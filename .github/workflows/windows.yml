@@ -1,0 +1,27 @@
+name: Launcher L1 checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
+          cache: npm
+      - run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run package:dir
+      - run: npm run smoke
+      - name: Packaged fixture smoke
+        shell: pwsh
+        run: |
+          $env:LAUNCHER_SMOKE_EXE=(Resolve-Path 'release/win-unpacked/Skyrim RP Launcher.exe').Path
+          npm run smoke
+      # No release/upload/publish step. Production signing is a separate L2 gate.

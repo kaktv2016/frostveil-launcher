@@ -1,0 +1,5 @@
+{
+  "forceCodeSigning":true,
+  "publish":{"provider":"github","owner":"REQUIRED_OWNER","repo":"REQUIRED_LAUNCHER_REPOSITORY","releaseType":"release"},
+  "win":{"publisherName":["REQUIRED_AUTHENTICODE_CERTIFICATE_SUBJECT"]}
+}
