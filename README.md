@@ -1,5 +1,7 @@
 # Skyrim RP Launcher — L1
 
+Current work: [Frostveil L2 self-update/source repository](L2.md), version0.1.1. L1 sections below preserve foundation context; L2 implements launcher update state/IPC/UI but real download/install is signing-gated. Modpack updates remain future work.
+
 Standalone Windows Electron/React/TypeScript/Vite/Tailwind app. Game integration is read-only: detects the existing Steam AppID489830 installation (registry + multiple libraryfolders + appmanifest), supports native folder selection, checks real version resources and a local hash baseline, creates bounded integration backups, and launches only the existing SKSE loader after the user clicks Play.
 
 ## Local workflow

@@ -1,0 +1,56 @@
+name: Approved signed launcher release
+on:
+  workflow_dispatch:
+    inputs:
+      approve_public_executable_release:
+        type: boolean
+        required: true
+        default: false
+permissions:
+  contents: read
+jobs:
+  release:
+    if: inputs.approve_public_executable_release == true
+    environment: production-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.11.1'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Enforce signing and existing approved tag
+        run: node scripts/production-gate.mjs
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          FROSTVEIL_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER_SUBJECT }}
+      - name: Signed nonpublishing package
+        run: npx --no-install electron-builder --win nsis --config .local/production-config.json --publish never
+        env:
+          CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      - run: node scripts/verify-artifacts.mjs
+      - name: Fail unless installer Authenticode is Valid
+        shell: pwsh
+        env:
+          FROSTVEIL_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER_SUBJECT }}
+        run: |
+          $installer=Get-ChildItem release/*local.exe | Select-Object -First 1
+          foreach($binary in @($installer.FullName, (Resolve-Path 'release/win-unpacked/Skyrim RP Launcher.exe').Path)) {
+            $signature=Get-AuthenticodeSignature -LiteralPath $binary
+            if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -ne $env:FROSTVEIL_PUBLISHER) { throw 'Pinned valid signer required for installer and app' }
+          }
+      - name: Publish after explicit dispatch and environment approval
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version=(Get-Content package.json | ConvertFrom-Json).version
+          gh release create "v$version" release/*local.exe release/*.blockmap release/latest.yml --verify-tag --repo kaktv2016/frostveil-launcher --title "Frostveil $version" --generate-notes

@@ -1,0 +1,12 @@
+import fs from 'node:fs/promises';
+const pkg=JSON.parse(await fs.readFile('package.json','utf8'));
+if(process.env.GITHUB_REF!=='refs/tags/v'+pkg.version)throw Error('Approved existing tag must match package version');
+if(!process.env.CSC_LINK||!process.env.CSC_KEY_PASSWORD||!process.env.FROSTVEIL_PUBLISHER)throw Error('BLOCKED BY SIGNING: credentials/publisher missing');
+const source=await fs.readFile('src/main/update-bootstrap.ts','utf8');
+const pinLiteral=source.match(/export const trustedPublisherNames:readonly string\[\]\s*=\s*(\[[^;]*\]);/);
+const pins=pinLiteral?JSON.parse(pinLiteral[1]):[];
+if(!pins.length||!pins.includes(process.env.FROSTVEIL_PUBLISHER))throw Error('BLOCKED BY SIGNING: exact trusted public signer identity not pinned/reviewed');
+if(pkg.build.publish?.owner!=='kaktv2016'||pkg.build.publish?.repo!=='frostveil-launcher')throw Error('Wrong publisher repository');
+const production={...pkg.build,forceCodeSigning:true,win:{...pkg.build.win,publisherName:[process.env.FROSTVEIL_PUBLISHER]},publish:{...pkg.build.publish,publishAutoUpdate:true}};
+await fs.mkdir('.local',{recursive:true});await fs.writeFile('.local/production-config.json',JSON.stringify(production,null,2));
+console.log('Production gates passed; private certificate values were not logged.');

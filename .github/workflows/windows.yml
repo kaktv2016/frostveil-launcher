@@ -1,4 +1,4 @@
-name: Launcher L1 checks
+name: Frostveil launcher checks
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
@@ -17,11 +17,19 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      - run: npm run package:dir
+      - run: npm run package:nsis
+      - run: node scripts/verify-artifacts.mjs
       - run: npm run smoke
       - name: Packaged fixture smoke
         shell: pwsh
         run: |
           $env:LAUNCHER_SMOKE_EXE=(Resolve-Path 'release/win-unpacked/Skyrim RP Launcher.exe').Path
           npm run smoke
-      # No release/upload/publish step. Production signing is a separate L2 gate.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frostveil-unsigned-development-only
+          path: |
+            release/*local.exe
+            release/latest.yml
+          retention-days: 7
+      # Development Actions artifacts only; no GitHub executable Release publication.

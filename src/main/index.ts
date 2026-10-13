@@ -11,6 +11,7 @@ import {authorize,validateSettings} from './authorization';
 import {contained,relativePath,safeDirectory,noLinks,checkExistingAncestors} from './files';
 import {updateState} from './updates';
 import {selectInstallation} from './session-state';
+import {createUpdater} from './update-bootstrap';
 import type {Dashboard,Profile,Settings} from '../shared/contracts';
 
 const smoke=process.argv.includes('--smoke');
@@ -48,7 +49,11 @@ async function start(){
    const response=await net.fetch(pathToFileURL(file).href);const headers=new Headers(response.headers);headers.set('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'");return new Response(response.body,{status:response.status,headers});
   }catch{return new Response('Not found',{status:404});}
  });
- const window=new BrowserWindow({width:1180,height:780,minWidth:960,minHeight:680,show:false,backgroundColor:'#101310',title:'Skyrim RP Launcher',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true}});
+ const updater=await createUpdater(!!fixture);
+ state.launcherUpdate=updater.snapshot();
+ const window=new BrowserWindow({width:1180,height:780,minWidth:960,minHeight:680,show:false,backgroundColor:'#101310',title:'Frostveil Launcher',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true}});
+ const unsubscribeUpdate=updater.subscribe(snapshot=>{state.launcherUpdate=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:update-state',snapshot);});
+ window.once('closed',()=>{unsubscribeUpdate();updater.dispose();});
  window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
  window.webContents.on('will-navigate',(event,url)=>{if(url!=='app://launcher/index.html')event.preventDefault();});
  window.webContents.session.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
@@ -56,6 +61,7 @@ async function start(){
  window.webContents.on('will-attach-webview',event=>event.preventDefault());
  const handler=(name:string,fn:(arg:unknown)=>Promise<void>)=>ipcMain.handle('launcher:'+name,async(event,arg)=>{
   if(event.sender!==window.webContents||!authorize(event.senderFrame?.url??'',event.senderFrame===window.webContents.mainFrame))throw Error('Unauthorized IPC sender');
+  if(name==='status'){await fn(arg);return structuredClone(state);}
   if(busy)throw Error('Another operation is in progress');busy=true;
   try{await fn(arg);return structuredClone(state);}catch(error){const message=error instanceof Error?error.message:'Operation failed';await log(message);throw Error(message);}finally{busy=false;}
  });
@@ -63,11 +69,16 @@ async function start(){
  handler('status',async arg=>{noArgument(arg);});
  handler('scan',async arg=>{noArgument(arg);await scan();});
  handler('choose',async arg=>{noArgument(arg);const selected=fixture?path.join(fixture,'game'):(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Select folder containing SkyrimSE.exe'})).filePaths[0];if(selected){selectInstallation(state,selected);await scan();}});
- handler('channel',async arg=>{settings.channel=validateSettings({directory:settings.directory,channel:arg}).channel;state.updates=updateState(settings.channel);await writeLocal(settingsPath,settings);});
+ handler('channel',async arg=>{if(arg!=='stable')throw Error('Beta is disabled until channel isolation is verified');settings.channel=validateSettings({directory:settings.directory,channel:arg}).channel;state.updates=updateState(settings.channel);await writeLocal(settingsPath,settings);});
+ handler('check-update',async arg=>{noArgument(arg);await updater.check();state.launcherUpdate=updater.snapshot();});
+ handler('download-update',async arg=>{noArgument(arg);await updater.download();state.launcherUpdate=updater.snapshot();});
+ handler('install-update',async arg=>{noArgument(arg);await updater.install();state.launcherUpdate=updater.snapshot();});
+ handler('defer-update',async arg=>{noArgument(arg);updater.defer();state.launcherUpdate=updater.snapshot();});
  handler('backup',async arg=>{noArgument(arg);if(!settings.directory)throw Error('Select a game installation first');state.backup=null;state.backup=await createBackup(settings.directory,path.join(storage,'backups'),profile);await log(`Verified integration backup: ${state.backup.files} files (${state.backup.skipped.length} skipped); not a full game backup`);});
- handler('play',async arg=>{noArgument(arg);await launch.play(async()=>{const current=await scan();if(!current)throw Error('No installation selected');return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
+ handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');await launch.play(async()=>{const current=await scan();if(!current)throw Error('No installation selected');return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
  app.on('second-instance',()=>{if(window.isMinimized())window.restore();window.focus();});
  window.once('ready-to-show',()=>{window.show();});
  await window.loadURL('app://launcher/index.html');
+ if(!fixture)void updater.check();
  app.on('window-all-closed',()=>app.quit());
 }

@@ -14,6 +14,9 @@ export async function steamRoots():Promise<string[]>{
  const roots=JSON.parse(text||'[]');return [...new Set((Array.isArray(roots)?roots:[roots]).filter((v:unknown)=>typeof v==='string'))] as string[];
 }
 export async function gameRunning():Promise<boolean>{return (await query("[bool](Get-Process -Name SkyrimSE,skse64_loader -ErrorAction SilentlyContinue) | ConvertTo-Json -Compress"))==='true';}
+export async function authenticode(file:string):Promise<{valid:boolean;subject:string}>{
+ try{const result=JSON.parse(await query("$s=Get-AuthenticodeSignature -LiteralPath $env:FROSTVEIL_SIGNATURE_FILE; @{valid=($s.Status -eq 'Valid');subject=$s.SignerCertificate.Subject} | ConvertTo-Json -Compress",{FROSTVEIL_SIGNATURE_FILE:file}));return{valid:result.valid===true,subject:typeof result.subject==='string'?result.subject:''};}catch{return{valid:false,subject:''};}
+}
 export async function startSkse(executable:string,cwd:string):Promise<void>{
  await observeStartup(spawn(executable,[],{cwd,shell:false,detached:true,stdio:'ignore',windowsHide:false}));
 }
