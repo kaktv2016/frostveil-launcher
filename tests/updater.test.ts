@@ -6,6 +6,10 @@ import {Readable,Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {DigestTransform} from 'builder-util-runtime';
 import {LauncherUpdateService,type UpdateEngine} from '../src/main/launcher-update-service';
+import {verifyDownloadedInstaller} from '../src/main/update-integrity';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 class Engine extends EventEmitter implements UpdateEngine {
  info:unknown={version:'0.1.1',files:[{url:'installer.exe',sha512:'a'.repeat(88),size:10}],releaseNotes:'New release'};
  failure:Error|null=null;checks=0;downloads=0;installs=0;cancelled=false;
@@ -25,3 +29,4 @@ test('app restart begins idle without claiming pending update already installed'
 test('failed NSIS installation restores a retryable verified state and redacts raw details',async()=>{const e=fixture();await e.service.check();await e.service.download();e.engine.install=()=>{throw Error('C:/Users/secret installer path');};await assert.rejects(()=>e.service.install(),/could not start/);assert.equal(e.service.snapshot().state,'downloaded');assert.equal(e.service.snapshot().message.includes('secret'),false);});
 test('library asynchronous install error event restores retryable state',async()=>{const e=fixture();await e.service.check();await e.service.download();await e.service.install();e.engine.emit('install-error',Error('secret installer detail'));assert.equal(e.service.snapshot().state,'downloaded');assert.equal(e.service.snapshot().canInstall,true);assert.equal(e.service.snapshot().message.includes('secret'),false);e.service.dispose();assert.equal(e.engine.listenerCount('install-error'),0);});
 test('pinned library DigestTransform rejects tampered fixture bytes',async()=>{const bytes=Buffer.from('authenticode-independent integrity fixture');const checksum=createHash('sha512').update(bytes).digest('base64');await pipeline(Readable.from([bytes]),new DigestTransform(checksum),new Writable({write(_chunk,_encoding,cb){cb();}}));await assert.rejects(()=>pipeline(Readable.from([Buffer.from('tampered')]),new DigestTransform(checksum),new Writable({write(_chunk,_encoding,cb){cb();}})));});
+test('cached installer recheck refuses changed bytes and wrong signer before installation',async()=>{const folder=await fs.mkdtemp(path.join(os.tmpdir(),'frostveil-integrity-'));try{const file=path.join(folder,'fixture.exe'),bytes=Buffer.from('inert fixture'),checksum=createHash('sha512').update(bytes).digest('base64');await fs.writeFile(file,bytes);await verifyDownloadedInstaller(file,checksum,['trusted'],async()=>({valid:true,subject:'trusted'}));await assert.rejects(()=>verifyDownloadedInstaller(file,checksum,['trusted'],async()=>({valid:true,subject:'other'})));await fs.appendFile(file,'tampered');await assert.rejects(()=>verifyDownloadedInstaller(file,checksum,['trusted'],async()=>({valid:true,subject:'trusted'})));}finally{await fs.rm(folder,{recursive:true,force:true});}});

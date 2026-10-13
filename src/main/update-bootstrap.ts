@@ -24,5 +24,5 @@ export async function createUpdater(fixture:boolean):Promise<LauncherUpdateServi
   const marker=path.join(path.dirname(process.execPath),'Uninstall Skyrim RP Launcher.exe');
   installed=app.isPackaged&&trust&&signature.valid&&trustedPublisherNames.includes(signature.subject)&&(await fs.stat(marker)).isFile();
  }catch{/* Missing metadata/certificate/NSIS marker is an explicit safe capability limit. */}
- return new LauncherUpdateService(new NsisEngine(),{version:app.getVersion(),checkEnabled:app.isPackaged&&configured,downloadTrusted:trust,installed,gameRunning});
+ return new LauncherUpdateService(new NsisEngine(trustedPublisherNames),{version:app.getVersion(),checkEnabled:app.isPackaged&&configured,downloadTrusted:trust,installed,gameRunning});
 }

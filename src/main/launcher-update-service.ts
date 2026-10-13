@@ -3,7 +3,7 @@ import type {LauncherUpdate} from '../shared/contracts';
 export interface UpdateEngine {
  on(event:string,listener:(value:any)=>void):unknown;
  removeListener(event:string,listener:(value:any)=>void):unknown;
- check():Promise<unknown>;download():Promise<void>;install():void;cancel():void;
+ check():Promise<unknown>;download():Promise<void>;install():void|Promise<void>;cancel():void;
 }
 interface Options {version:string;checkEnabled:boolean;downloadTrusted:boolean;installed:boolean;now?:()=>number;gameRunning:()=>Promise<boolean>;}
 export class LauncherUpdateService {
@@ -15,7 +15,7 @@ export class LauncherUpdateService {
  constructor(private readonly engine:UpdateEngine,private readonly options:Options){
   this.now=options.now??Date.now;
   this.value={state:options.checkEnabled?'idle':'unsupported',installedVersion:options.version,message:options.checkEnabled?'Ready to check stable releases':'Development/fixture mode: real self-update disabled',canDownload:false,canInstall:false,source:'https://github.com/kaktv2016/frostveil-launcher/releases'};
-  this.listeners=[['progress',p=>{if(this.value.state!=='downloading'||this.disposed)return;if(!p||![p.percent,p.transferred,p.total,p.bytesPerSecond].every(Number.isFinite)||p.total<0||p.transferred<0||p.transferred>p.total||p.bytesPerSecond<0)return;this.set({progress:{percent:Math.max(0,Math.min(100,p.percent)),transferred:p.transferred,total:p.total,bytesPerSecond:p.bytesPerSecond}});}],['downloaded',info=>{if(this.value.state==='downloading'&&!this.disposed&&info?.version===this.value.availableVersion)this.set({state:'downloaded',message:'Verified download ready; installation requires your action',canDownload:false,canInstall:this.options.installed});}]];
+  this.listeners=[['progress',p=>{if(this.value.state!=='downloading'||this.disposed)return;if(!p||![p.percent,p.transferred,p.total,p.bytesPerSecond].every(Number.isFinite)||p.total<0||p.transferred<0||p.transferred>p.total||p.bytesPerSecond<0)return;this.set({progress:{percent:Math.max(0,Math.min(100,p.percent)),transferred:p.transferred,total:p.total,bytesPerSecond:p.bytesPerSecond}});}],['downloaded',info=>{if(this.value.state==='downloading'&&!this.disposed&&info?.version===this.value.availableVersion)this.set({state:'downloaded',message:'Verified download ready; installation requires your action',canDownload:false,canInstall:this.options.installed,progress:this.value.progress?{...this.value.progress,percent:100,transferred:this.value.progress.total}:undefined});}]];
   for(const [name,listener] of this.listeners)engine.on(name,listener);
   const installError=()=>{if(this.value.state==='installing')this.set({state:'downloaded',message:'NSIS update installation failed; verified download retained for retry',canInstall:true});};
   this.listeners.push(['install-error',installError]);engine.on('install-error',installError);
@@ -45,7 +45,7 @@ export class LauncherUpdateService {
  async install(){
   if(this.disposed||this.lock||!this.options.installed||!this.options.downloadTrusted||!['downloaded','deferred'].includes(this.value.state))throw Error('Installed signed NSIS build and verified download required');
   this.lock=true;const previous=this.value.state;
-  try{if(await this.options.gameRunning())throw Error('Skyrim/SKSE is running; close it yourself before updating');this.set({state:'installing',message:'Restarting through NSIS updater; installation not yet confirmed',canInstall:false});this.engine.install();}catch(error){const message=error instanceof Error&&error.message.startsWith('Skyrim/SKSE is running')?error.message:'Verified update installation could not start; retry later';this.set({state:previous,message,canInstall:true});throw Error(message);}finally{this.lock=false;}
+  try{if(await this.options.gameRunning())throw Error('Skyrim/SKSE is running; close it yourself before updating');this.set({state:'installing',message:'Restarting through NSIS updater; installation not yet confirmed',canInstall:false});await this.engine.install();}catch(error){const message=error instanceof Error&&error.message.startsWith('Skyrim/SKSE is running')?error.message:'Verified update installation could not start; retry later';this.set({state:previous,message,canInstall:true});throw Error(message);}finally{this.lock=false;}
  }
  dispose(){this.disposed=true;this.engine.cancel();for(const [name,listener] of this.listeners)this.engine.removeListener(name,listener);this.subscribers.clear();}
 }
