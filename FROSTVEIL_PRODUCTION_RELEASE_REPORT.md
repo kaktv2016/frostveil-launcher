@@ -1,220 +1,108 @@
-# Frostveil first production release — execution report
+# Frostveil first production release — verified execution report
 
-Date: 2026-10-16. Status: **IN PROGRESS — PRODUCTION KEYS PINNED; FINAL VALIDATION/PUBLICATION PENDING**.
+Date: 2026-10-16. Evidence finalized: 2026-10-16T08:15:46.864Z.
 
-The owner's FIRST PRODUCTION RELEASE brief explicitly authorizes A–D. Approval E
-(real Skyrim writes) is excluded. This is an interim evidence record, not a claim
-that the production release is complete. No replacement identities were generated.
+**PRODUCTION KEYS PINNED · SOURCE AUDITED AND PUSHED · LAUNCHER v0.1.6 RELEASE PUBLISHED · MODPACK pack-v1.0.0 RELEASE PUBLISHED.**
 
-## Production identities
+The owner's FIRST PRODUCTION RELEASE brief authorizes A–D. E (real Skyrim writes) is excluded. Both public releases were actually published and tested. L5, Nexus integration, new gameplay and real game/server operations were not performed.
 
-| Channel | Approved key ID | Public SPKI SHA-256 | Expiry UTC |
-|---|---|---|---|
-| Launcher | `frostveil-launcher-update-20261016` | `44b402b99394515908c10c72d2e6e77ad210a1b36248e5bafe991b59183b0fea` | 2027-10-16T00:00:00.000Z |
-| Modpack | `frostveil-modpack-publisher-20261016` | `7eded189b364ffc31c5c9730c7b73c0b13424b60576313a0197a6327b5633369` | 2027-10-16T00:00:00.000Z |
+## Independent production trust and offline recovery
 
-Fresh local verification at 2026-10-16T06:37:30.551Z:
+| Channel | Key ID | Full public SPKI SHA-256 |
+|---|---|---|
+| Launcher | `frostveil-launcher-update-20261016` | `44b402b99394515908c10c72d2e6e77ad210a1b36248e5bafe991b59183b0fea` |
+| Modpack | `frostveil-modpack-publisher-20261016` | `7eded189b364ffc31c5c9730c7b73c0b13424b60576313a0197a6327b5633369` |
 
-- Both existing private keys derive the exact approved public fingerprints and
-  match the original public candidate identities.
-- Independent random-challenge signing/verification passed for both Ed25519 keys.
-- Neither identity is marked revoked in the approved local identity record;
-  both expiries remain in the future. This is local configured revocation state,
-  not a claim about a separate external revocation service.
-- Signing directory inheritance is disabled. Directory/file ACL allow entries
-  are restricted to SYSTEM and the current Windows user.
-- Private keys remain outside the repositories. Verification output contains
-  public identity metadata only.
-- **Offline backup: VERIFIED. PRODUCTION KEYS PINNED.**
+Both keys are Ed25519, environment=production, not revoked in configured trust, expiry **2027-10-16T00:00:00.000Z**. Local possession challenges, independent signature verification and exact packaged public pins passed. No replacement production keys were generated. Unknown, expired, cross-channel and synthetic Level B publishers remain rejected.
 
-The brief's section 4 says: “Before production activation or publication, verify
-that both production private keys have a usable secure offline backup.” The owner
-confirmed no offline backup initially existed, then selected removable USB drive D:
-and explicitly requested a local password dialog for an encrypted backup. The drive
-is USB/FAT32, so its filesystem cannot enforce NTFS ACLs; encrypted backup bytes
-will protect the offline copy while the live signing keys retain restrictive ACLs.
-The encrypted backup was written to USB and reread at 2026-10-16T07:08:11.997Z;
-both recovered keys passed public-fingerprint checks and fresh signing challenges.
-The owner then confirmed USB detachment and separate password storage; drive D:
-was independently observed absent before public-key activation.
-Encrypted backup: AES-256-GCM, scrypt N=131072/r=8/p=1, 1,492 bytes, SHA-256
-`fd2e83dc470c968ee0ae1d25b6cd73537755f9973d32e9a24a4030de49949d3b`.
-Only encrypted key material and public recovery documentation were written to USB.
-No backup password or plaintext private key was persisted in the workspace/logs.
-A same-drive copy is insufficient. This gate applies before pinning
-or publication; A–D authorization itself does not need to be requested again.
+**Offline backup VERIFIED:** owner-selected removable USB, AES-256-GCM with scrypt N=131072/r=8/p=1; encrypted bundle 1,492 bytes, SHA-256 `fd2e83dc470c968ee0ae1d25b6cd73537755f9973d32e9a24a4030de49949d3b`. USB readback/decryption recovered both approved public fingerprints and passed fresh challenges. Owner confirmed USB detached/password separate; drive absence was checked before activation. FAT32 lacks NTFS ACLs, so only encrypted key bytes were exported; live keys retain owner/SYSTEM ACLs outside repositories. No password or plaintext private key entered source, artifacts or logs.
 
-### Backup recovery and rotation procedure
+Recovery: attach the offline medium locally, decrypt into a protected signing location outside repositories, independently compare both public fingerprints, and sign a fresh random challenge before use. Detach the medium afterward. Keep its password separate. Rotation/revocation needs separately approved identities, audited trust configuration and a new signed Launcher release; compromise recovery may require a separately verified manual bootstrap. Preserve independent channel identities and prior immutable releases.
 
-1. The owner stores both private keys on secure offline media outside repositories,
-   build outputs and cloud/shared folders. Protect the media with encryption or
-   equivalent restricted physical access; keep its unlock secret outside chat/logs.
-2. Temporarily attach/unlock that media locally. Verify the recovered files derive
-   the exact fingerprints above and can sign a fresh random challenge. Check that
-   the backup is not merely another directory on the live signing drive. Record
-   only public fingerprints, verification time, medium description and results.
-3. The owner detaches the media and confirms offline storage. Do not put restored
-   private bytes into the workspace or attach them to a message.
-4. On a signing-machine loss, restore into a protected signing directory outside
-   repositories, restrict ACL to the owner/SYSTEM and repeat fingerprint/challenge
-   verification before signing. Compare against the public pins independently.
-5. Rotation requires separately approved new identities, expiry/revocation updates,
-   audited source, tests and a new Launcher release. Preserve channel separation.
-   If compromise is suspected, stop affected publication and revoke the old key
-   in trusted configuration. Do not rely on an update signed solely by a compromised
-   key for recovery; use a separately verified manual bootstrap where necessary.
+## Source and Windows verification
 
-## Current repositories and publication state
+Launcher repository: [kaktv2016/frostveil-launcher](https://github.com/kaktv2016/frostveil-launcher). Release source commit **`4fc1ab067e88a0bdcf39174afb74af30e86cad61`**.
 
-GitHub authentication was verified as `kaktv2016`. Both repositories are public,
-default branch `main`, with push/maintain/admin permission available.
+Cumulative approved implementation: `c07cc1a4935d14863184c0017501c85c4055c8c0`; trust-audit correction `6b81782f99361c6b0c108afca6ec92897cdde38f`; diagnostic source `18c24d2f60eaed70d3daafcb74654c1538bf7c94`; Windows canonical identity correction `fcbeaeab9c065118287271279ddc512d8c24c83f`; final disposable NSIS environment correction is the release source above. Normal commits/pushes only; no force/reset or source push to Distribution.
 
-| Repository | Current local/remote main | Target release | Observed state |
-|---|---|---|---|
-| [Launcher](https://github.com/kaktv2016/frostveil-launcher) | `5eb2cf773deaaa47b460b17e02926913d856a90b` | `v0.1.6` | No release or target tag found |
-| [Distribution](https://github.com/kaktv2016/frostveil-distribution) | `1c223f11fcdf59529efa3f5800f6c0f7505a87c9` | `pack-v1.0.0` | No target release/tag found |
+Distribution target commit: `1c223f11fcdf59529efa3f5800f6c0f7505a87c9`. SkyMP remains `develop`, checkout `5397cd3bf4666c942f78193107881d8cf0ac2748`; native engine baseline `2849e676fe008925384b26f34476e382a30bd877`.
 
-Launcher immutable releases: **disabled**, not owner-enforced. Distribution immutable
-releases: **enabled**, not owner-enforced. No settings were changed by this execution.
-The existing immutable prerelease `test-pack-v0.0.1`, release ID `414428948`, remains
-untouched. No new draft, tag, public release, source commit or source push has occurred.
-Remote CI for the final production source is consequently **NOT RUN**.
+Remote Windows CI: **PASSED**, [release-source run](https://github.com/kaktv2016/frostveil-launcher/actions/runs/38870565335). Node 24.11.1, locked npm dependencies, contents:read, no automated publication/secrets.
 
-## Fresh safe validation before key activation
-
-These checks validate the current pre-activation source; they do not certify a
-future installer rebuilt with production pins.
-
-| Check | Executed result |
+| Check | Actual result |
 |---|---|
-| Launcher TypeScript typecheck | PASSED |
-| Full Launcher automated suite | **392 passed, 0 failed, 0 skipped** |
-| Actual isolated Windows NSIS regression | PASSED within that suite: disposable 0.1.5 → 0.1.6, signed loopback download, installed ASAR version changed |
-| Distribution TypeScript typecheck | PASSED |
-| Distribution tests | **4 passed, 0 failed, 0 skipped** |
-| Source build | PASSED |
-| Source Electron fixture smoke | PASSED |
-| Existing unpacked Electron fixture smoke | PASSED |
-| Existing NSIS metadata + L3/L4-A/L4-B/L4-C package audits | PASSED before production pins |
-| Pre-fix built main/preload vs existing packaged ASAR | Byte-identical at the initial baseline check; rebuild required after updater changes |
-| Intended source inventory/privacy scan | 131 files scanned; no matching private-key material, GitHub tokens, credential assignments, prohibited binaries or actual personal paths found; two user-path matches are deliberate fictional redaction fixtures in `tests/updater.test.ts` |
-| Protected file comparison | **63 paths checked, 0 changes**, including existing Launcher executable/ASAR, original protected runtime files, server settings/manifest/world, saves and L1 backups |
+| Launcher TypeScript and full automated suite | PASSED; 401 passed, 0 failed, 0 skipped |
+| Distribution typecheck and tests | PASSED; 4 passed, 0 failed, 0 skipped |
+| Windows NSIS packaging | PASSED; final version 0.1.6 |
+| Source and packaged Electron fixture smoke | PASSED |
+| Artifact/privacy, L3, L4-A, L4-B, L4-C audits | PASSED; independent exact public fingerprints checked in packaged code |
+| Actual isolated installed-app NSIS 0.1.5 → 0.1.6 | PASSED locally and remote CI; real Main/bootstrap, IPC, verified default handoff/spawn, old quit, new --updated restart/window readiness |
+| Existing settings / authenticated ownership / journals / backups across NSIS | PASSED; exact bytes/HMAC evidence preserved |
+| Production anonymous Launcher check/download | PASSED using normal production NsisEngine; install() never called |
+| Production anonymous Modpack provider/download | PASSED; three package hashes/sizes and production signature verified |
+| Production bytes managed sandbox | Fresh installation, owned upgrade, backup, rollback and killed-child/reopened recovery PASSED |
+| Real protected files | 63 paths, **0 changes**; no real installation apply |
 
-The initial NSIS regression substituted its handoff callback/arguments and never
-launched the installed older application. Review identified that gap and a separate
-15-second total installer transfer deadline. Both have now been addressed:
+Earlier remote CI exposed four failures; those runs were not treated as success. Genuine Windows short8.3/full-path identity errors were reproduced and corrected with filesystem canonicalization while retaining link/capability checks. The 80ms retry fixture was replaced by an explicitly stalled first request and bounded realistic timeout; user cancellation remains non-retried. NSIS already upgraded, but the runner's Explorer restart changed session TEMP to Temp/2; only disposable test entries now preserve their initial TEMP/TMP. Production validators were not relaxed. Installer transfer separately permits a bounded 30-minute stream while metadata remains bounded to15 seconds. Read-only review found no blocking issues.
 
-- Installer transfer has a separate bounded 30-minute deadline; metadata remains
-  bounded to 15 seconds. A new regression reproduced the original timeout before
-  the fix. The updated security suite passes **10/10**, including delayed streaming,
-  cancellation and transfer-deadline enforcement.
-- Disposable NSIS builds now include production dependencies. An installed-app
-  bootstrap regression failed before this correction and passed afterward.
-- The extended NSIS test passed through actual installed 0.1.5 Main/bootstrap,
-  preload download/install IPC, verified handoff/default spawn, normal old-app quit
-  and actual 0.1.6 restart carrying `--updated`. Actual application settings plus
-  an existing sandbox engine's authenticated receipt/journals/backups survived.
-  The test-only entry prelude confines storage/profile inputs across Explorer-based
-  restarts; it is not included in production packaging. One final formatting-only
-  cleanup to that test prelude still needs the final full-suite run.
-- The existing callback-based installer replacement check remains additional
-  coverage. No public-to-public 0.1.6 → 0.1.7 update has been verified.
+## Published Launcher
 
-These changes require a new full suite and final production packaging. The initial
-392/392 baseline is not the final post-fix/post-pin result.
+[Frostveil Launcher v0.1.6](https://github.com/kaktv2016/frostveil-launcher/releases/tag/v0.1.6) — release ID **414697483**, stable. Draft-first upload/readback used real asset IDs before signing. Exactly four assets; anonymous installer SHA-256/SHA-512/size match the final sealed build and signed manifest. latest.yml consistency and blockmap bytes verified independently.
 
-Local evidence is retained under the ignored production-release audit directory.
-It is intentionally excluded from source commits and release assets.
+| Asset | GitHub asset ID | Bytes | SHA-256 |
+|---|---:|---:|---|
+| frostveil-launcher-update.json | 646625083 | 1316 | `820cc590ecbf3bf56580637b75b815d03747a76580e63636281712effd630a35` |
+| latest.yml | 646624955 | 369 | `48c2ba34c84cee0ca486771d5fd8d5d0bec70f7839cb366e7ae8e9a4fceb7dac` |
+| SkyrimRPLauncher-0.1.6-x64-local.exe | 646623677 | 112344076 | `bac287620d90a4a9ef4bd8ef94e9abaf5ac994e8f9b258a1f61f596be6d23d49` |
+| SkyrimRPLauncher-0.1.6-x64-local.exe.blockmap | 646624827 | 118149 | `9844b79d066aaae89fb6d9c0a8ae8ff84cbc95d187996666ac8aa3b87d700336` |
 
-## Source and package review
+Installer SHA-512 (base64): `VQk6SsuuC3goKE6jjetr8RmILRBT/KZrgM50QM18isXYHt5p3Nu/BkmuNO/4rzN+MPO0gsa14l9LjGW8bSgBuQ==`.
 
-The cumulative uncommitted L3/L4-A/L4-B/L4-C/Player Distribution work is the intended
-source audit scope. Dependency diff changes package versions from 0.1.1 to 0.1.6;
-no dependency versions or resolved dependency graph changed in that diff.
+Other final asset SHA-512 (base64):
+- SkyrimRPLauncher-0.1.6-x64-local.exe.blockmap: `kjpHUbHQSeA2yaPv4XzNna2EOklwcNE7y3Q6tO/o8474uh6JuTDSMhMMtqetv6frUAvIXLx7MHUT1bVS4225kw==`
+- latest.yml: `nmqWbSdjGRAUFkMojbLzL+4LkCMaxEopOnZAhLJH/P4aOxG5bJ2nuwbv3z7JX8vmd6tlRE1TQ/RQBB/NUYhmeQ==`
 
-Reviewed updater execution paths authenticate the signed manifest before download,
-bind installer asset ID/name/size/SHA-256/SHA-512, use restricted anonymous transport,
-maintain a version ledger, reverify cache identity and bytes before handoff, disable
-web/differential installer downloads and refuse automatic quit-time installation.
-`latest.yml` does not authorize the direct installer path; release publication must
-independently verify its consistency against the signed manifest/final installer.
-The old 0.1.4 installation is untouched and requires one manual bootstrap install.
+Installer Authenticode: **NotSigned** (verified from the actual final executable). Ed25519 production update trust was verified independently; Windows Authenticode/SmartScreen signing was not claimed.
 
-Independent security review identified the two issues above; its fix review found
-no additional blocking findings. Final pins, packaging and full regression remain
-pending, so source is **NOT YET DECLARED FULLY AUDITED FOR PUSH**. The Windows workflow has been updated to run
-the existing L4-C artifact audit as well as L3/L4-A/L4-B audits. Workflow permissions
-remain `contents: read`; packaging uses `--publish never`.
+Launcher repository immutable releases: **disabled**, not owner-enforced; reported and left unchanged. Ed25519/size/hash/release-binding checks still apply. Distribution immutable releases: enabled; the published Modpack is verified immutable. No repository settings changed in this milestone.
 
-Both production trust configurations now contain exactly their independently
-approved public keys, environment `production`, revocation false and expiry
-2027-10-16. Modpack pack ID is `frostveil-rp-pack`. The new literal-only artifact
-audit verifies exact SPKI fingerprints without executing packaged code and rejects
-cross-channel substitution, extra/missing trust, wrong identity/expiry and dynamic
-initializers. Its five tests passed; full post-pin regression is running.
-The synthetic Level B identity remains outside both production key sets.
+## Published first-party Modpack
 
-## First-party Modpack content review
+[Frostveil RP Pack v1.0.0](https://github.com/kaktv2016/frostveil-distribution/releases/tag/pack-v1.0.0) — release ID **414698726**, tag `pack-v1.0.0`, pack ID `frostveil-rp-pack`, stable, immutable. Minimum Launcher0.1.6; Skyrim1.6.1170.0; SKSE resource0.2.2.6 (release2.2.6). Exact original29 external-only references preserved; none redistributed.
 
-Required final identity: `frostveil-rp-pack`, stable, version `1.0.0`, tag `pack-v1.0.0`.
-The original candidate uses `frostveil` and placeholder asset IDs. It is preserved
-unchanged as preparation evidence and must not be uploaded as the final manifest.
+| Owned payload | GitHub asset ID | Bytes | SHA-256 |
+|---|---:|---:|---|
+| frostveil-client-settings.json | 646627204 | 370 | `9a1d1d16c7271d816fd91f0699999ec516fdc0df26dae7dae67f35c85170bd21` |
+| frostveil-client-readme.txt | 646627342 | 897 | `4bf195a94902b870f688522b3461a1b0c3abacdec8e55cc66340bca4a82ce921` |
+| frostveil-hud-reference.html | 646627477 | 457 | `5bb5168fca942c7321bbedef569d26496eebcf14564d36093a6effa1817a9425` |
 
-The original first-party text claimed medical/police/economy/animation commands and
-F2/F6 bindings that are not present in the inspected current RP gamemode modules.
-New unsigned local content corrects the pack ID and documents only source-supported
-chat, character profile, dice and Courier commands, with the configurable default
-F7 chat key. These three files are metadata/static references; they do not install
-or enable gameplay modules or replace the actual in-game HUD.
+Signed manifest asset ID **646627659**, 22674 bytes; SHA-256 `e9b4c46a3003e21bc0b1d62c6e937d904277a7402172e5511e6945bcac9df907`.
+Authenticated payload SHA-256: `8558058fe274a57a8e4aa419e300e2d63fdb0888d6693411268ddae80b268fc4`.
 
-| Target | Asset name | Bytes | Reviewed unsigned payload SHA-256 |
-|---|---|---:|---|
-| `Data/Frostveil/settings.json` | `frostveil-client-settings.json` | 370 | `9a1d1d16c7271d816fd91f0699999ec516fdc0df26dae7dae67f35c85170bd21` |
-| `Data/Frostveil/readme.txt` | `frostveil-client-readme.txt` | 897 | `4bf195a94902b870f688522b3461a1b0c3abacdec8e55cc66340bca4a82ce921` |
-| `Data/Interface/Frostveil/hud-reference.html` | `frostveil-hud-reference.html` | 457 | `5bb5168fca942c7321bbedef569d26496eebcf14564d36093a6effa1817a9425` |
+Managed payload SHA-512 (base64):
+- frostveil-client-settings.json: `bkpFvHqGhaY1HkVSp9A3Z/NQuLNrqlW1ku1uMJYVJgkqBbj9M//wguw4Km0Tv2ybkLk1S++EJGVdERaGvQCLtA==`
+- frostveil-client-readme.txt: `2VFzGLpjDrN9TLyi80jKKOods9Y9JX+t7Lt6wK5USu/MP/oe1wsFz7/SUtLr/2MlbjF2I6/2Z3cWSpuEyYeTNg==`
+- frostveil-hud-reference.html: `Z+7VAfre4yfyJT8M9BSDtaALgJg4YZzRkycRdN58j0qWLhIXEZ8peRXXy+H476sSCdM4UhGXQJkl0ZICe7aarw==`
 
-First-party ownership and real-target path policy checks passed. No external
-endpoint, credential, script tag or executable header was found in these payloads.
-The original 29 external-only requirements remain verification references, with
-**zero redistributed third-party/game/native assets**. No new feature was implemented.
+These three owned files are configuration/static references documenting implemented chat/profile/dice/Courier commands, not new gameplay or an implemented HUD renderer. No third-party mods, proprietary masters, SKSE/SkyMP binaries, private endpoints or player data were uploaded. Existing immutable test release `test-pack-v0.0.1`, ID414428948, was preserved with unchanged assets.
 
-## Read-only SkyMP/runtime findings
+## Production-byte sandbox evidence
 
-- Skyrim executable: **1.6.1170.0**. SKSE loader/runtime file version: **0.2.2.6**
-  (SKSE release **2.2.6**). Current L1 scan is ready; all **29/29** external-only
-  manifest file requirements verified against local bytes/resource versions.
-- SkyMP checkout HEAD: `5397cd3bf4666c942f78193107881d8cf0ac2748`; candidate native
-  engine baseline reference: `2849e676fe008925384b26f34476e382a30bd877`.
-- Fresh offline export checks current native manifest CRC/size/header/hash against
-  the five official masters: Skyrim, Update, Dawnguard, HearthFires, Dragonborn.
-  Server archive list: `Skyrim - Misc.bsa`.
-- Native activation preflight: **UNVERIFIED**, no hard blockers, because existing
-  active Creation Club light/ESL plugins have unverified pinned SkyMP behavior.
-  No plugin activation was changed to clear the warning.
-- Live server compatibility: **UNVERIFIED**. No game or server was launched/restarted.
-- Current server-profile schema expires an offline snapshot after seven days.
-  A final snapshot must be freshly exported for publication. An immutable embedded
-  snapshot will still expire; later refresh/version publication needs separate
-  authorization. Do not claim indefinite production availability from this release.
+- Anonymous production bytes fresh installation and absence rollback PASS
+- Owned prior generation upgrade, byte-verified backup and exact rollback PASS
+- Owned child terminated after actual rename; reopened authenticated journal recovery and prior bytes PASS
+- 29 local-only external requirements, unmanaged sentinel and activation bytes unchanged PASS
 
-## Remaining release requirements
+Only newly generated `managed-fixture` capabilities were authorized. The29 legitimately installed external files were copied locally to disposable fixtures without hardlinks; no additional redistribution occurred. A separately generated in-memory TEST key supplied a prior owned generation, was explicitly rejected by production authentication, and was never published or pinned. Upgrade then consumed the actual anonymously downloaded v1.0.0 bytes. Actual verified backup bytes restored that prior generation. An owned Node worker was terminated after a real rename; reopening authenticated journal evidence recovered the original bytes. No Skyrim/server/Steam process was launched, stopped or restarted.
 
-| Requirement | Current status / missing evidence |
-|---|---|
-| Offline backup and recovered-key verification | VERIFIED; owner detached USB and retained password separately |
-| PRODUCTION KEYS PINNED | VERIFIED in source; final packaged audit pending |
-| Final production-key build, hashes, executable versions | NOT BUILT; historical installer hashes are not final production values |
-| SOURCE AUDITED AND PUSHED | NOT EXECUTED; cumulative review incomplete |
-| Remote Windows CI | NOT RUN for a final production commit |
-| LAUNCHER v0.1.6 RELEASE PUBLISHED | NOT EXECUTED; no actual production asset IDs/URL |
-| MODPACK pack-v1.0.0 RELEASE PUBLISHED | NOT EXECUTED; no actual production asset IDs/URL |
-| ANONYMOUS GITHUB DOWNLOAD VERIFIED | NOT TESTED for production releases |
-| PRODUCTION ED25519 SIGNATURE VERIFIED | Key possession verified; final published signatures NOT TESTED |
-| Real production assets in sandbox | NOT TESTED; generic/disposable regression success is not release acceptance |
-| Production Backup / Rollback / Recovery | NOT TESTED with actual production downloads |
-| Final real-install ManagedPlan and planHash | NOT PREPARED; requires real authenticated release metadata |
-| REAL SKYRIM INSTALL NOT YET EXECUTED | CONFIRMED by protected comparison |
-| PRODUCTION PLAYER ACCEPTANCE PENDING | PENDING; requires separately approved real installation and manual in-game tests |
+## Real compatibility and remaining limits
 
-Keep this report in progress until every required publication and verification is
-complete. Do not relabel preparation or historical test results as production success.
+29/29 local external requirements and five server master hash/CRC/header entries match the offline baseline. This proves file integrity/offline snapshot correspondence. **Live server compatibility and production player acceptance remain UNVERIFIED.** Existing active Creation Club light/ESL plugins are preserved and keep the real preflight **UNVERIFIED**. They were not deactivated to clear the warning.
+
+Signed offline server snapshot expires **2026-10-23T08:09:13.587Z** (maximum seven-day schema lifetime). After expiry, safe verification blocks installation until a separately reviewed/published compatible snapshot/release is approved; immutable metadata will not be edited in place.
+
+Installed0.1.4 may need one manual0.1.6 bootstrap installation. This first public release does not prove public0.1.6→0.1.7 self-update; a later separately approved release is required. Production installer Authenticode is independent of the verified Ed25519 channel; do not infer Authenticode trust from the manifest signature. L1 first-player compatibility-profile provisioning remains a separate deployment limitation.
+
+**REAL SKYRIM INSTALL NOT YET EXECUTED.** The actual signed production metadata was used to produce a deterministic read-only ManagedPlan (hash `d6c33c4954edbf0bb9868551e7622f44ec041793d01f7d3c6d8ec751a73a4c0b`). The real plan remains BLOCKED; NEW PREFLIGHT/PLAN REQUIRED BEFORE OWNER APPROVAL. See [real installation readiness](FROSTVEIL_REAL_INSTALL_READY.md). Approval E is still excluded; no fresh owner authorization was requested or consumed. L5/Nexus work was not started.
+
+Read-only planning context: Codex's MSIX packaging redirects newly created LocalAppData metadata children. Root-identity validation correctly refused that redirected metadata path. Planning therefore used an explicit persistent private audit metadata root outside Git/cloud/game files; production validators were not changed. The installed Launcher must create its own fresh plan from its actual storage/ownership receipt before E can be considered. The retained hash describes this audit plan, not an authorization accepted by the installed UI.
