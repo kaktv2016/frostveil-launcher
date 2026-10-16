@@ -27,10 +27,13 @@ await core.verifyDownloadedInstaller(oldFile,oldInstaller.sha512,[],undefined,{e
 async function run(file,args){return new Promise((resolve,reject)=>{const child=spawn(file,args,{windowsHide:true,stdio:'ignore'});child.once('error',reject);child.once('exit',code=>code===0?resolve():reject(Error('Owned installer exited '+code)));});}
 await run(oldFile,['/S','--no-desktop-shortcut','/D='+install]);
 assert.equal(JSON.parse(extractFile(path.join(install,'resources/app.asar'),'package.json')).version,'0.1.6');
+// NSIS temporarily removes/replaces the executable. Record the verified original
+// location before handoff; transient absence is not evidence of update failure.
+const expectedExe=(await fs.realpath(exe)).toLowerCase();
 const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
 let app;let oldPid;const checks=[];
 async function processes(){const r=await execute(powershell,['-NoProfile','-NonInteractive','-Command',"@(Get-Process -Name 'Skyrim RP Launcher' -ErrorAction SilentlyContinue | ForEach-Object { @{id=$_.Id;path=$_.Path;window=[string]$_.MainWindowHandle} }) | ConvertTo-Json -Compress"],{windowsHide:true});const p=JSON.parse(r.stdout.trim()||'[]');return Array.isArray(p)?p:[p];}
-async function ownedProcesses(){const target=(await fs.realpath(exe)).toLowerCase(),result=[];for(const p of await processes()){try{if(typeof p.path==='string'&&(await fs.realpath(p.path)).toLowerCase()===target)result.push(p);}catch{/* Exited process. */}}return result;}
+async function ownedProcesses(){const result=[];for(const p of await processes()){try{if(typeof p.path==='string'&&(await fs.realpath(p.path)).toLowerCase()===expectedExe)result.push(p);}catch{/* Exited process or executable temporarily being replaced. */}}return result;}
 async function until(check,label){const end=Date.now()+120000;for(;;){const value=await check();if(value)return value;if(Date.now()>end)throw Error('Timed out waiting for '+label);await new Promise(r=>setTimeout(r,500));}}
 async function closeOwned(p){const r=await execute(powershell,['-NoProfile','-NonInteractive','-Command',"$p=Get-Process -Id ([int]$env:FV_OWNED_PID) -ErrorAction Stop; if($p.Path -ne $env:FV_OWNED_EXE){throw 'Process identity changed'}; [void]$p.CloseMainWindow()"],{windowsHide:true,env:{...process.env,FV_OWNED_PID:String(p.id),FV_OWNED_EXE:p.path}});await until(async()=>!(await ownedProcesses()).some(x=>x.id===p.id),'owned updated app close');}
 try{
@@ -48,5 +51,5 @@ try{
  await updated.screenshot({path:path.join(output,'public-update-and-download.png'),fullPage:true});
  const result={status:'PASS',verifiedAt:new Date().toISOString(),from:'0.1.6',to:'0.1.7',productionPublicKeysOnly:true,anonymous:true,loopback:false,substituteInstallCallback:false,realGameWrites:false,runner:'disposable github-hosted Windows',checks,pack:{id:pack.packId,version:pack.version,files:pack.files},oldReleaseId:old.id,newReleaseId:(await metadataFor('v0.1.7')).id};
  await fs.writeFile(path.join(output,'report.json'),JSON.stringify(result,null,2)+'\n');console.log(JSON.stringify(result));
-}catch(e){await fs.writeFile(path.join(output,'failure.json'),JSON.stringify({error:String(e),processes:await ownedProcesses().catch(()=>[]),installedVersion:await fs.readFile(path.join(install,'resources/app.asar')).then(()=>JSON.parse(extractFile(path.join(install,'resources/app.asar'),'package.json')).version).catch(()=>null)},null,2));throw e;}
+}catch(e){await fs.writeFile(path.join(output,'failure.json'),JSON.stringify({error:String(e),checks,processes:await ownedProcesses().catch(()=>[]),installedVersion:await fs.readFile(path.join(install,'resources/app.asar')).then(()=>JSON.parse(extractFile(path.join(install,'resources/app.asar'),'package.json')).version).catch(()=>null)},null,2));throw e;}
 finally{await app?.close().catch(()=>{});for(const p of (await ownedProcesses().catch(()=>[])).filter(p=>p.window!=='0'))await closeOwned(p).catch(()=>{});}
