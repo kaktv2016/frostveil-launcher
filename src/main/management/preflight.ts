@@ -5,6 +5,7 @@ import {noLinks,safeFile} from '../files';
 import {readOrderInputs,readPluginHeader,type OrderInputs} from '../modpack/plugins';
 import {planActivation} from './activation';
 import type {Scan} from '../../shared/contracts';
+import {EXISTING_LIGHT_NOTICE} from './eligibility';
 
 export interface ManagedFileEvidence {name:string;path:string;size:number;mtimeMs:number;device:number;inode:number;links:number;light?:boolean;master?:boolean;masters?:string[];}
 export interface ManagedPreflight {
@@ -64,7 +65,7 @@ export async function inspectManagedInstallation(game:string,orderDirectory:stri
  if(!runtime?.ready)result.manual.push('Skyrim/SKSE/SkyMP runtime baseline is unverified.');
  if(runtime&&path.resolve(runtime.directory).toLowerCase()!==result.root.toLowerCase())block('Runtime evidence is bound to another installation.');
  const activeLight=result.activation?.active.some(name=>result.plugins.some(p=>p.name.toLowerCase()===name.toLowerCase()&&(p.light||/\.esl$/i.test(p.name))));
- if(activeLight)result.manual.push('Existing active light/ESL plugins are preserved; their gameplay compatibility with the pinned SkyMP build is unverified.');
+ if(activeLight)result.manual.push(EXISTING_LIGHT_NOTICE);
  result.status=result.blockers.length?'BLOCKED':result.managerDetected?'MANUAL ACTION REQUIRED':!runtime?.ready||activeLight?'UNVERIFIED':'READY';
  return result;
 }

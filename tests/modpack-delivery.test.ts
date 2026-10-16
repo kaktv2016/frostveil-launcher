@@ -513,9 +513,11 @@ test('Modpack Delivery #1–#5: valid Ed25519 manifest accepted; tampered manife
  }
 });
 
-test('Modpack Delivery #6–#13: ManagementService end-to-end corrupt download rejection, install, update, repair, conflict refusal, unmanaged/official file preservation, and rollback',async()=>{
+for(const preserveLight of [false,true]) test('Modpack Delivery #6–#13: ManagementService end-to-end corrupt download rejection, install, update, repair, conflict refusal, unmanaged/official file preservation, and rollback'+(preserveLight?' [existing ESL preserved]':''),async()=>{
  const env=await createDisposableSkyrimInstall();
  const corruptEnv=await createDisposableSkyrimInstall();
+ const existingLight=makeTes4Plugin();existingLight.writeUInt32LE(0x200,8);
+ if(preserveLight)for(const install of [env,corruptEnv]){await fs.writeFile(path.join(install.game,'Data/ccExisting.esl'),existingLight);await fs.writeFile(path.join(install.game,'Skyrim.ccc'),'ccExisting.esl\r\n');}
  const modpackPair=generateKeyPairSync('ed25519');
  const modpackPub=modpackPair.publicKey.export({type:'spki',format:'pem'}).toString();
  const keyId='frostveil-modpack-publisher-20261016';
@@ -641,7 +643,8 @@ test('Modpack Delivery #6–#13: ManagementService end-to-end corrupt download r
   corruptAssetId=null;
   await service.initialize();
   const inspected=await service.inspect();
-  assert.equal(inspected.phase,'complete');
+  assert.equal(inspected.phase,preserveLight?'blocked':'complete',inspected.message);
+  if(preserveLight)assert.equal(inspected.status,'UNVERIFIED');
   assert.equal(inspected.productionConfigured,true);
 
   const preparedInstall=await service.prepare('install');
@@ -701,6 +704,7 @@ test('Modpack Delivery #6–#13: ManagementService end-to-end corrupt download r
   const rolledBack=await service.rollback();
   assert.equal(rolledBack.phase,'complete');
   assert.equal(rolledBack.installedVersion,'1.0.0');
+  if(preserveLight){assert.deepEqual(await fs.readFile(path.join(env.game,'Data/ccExisting.esl')),existingLight);assert.equal(await fs.readFile(path.join(env.game,'Skyrim.ccc'),'utf8'),'ccExisting.esl\r\n');assert.ok(rolledBack.plan===undefined);}
   assert.equal(await fs.readFile(path.join(env.game,'Data/Frostveil/settings.json'),'utf8'),v1Settings.toString('utf8'));
   assert.equal(await fs.readFile(path.join(env.game,'Data/Frostveil/readme.txt'),'utf8'),v1Readme.toString('utf8'));
   assert.equal(await fs.readFile(path.join(env.game,'Data/Interface/Frostveil/hud-reference.html'),'utf8'),v1Hud.toString('utf8'));

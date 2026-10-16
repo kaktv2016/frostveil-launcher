@@ -1,4 +1,6 @@
 import type {Channel,UpdateState,FutureUpdates} from '../shared/contracts';
+export {ProductionDownloads} from './management/downloads';
+export {installPreflightIssue,finalPlanPreflightIssue,restorationPreflightIssue} from './management/eligibility';
 export const futureUpdates:FutureUpdates={github:null,trustedManifestKeys:{}};
 export function updateState(channel:Channel):UpdateState{return{launcher:futureUpdates.github?'NOT AVAILABLE IN L1':'NOT CONFIGURED',modpack:'NOT AVAILABLE IN L1',channel};}
 export {validateManifest} from './modpack/schema';

@@ -15,6 +15,8 @@ import {readPluginHeader} from '../modpack/plugins';
 import {cancelled} from '../modpack/scanner';
 import {inspectManagedInstallation,type ManagedPreflight} from './preflight';
 import {planActivation,type ActivationHeader} from './activation';
+import {installPreflightIssue,finalPlanPreflightIssue,restorationPreflightIssue} from './eligibility';
+import type {PackageReference} from '../../shared/modpack-contracts';
 import {prepareManagementPlan} from './planner';
 import {freezePlan,planDigest,PlanAuthorizer} from './authorization';
 import type {ManagedPlan,ManagementIntent,ManagementState,ManagedAction} from '../../shared/management-contracts';
@@ -53,7 +55,8 @@ export class ManagementService {
   confirm:(plan:unknown,hash:string)=>Promise<boolean>,
   private readonly versionReader=fileVersion,
   private readonly source:DistributionSource=productionSource,
-  private readonly providerFactory:()=>GitHubDistributionProvider=()=>new GitHubDistributionProvider()
+  private readonly providerFactory:()=>GitHubDistributionProvider=()=>new GitHubDistributionProvider(),
+  private readonly stageDownload?:(grant:SandboxGrant,reference:PackageReference,signal?:AbortSignal)=>Promise<string>
  ){
   this.authorizer=new PlanAuthorizer(confirm);
   this.state={
@@ -192,8 +195,9 @@ export class ManagementService {
   try{
    const context=await this.context(true);if(context.channel!==this.source.channel)throw Error('Selected release channel is not approved by production policy');
    const preflight=await this.preflight(context);cancelled(controller.signal);if(!this.current(revision))return this.snapshot();this.present(preflight);
-   if(preflight.status!=='READY'){this.update({phase:'blocked',status:preflight.status,message:preflight.blockers[0]??preflight.manual[0]??'Real installation preflight remains unverified.'});return this.snapshot();}
+   if(preflight.blockers.length){this.update({phase:'blocked',status:preflight.status,message:preflight.blockers[0]!});return this.snapshot();}
    const provider=this.providerFactory(),release=await provider.resolve(this.source.channel,undefined,controller.signal),bundle=authenticateRelease(await provider.envelope(release,controller.signal),this.source,release);
+   const issue=installPreflightIssue(preflight,bundle);if(issue){this.update({phase:'blocked',status:preflight.status,message:issue});return this.snapshot();}
    if(lt(this.launcherVersion,bundle.manifest.minimumLauncherVersion))throw Error('This modpack requires a newer Launcher version');
    await safeDirectory(this.storage);const grant=await registerRealTarget(context.directory,context.orderDirectory,this.storage,context.runtime!,this.versionReader),history=await this.history(grant);
    if(history.records.some(j=>!terminal.has(j.state)))throw Error('Recovery required before another installation');
@@ -206,11 +210,12 @@ export class ManagementService {
     cancelled(controller.signal);const actual=await observe(grant,file.path);
     if(actual?.sha256===file.sha256&&actual.size===file.size)continue;
     const ref=bundle.packages.find(p=>p.sha256===file.sha256&&p.size===file.size);if(!ref)throw Error('Authenticated direct-file package binding missing');
-    const cache=await downloader.acquire(ref,controller.signal);completed++;bytes+=file.size;
+    const cache=await (this.stageDownload?this.stageDownload(grant,ref,controller.signal):downloader.acquire(ref,controller.signal));completed++;bytes+=file.size;
     if(/^data\/[^/]+\.(esm|esp)$/i.test(file.path))headers[file.path.slice(5)]=await readPluginHeader(cache);
     if(this.current(revision))this.update({progress:{stage:'verified staging outside Skyrim',completed,total:bundle.packages.length,bytes}});
    }
-   const activation=await this.activation(preflight,bundle,history.receipt,intent,headers),plan=await prepareManagementPlan(grant,bundle,history.receipt,intent,this.evidence(preflight),activation);
+   const activation=await this.activation(preflight,bundle,history.receipt,intent,headers),plan=await prepareManagementPlan(grant,bundle,history.receipt,intent,this.evidence(preflight),activation,this.launcherVersion);
+   const finalIssue=finalPlanPreflightIssue(preflight,bundle,plan);if(finalIssue){this.update({phase:'blocked',status:preflight.status,message:finalIssue});return this.snapshot();}
    cancelled(controller.signal);if(!this.current(revision))return this.snapshot();
    this.prepared={plan,bundle,grant,downloader};
    this.update({
@@ -238,9 +243,10 @@ export class ManagementService {
  private async revalidate(prepared:Prepared){
   const context=await this.context(true);if(!await sameSelection(context,prepared.grant)||context.channel!==prepared.plan.channel)throw Error('Selected installation or release channel changed');
   await checkRoots(prepared.grant);const bundle=authenticateRelease(prepared.bundle.envelope,this.source,prepared.bundle.release);
-  const preflight=await this.preflight(context);if(preflight.status!=='READY')throw Error(preflight.blockers[0]??preflight.manual[0]??'Current preflight is not ready');
+  const preflight=await this.preflight(context),issue=installPreflightIssue(preflight,bundle);if(issue)throw Error(issue);
   const engine=await SandboxInstaller.open(prepared.grant,{}),receipt=await engine.receipt(),activation=await this.activation(preflight,bundle,receipt,prepared.plan.intent,await this.headers(prepared));
-  const current=await prepareManagementPlan(prepared.grant,bundle,receipt,prepared.plan.intent,this.evidence(preflight),activation);
+  const current=await prepareManagementPlan(prepared.grant,bundle,receipt,prepared.plan.intent,this.evidence(preflight),activation,this.launcherVersion);
+  const finalIssue=finalPlanPreflightIssue(preflight,bundle,current);if(finalIssue)throw Error(finalIssue);
   if(current.blockers.length||Date.parse(prepared.plan.expiresAt)<=Date.now()||planDigest(withoutClock(current))!==planDigest(withoutClock(prepared.plan)))throw Error('Installation plan changed or expired; prepare a fresh review');
   return preflight;
  }
@@ -278,12 +284,13 @@ export class ManagementService {
   const grant=this.grant,{controller,revision}=this.start();this.clearPlan();
   try{
    const context=await this.context(true);if(!await sameSelection(context,grant)||!context.runtime?.ready)throw Error('Current trusted Skyrim selection is required for recovery');
-   const preflight=await this.preflight(context);if(preflight.status!=='READY')throw Error(preflight.blockers[0]??preflight.manual[0]??'Recovery preflight is not ready');
+   const preflight=await this.preflight(context);if(preflight.blockers.length)throw Error(preflight.blockers[0]);
    const {store,records,receipt}=await this.history(grant),reader=await SandboxInstaller.open(grant,{}),candidate=mode==='rollback'?await reader.rollbackCandidate():undefined;
    const selected=mode==='rollback'?records.filter(j=>j.id===candidate):records.filter(j=>!terminal.has(j.state));if(!selected.length)throw Error('No '+mode+' candidate is available');
    if(selected.length!==1)throw Error('Multiple incomplete transactions require individual manual recovery review');
    let saved:{plan:ManagedPlan;envelope:unknown};try{saved=await store.read('transactions/'+selected[0]!.id+'/management-plan.json') as typeof saved;}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;saved=await store.read('management-plan.json') as typeof saved;}
    if(!saved?.plan||saved.plan.targetId!==grant.id||saved.plan.signedPayloadHash!==selected[0]!.manifestHash||!saved.envelope)throw Error('Original reviewed management plan is unavailable or does not match this transaction');
+   const restorationIssue=restorationPreflightIssue(preflight,selected.flatMap(j=>j.operations.map(o=>o.path)),saved.plan.pluginPlan.order);if(restorationIssue)throw Error(restorationIssue);
    const actions:ManagedAction[]=[];
    for(const journal of selected)for(const operation of [...journal.operations].reverse()){
     const actual=await observe(grant,operation.path);
@@ -292,11 +299,11 @@ export class ManagementService {
     actions.push({path:operation.path,action:operation.type==='configuration'?'configuration':operation.original?'repair':'remove',sha256:operation.original?.sha256??operation.sha256,size:operation.original?.size??0,componentId:operation.componentId,original:actual});
    }
    const journalBinding=selected.map(j=>({id:j.id,digest:planDigest(j)}));
-   const plan=freezePlan({...saved.plan,intent:mode==='rollback'?'remove':'repair',createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+120000).toISOString(),receiptDigest:planDigest(receipt),actions,blockers:[],manual:['Restore only files attributable to the selected transaction; external changes must be preserved.'],release:{...(saved.plan.release as object),restoration:{operation:mode,journals:journalBinding}},downloadBytes:0,backupBytes:0,requiredBytes:actions.reduce((n,a)=>n+a.size*2,1024*1024)}) as ManagedPlan;
+   const plan=freezePlan({...saved.plan,intent:mode==='rollback'?'remove':'repair',createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+120000).toISOString(),receiptDigest:planDigest(receipt),actions,blockers:[],manual:[...preflight.manual,'Restore only files attributable to the selected transaction; external changes must be preserved.'],release:{...(saved.plan.release as object),restoration:{operation:mode,journals:journalBinding}},downloadBytes:0,backupBytes:0,requiredBytes:actions.reduce((n,a)=>n+a.size*2,1024*1024)}) as ManagedPlan;
    this.update({phase:'awaiting-review',status:'RECOVERY REVIEW REQUIRED',message:'Review the exact restoration operations before native confirmation.',plan,planHash:planDigest(plan),realWriteAuthorized:false});
    const token=await this.authorizer.request(plan);cancelled(controller.signal);
    const freshContext=await this.context(true);if(!await sameSelection(freshContext,grant))throw Error('Recovery installation selection changed');
-   const fresh=await this.preflight(freshContext);if(fresh.status!=='READY')throw Error('Recovery preflight changed');
+   const fresh=await this.preflight(freshContext);if(restorationPreflightIssue(fresh,selected.flatMap(j=>j.operations.map(o=>o.path)),saved.plan.pluginPlan.order))throw Error('Recovery preflight changed');
    if(planDigest(await reader.receipt())!==plan.receiptDigest)throw Error('Recovery ownership receipt changed');
    for(const binding of journalBinding)if(planDigest(await store.read('transactions/'+binding.id+'/journal.json'))!==binding.digest)throw Error('Recovery journal changed');
    for(const action of plan.actions)if(!sameObservation(action.original,await observe(grant,action.path)))throw Error('Recovery target changed after approval');

@@ -1,7 +1,8 @@
+import {ProductionDownloads} from './management/downloads';import {inspectSkyUI,SKYUI_SOURCE} from './management/external-mods';
 import {ManagementService} from './management/service';import {runManagementFixtureDemo} from './management/demo';
 import {readTestProfile} from './distribution/level-b';
 import {DistributionService} from './distribution/service';
-import {app,BrowserWindow,ipcMain,dialog,protocol,net} from 'electron';
+import {app,BrowserWindow,ipcMain,dialog,protocol,net,shell} from 'electron';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -33,10 +34,11 @@ async function start(){
  const settingsPath=path.join(storage,'settings.json');
  let profileFile=fixture?path.join(fixture,'profile.json'):path.join(storage,'compatibility-profile.json');
  if(!fixture){try{await noLinks(profileFile);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;profileFile=path.join(__dirname,'../assets/local-baseline.json');}}
- const profile:Profile=JSON.parse((await fs.readFile(profileFile,'utf8')).replace(/^\uFEFF/,''));
+ let profile:Profile=JSON.parse((await fs.readFile(profileFile,'utf8')).replace(/^\uFEFF/,''));
  let settings:Settings={directory:fixture?path.join(fixture,'game'):'',channel:'stable'};
  try{settings=validateSettings(JSON.parse(await fs.readFile(settingsPath,'utf8')));}catch{/* first start or invalid local settings: safe defaults */}
  const state:Dashboard={version:app.getVersion(),settings,scan:null,backup:null,updates:updateState(settings.channel),server:'NOT TESTED',events:[]};
+ const downloads=new ProductionDownloads(storage,app.getVersion());state.productionDownloads=downloads.snapshot();
  const writeLocal=async(file:string,data:unknown)=>{try{await noLinks(file);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}await fs.writeFile(file,JSON.stringify(data,null,2));};
  const log=async(message:string)=>{state.events.unshift(new Date().toISOString()+' '+message);state.events=state.events.slice(0,60);await writeLocal(path.join(storage,'diagnostics.json'),state.events);};
  const version=fixture?async(file:string)=>path.basename(file)==='SkyrimSE.exe'?profile.runtime:profile.skseVersion:fileVersion;
@@ -44,6 +46,7 @@ async function start(){
  let busy=false;
  const scan=async()=>{
   if(!settings.directory){const choices=await discoverSteam(await steamRoots());settings.directory=choices[0]??'';}
+  if(settings.directory&&!profile.files.length&&!fixture&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{profile=await downloads.baselineProfile();}catch(error){await log('Signed public baseline unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
   state.scan=settings.directory?await scanInstallation(settings.directory,profile,version):null;
   if(!settings.directory)await log('No Steam installation detected; select a game folder');else await log(state.scan?.ready?'Installation matches local baseline; server connection NOT TESTED':'Installation incompatible/unverified — Play blocked');
   await writeLocal(settingsPath,settings);return state.scan;
@@ -58,17 +61,18 @@ async function start(){
  const modpack=new ModpackVerifier(fixture??storage,app.getVersion(),fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition'),version);
  const levelBEnabled=process.argv.includes('--distribution-level-b'),profileIndex=process.argv.indexOf('--level-b-profile'),levelBProfileFile=levelBEnabled&&profileIndex>=0?process.argv[profileIndex+1]:undefined;if(levelBEnabled&&(!levelBProfileFile||!path.isAbsolute(levelBProfileFile)))throw Error('Explicit absolute public test profile required');const levelBProfile=levelBProfileFile?await readTestProfile(levelBProfileFile):undefined;
  const distribution=new DistributionService(storage,levelBProfile);await distribution.initialize();state.distribution=distribution.snapshot();
- const management=new ManagementService(storage,app.getVersion(),()=>({directory:settings.directory,orderDirectory:fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition'),runtime:state.scan,channel:settings.channel,iniDirectory:fixture?path.join(fixture,'ini'):path.join(app.getPath('documents'),'My Games','Skyrim Special Edition')}),async(plan,hash)=>{if(smoke)return false;const answer=await dialog.showMessageBox(window,{type:'warning',title:'Review exact Skyrim modpack plan',message:'Authorize this exact installation transaction?',detail:hash+'\n'+JSON.stringify(plan,null,2),buttons:['Cancel','Authorize this plan'],defaultId:0,cancelId:0,noLink:true});return answer.response===1;},version);await management.initialize();state.management=management.snapshot();
+ const management=new ManagementService(storage,app.getVersion(),()=>({directory:settings.directory,orderDirectory:fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition'),runtime:state.scan,channel:settings.channel,iniDirectory:fixture?path.join(fixture,'ini'):path.join(app.getPath('documents'),'My Games','Skyrim Special Edition')}),async(plan,hash)=>{if(smoke)return false;const answer=await dialog.showMessageBox(window,{type:'warning',title:'Review exact Skyrim modpack plan',message:'Authorize this exact installation transaction?',detail:hash+'\n'+JSON.stringify(plan,null,2),buttons:['Cancel','Authorize this plan'],defaultId:0,cancelId:0,noLink:true});return answer.response===1;},version,undefined,undefined,(grant,ref,signal)=>downloads.stage(grant,ref,signal));await management.initialize();state.management=management.snapshot();
  const installer=new InstallerSandboxDemo(storage);await installer.initialize();state.installer=installer.snapshot();
  state.modpack=modpack.snapshot();
  state.launcherUpdate=updater.snapshot();
  const window=new BrowserWindow({width:1180,height:780,minWidth:960,minHeight:680,show:false,backgroundColor:'#101310',title:'Frostveil Launcher',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true}});
+ const unsubscribeDownloads=downloads.subscribe(snapshot=>{state.productionDownloads=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:production-downloads-state',snapshot);});
  const unsubscribeUpdate=updater.subscribe(snapshot=>{state.launcherUpdate=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:update-state',snapshot);});
  const unsubscribePack=modpack.subscribe(snapshot=>{state.modpack=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:modpack-state',snapshot);});
  const unsubscribeDistribution=distribution.subscribe(snapshot=>{state.distribution=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:distribution-state',snapshot);});
  const unsubscribeManagement=management.subscribe(snapshot=>{state.management=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:management-state',snapshot);});
  const unsubscribeInstaller=installer.subscribe(snapshot=>{state.installer=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:installer-state',snapshot);});
- window.once('closed',()=>{unsubscribeManagement();management.dispose();unsubscribeDistribution();distribution.dispose();unsubscribeInstaller();installer.dispose();unsubscribeUpdate();unsubscribePack();modpack.dispose();updater.dispose();});
+ window.once('closed',()=>{unsubscribeDownloads();downloads.dispose();unsubscribeManagement();management.dispose();unsubscribeDistribution();distribution.dispose();unsubscribeInstaller();installer.dispose();unsubscribeUpdate();unsubscribePack();modpack.dispose();updater.dispose();});
  window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
  window.webContents.on('will-navigate',(event,url)=>{if(url!=='app://launcher/index.html')event.preventDefault();});
  window.webContents.session.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
@@ -76,11 +80,15 @@ async function start(){
  window.webContents.on('will-attach-webview',event=>event.preventDefault());
  const handler=(name:string,fn:(arg:unknown)=>Promise<void>)=>ipcMain.handle('launcher:'+name,async(event,arg)=>{
   if(event.sender!==window.webContents||!authorize(event.senderFrame?.url??'',event.senderFrame===window.webContents.mainFrame))throw Error('Unauthorized IPC sender');
-  if(name==='status'||name==='cancel-management'||name==='cancel-distribution'||name==='cancel-modpack'||name==='cancel-installer-sandbox'){await fn(arg);return structuredClone(state);}
+  if(name==='status'||name==='cancel-server-files'||name==='cancel-management'||name==='cancel-distribution'||name==='cancel-modpack'||name==='cancel-installer-sandbox'){await fn(arg);return structuredClone(state);}
   if(busy)throw Error('Another operation is in progress');busy=true;
   try{await fn(arg);return structuredClone(state);}catch(error){const message=error instanceof Error?error.message:'Operation failed';await log(message);throw Error(message);}finally{busy=false;}
  });
  const noArgument=(arg:unknown)=>{if(arg!==undefined)throw Error('Unexpected IPC input');};
+ handler('download-server-files',async arg=>{noArgument(arg);if(smoke)throw Error('Production download is disabled in fixture smoke');await downloads.download();});
+ handler('cancel-server-files',async arg=>{noArgument(arg);downloads.cancel();});
+ handler('open-skyui-source',async arg=>{noArgument(arg);if(smoke)throw Error('External navigation is disabled in fixture smoke');await shell.openExternal(SKYUI_SOURCE);});
+ handler('inspect-skyui',async arg=>{noArgument(arg);if(smoke)throw Error('External folders are disabled in fixture smoke');const selected=(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Choose extracted SkyUI folder (read-only verification)'})).filePaths[0];if(selected)state.externalMod=await inspectSkyUI(selected);});
  handler('status',async arg=>{noArgument(arg);});
  handler('inspect-management',async arg=>{noArgument(arg);await scan();await management.inspect();});
  handler('prepare-management',async arg=>{await scan();await management.prepare(arg);});

@@ -9,6 +9,6 @@ assert.equal(main.includes('c9d19a50b06f2d55c5e9a31c6ba85b947c021581faa56c442316
 assert.equal(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/.test(main),false,'GitHub token packaged');
 assert.equal(/[A-Z]:[/\\]+Users[/\\]+[^/\\]+/i.test(main),false,'Personal user path packaged in main');
 assert.equal(/[A-Z]:[/\\]+Users[/\\]+[^/\\]+/i.test(preload),false,'Personal user path packaged in preload');
-assert.equal(pkg.version,'0.1.6');assert.equal(pkg.version,source.version);assert.equal(source.build.appId,'dev.skyrimrp.launcher');assert.equal(source.build.productName,'Skyrim RP Launcher');
+assert.equal(pkg.version,'0.1.7');assert.equal(pkg.version,source.version);assert.equal(source.build.appId,'dev.skyrimrp.launcher');assert.equal(source.build.productName,'Skyrim RP Launcher');
 assert.ok(main.includes('REAL INSTALLATION PLAN NOT AUTHORIZED'));assert.ok(main.includes('PRODUCTION NOT CONFIGURED'));assert.ok(main.includes('realWriteAuthorized: false'));assert.ok(main.includes('frostveil-launcher-update.json'));assertProductionTrust(main);
-console.log('L4-C + Player Distribution packaged source/trust/boundary/privacy audit PASSED; version 0.1.6, no private keys, tokens, personal paths or unapproved trust promotion.');
+console.log('L4-C + Player Distribution packaged source/trust/boundary/privacy audit PASSED; version 0.1.7, no private keys, tokens, personal paths or unapproved trust promotion.');
