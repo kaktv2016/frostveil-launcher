@@ -17,6 +17,14 @@ jobs:
       - run: npm run typecheck
       - name: L1-L4-C regressions, signed updater, isolated NSIS upgrade and recovery
         run: npm test
+      - name: Disposable NSIS failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frostveil-disposable-test-diagnostics
+          path: ${{ runner.temp }}/frostveil-nsis-diagnostics.json
+          if-no-files-found: ignore
+          retention-days: 3
       - run: npm run build
       - run: npm run package:nsis
       - run: node scripts/verify-artifacts.mjs

@@ -141,7 +141,13 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
  }
  const metadataBefore=await snapshotMetadata(),receiptBefore=await fixtureStore.read('ownership.json');
  async function events(){try{return(await fs.readFile(boot.events,'utf8')).trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return[];throw e;}}
- async function until(check:()=>Promise<boolean>,label:string){const deadline=Date.now()+90000;while(!await check()){if(Date.now()>deadline)throw Error('Timed out waiting for '+label);await new Promise(r=>setTimeout(r,100));}}
+ async function until(check:()=>Promise<boolean>,label:string){const deadline=Date.now()+90000;while(!await check()){if(Date.now()>deadline){
+  const installedVersion=await fs.readFile(path.join(installDir,'resources/app.asar')).then(()=>JSON.parse(extractFile(path.join(installDir,'resources/app.asar'),'package.json').toString()).version).catch(()=>null);
+  const diagnostics={label,events:await events(),installedVersion,tempRoot,canonicalTempRoot:await fs.realpath(tempRoot)};
+  console.error('Disposable NSIS diagnostics:',JSON.stringify(diagnostics));
+  if(process.env.RUNNER_TEMP)await fs.writeFile(path.join(process.env.RUNNER_TEMP,'frostveil-nsis-diagnostics.json'),JSON.stringify(diagnostics,null,2));
+  throw Error('Timed out waiting for '+label);
+ }await new Promise(r=>setTimeout(r,100));}}
 
  let httpServer:http.Server|undefined;
  try{

@@ -133,7 +133,7 @@ test('persisted session opened before L1 scan rebinds recovery evidence after sc
   await service.initialize();
   assert.equal(service.snapshot().phase,'recovery-required');
   assert.equal(service.snapshot().recovery,'required');
-  assert.deepEqual(service.snapshot().backups,[journalId]);
+  assert.deepEqual(service.snapshot().backups,[journalId],JSON.stringify({state:service.snapshot(),storage:f.storage,canonicalStorage:await fs.realpath(f.storage),grantDirectory:grant.directory}));
  }finally{service.dispose();f.service.dispose();await fs.rm(f.root,{recursive:true,force:true});}
 });
 

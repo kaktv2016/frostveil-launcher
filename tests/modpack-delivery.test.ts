@@ -652,7 +652,7 @@ test('Modpack Delivery #6–#13: ManagementService end-to-end corrupt download r
   assert.ok(preparedInstall.planHash);
 
   const installed=await service.apply(preparedInstall.planHash);
-  assert.equal(installed.phase,'complete');
+  assert.equal(installed.phase,'complete',JSON.stringify({message:installed.message,selection:env.game,canonicalSelection:await fs.realpath(env.game)}));
   assert.equal(installed.installedVersion,'1.0.0');
   assert.equal(await fs.readFile(path.join(env.game,'Data/Frostveil/settings.json'),'utf8'),v1Settings.toString('utf8'));
   assert.equal(await fs.readFile(path.join(env.game,'Data/Frostveil/readme.txt'),'utf8'),v1Readme.toString('utf8'));
