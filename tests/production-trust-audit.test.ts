@@ -16,6 +16,11 @@ const bundle=(value:ReturnType<typeof configs>)=>Object.entries(value).map(([nam
 test('artifact audit accepts exactly the approved independent production fingerprints',async()=>{
  const {assertProductionTrust}=await import(script);assertProductionTrust(bundle(configs()));
 });
+test('artifact audit reads esbuild module initializers without executing their assignment',async()=>{
+ const {assertProductionTrust}=await import(script);
+ const initializers=Object.entries(configs()).map(([name,v])=>name+' = '+JSON.stringify(v)+';').join('\n');
+ assertProductionTrust('var productionSource;var productionLauncherUpdateSource;'+initializers);
+});
 test('artifact audit rejects cross-channel key substitution and unreviewed extra pins',async()=>{
  const {assertProductionTrust}=await import(script),c=configs();
  c.productionSource.keys['frostveil-modpack-publisher-20261016'].publicKey=publicKeys.launcher;

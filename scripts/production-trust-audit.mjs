@@ -40,7 +40,7 @@ function literal(text,start){
  const result=read();skip();assert.equal(text[index],';','Trust initializer must end as a literal declaration');return result;
 }
 export function assertProductionTrust(text){
- const values=new Map(),declarations=/\b(?:var|let|const)\s+(productionSource|productionLauncherUpdateSource)(?:\s*:[^=;\n]+)?\s*=\s*/g;
+ const values=new Map(),declarations=/\b(productionSource|productionLauncherUpdateSource)(?:\s*:[^=;\n]+)?\s*=\s*/g;
  for(const match of text.matchAll(declarations)){
   assert.equal(values.has(match[1]),false,'Duplicate production trust declaration');
   values.set(match[1],literal(text,match.index+match[0].length));
