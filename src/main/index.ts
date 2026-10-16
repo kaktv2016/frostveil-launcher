@@ -49,6 +49,8 @@ async function start(){
   if(settings.directory&&!profile.files.length&&!fixture&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{profile=await downloads.baselineProfile();}catch(error){await log('Signed public baseline unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
   state.scan=settings.directory?await scanInstallation(settings.directory,profile,version):null;
   if(!settings.directory)await log('No Steam installation detected; select a game folder');else await log(state.scan?.ready?'Installation matches local baseline; server connection NOT TESTED':'Installation incompatible/unverified — Play blocked');
+  if(settings.directory){const orderDir=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');if(!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')&&!await downloads.isInstalled(settings.directory,orderDir)){try{await log('1-Click Auto-Install: Installing server files & activating SkyUI...');await downloads.installAndActivate(settings.directory,orderDir);await log('Server files and SkyUI installed and activated in plugins.txt');}catch(error){await log('Auto-install failed: '+(error instanceof Error?error.message:'Unknown error'));}}downloads.setInstalled(await downloads.isInstalled(settings.directory,orderDir));}
+  state.productionDownloads=downloads.snapshot();
   await writeLocal(settingsPath,settings);return state.scan;
  };
  const root=path.join(__dirname,'renderer');
@@ -65,7 +67,7 @@ async function start(){
  const installer=new InstallerSandboxDemo(storage);await installer.initialize();state.installer=installer.snapshot();
  state.modpack=modpack.snapshot();
  state.launcherUpdate=updater.snapshot();
- const window=new BrowserWindow({width:1180,height:780,minWidth:960,minHeight:680,show:false,backgroundColor:'#101310',title:'Frostveil Launcher',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true}});
+ const window=new BrowserWindow({width:1180,height:780,minWidth:960,minHeight:680,show:true,backgroundColor:'#101310',title:'Frostveil Launcher',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true}});
  const unsubscribeDownloads=downloads.subscribe(snapshot=>{state.productionDownloads=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:production-downloads-state',snapshot);});
  const unsubscribeUpdate=updater.subscribe(snapshot=>{state.launcherUpdate=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:update-state',snapshot);});
  const unsubscribePack=modpack.subscribe(snapshot=>{state.modpack=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:modpack-state',snapshot);});
@@ -85,7 +87,7 @@ async function start(){
   try{await fn(arg);return structuredClone(state);}catch(error){const message=error instanceof Error?error.message:'Operation failed';await log(message);throw Error(message);}finally{busy=false;}
  });
  const noArgument=(arg:unknown)=>{if(arg!==undefined)throw Error('Unexpected IPC input');};
- handler('download-server-files',async arg=>{noArgument(arg);if(smoke)throw Error('Production download is disabled in fixture smoke');await downloads.download();});
+ handler('download-server-files',async arg=>{noArgument(arg);if(smoke)throw Error('Production download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await downloads.installAndActivate(settings.directory,orderDirectory);await scan();await log('Server files and SkyUI installed and activated in plugins.txt');});
  handler('cancel-server-files',async arg=>{noArgument(arg);downloads.cancel();});
  handler('open-skyui-source',async arg=>{noArgument(arg);if(smoke)throw Error('External navigation is disabled in fixture smoke');await shell.openExternal(SKYUI_SOURCE);});
  handler('inspect-skyui',async arg=>{noArgument(arg);if(smoke)throw Error('External folders are disabled in fixture smoke');const selected=(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Choose extracted SkyUI folder (read-only verification)'})).filePaths[0];if(selected)state.externalMod=await inspectSkyUI(selected);});
@@ -117,10 +119,10 @@ async function start(){
  handler('cancel-installer-sandbox',async arg=>{noArgument(arg);installer.cancel();});
  handler('cancel-modpack',async arg=>{noArgument(arg);modpack.cancel();});
  handler('backup',async arg=>{noArgument(arg);if(!settings.directory)throw Error('Select a game installation first');state.backup=null;state.backup=await createBackup(settings.directory,path.join(storage,'backups'),profile);await log(`Verified integration backup: ${state.backup.files} files (${state.backup.skipped.length} skipped); not a full game backup`);});
- handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');await launch.play(async()=>{const current=await scan();if(!current)throw Error('No installation selected');if(mandatoryPackPolicy){await modpack.scan(settings.directory,settings.channel,current);modpack.enforce();}return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
- app.on('second-instance',()=>{if(window.isMinimized())window.restore();window.focus();});
+ handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');if(settings.directory&&!smoke){const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');if(!await downloads.isInstalled(settings.directory,orderDirectory)){await log('1-Click Auto-Install: Installing server files & activating SkyUI...');await downloads.installAndActivate(settings.directory,orderDirectory);await scan();}}await launch.play(async()=>{const current=await scan();if(!current)throw Error('No installation selected');if(mandatoryPackPolicy){await modpack.scan(settings.directory,settings.channel,current);modpack.enforce();}return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
+ app.on('second-instance',()=>{window.show();if(window.isMinimized())window.restore();window.focus();});
  window.once('ready-to-show',()=>{window.show();});
- await window.loadURL('app://launcher/index.html');
+ await window.loadURL('app://launcher/index.html');window.show();window.focus();
  if(!fixture)void updater.check();
  app.on('window-all-closed',()=>app.quit());
 }

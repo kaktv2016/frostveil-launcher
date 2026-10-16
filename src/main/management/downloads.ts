@@ -18,6 +18,7 @@ export class ProductionDownloads {
  private state:ProductionDownloadState={phase:'idle',message:'Download signed server files before choosing whether to install them.',signature:'UNVERIFIED',installed:false,files:[],externalRequirements:0,bytes:0,totalBytes:0};
  private grant?:SandboxGrant;
  private controller?:AbortController;
+ private lastBundle?:ReturnType<typeof authenticateRelease>;
  private listeners=new Set<(state:ProductionDownloadState)=>void>();
  private disposed=false;
  constructor(private storage:string,private version:string,private source:DistributionSource=productionSource,private providerFactory=()=>new GitHubDistributionProvider()){}
@@ -57,6 +58,7 @@ export class ProductionDownloads {
  async baselineProfile():Promise<Profile>{
   if(this.disposed)throw Error('Download service disposed');
   const provider=this.providerFactory(),release=await provider.resolve(this.source.channel),bundle=authenticateRelease(await provider.envelope(release),this.source,release);
+  this.lastBundle=bundle;
   if(lt(this.version,bundle.manifest.minimumLauncherVersion))throw Error('Update Launcher before resolving the public baseline');
   await safeDirectory(this.storage);await new VersionLedger(path.join(this.storage,'production-download-history')).accept(bundle.manifest.packId,bundle.manifest.channel,bundle.manifest.packVersion,bundle.manifestHash);
   const pack=bundle.manifest,skseDll='skse64_'+pack.requiredSkyrimRuntime.split('.').slice(0,3).join('_')+'.dll';
@@ -73,6 +75,7 @@ export class ProductionDownloads {
   try{
    const provider=this.providerFactory(),release=await provider.resolve(this.source.channel,undefined,controller.signal);
    const bundle=authenticateRelease(await provider.envelope(release,controller.signal),this.source,release);
+   this.lastBundle=bundle;
    if(lt(this.version,bundle.manifest.minimumLauncherVersion))throw Error('Update Launcher before downloading this pack');
    const grant=await this.cache();await new VersionLedger(path.join(this.storage,'production-download-history')).accept(bundle.manifest.packId,bundle.manifest.channel,bundle.manifest.packVersion,bundle.manifestHash);
    const totalBytes=bundle.packages.reduce((n,p)=>n+p.size,0);let completed=0;
@@ -82,6 +85,68 @@ export class ProductionDownloads {
    this.update({phase:'complete',message:'Files downloaded and verified. NOT INSTALLED — review installation separately.',bytes:totalBytes});
   }catch(e){this.update({phase:controller.signal.aborted?'cancelled':'error',message:controller.signal.aborted?'Download cancelled; verified cache retained.':e instanceof Error?e.message:'Download failed',installed:false});}
   finally{this.controller=undefined;}
+  return this.snapshot();
+ }
+ setInstalled(installed:boolean){if(this.state.installed!==installed)this.update({installed,...(installed&&this.state.phase==='idle'?{message:'Server files & mods (SkyUI) are installed and active.'}:{})});}
+ async isInstalled(gameDirectory:string,orderDirectory:string):Promise<boolean>{
+  if(!gameDirectory)return false;
+  try{
+   await fs.access(path.join(gameDirectory,'Data','SkyUI_SE.esp'));
+   await fs.access(path.join(gameDirectory,'Data','SkyUI_SE.bsa'));
+   const pluginsFile=path.join(orderDirectory,'plugins.txt');
+   const content=await fs.readFile(pluginsFile,'utf8');
+   return /^\s*\*SkyUI_SE\.esp\s*$/mi.test(content);
+  }catch{return false;}
+ }
+ async installAndActivate(gameDirectory:string,orderDirectory:string):Promise<ProductionDownloadState>{
+  if(this.disposed)throw Error('Download service disposed');
+  if(!gameDirectory)throw Error('Skyrim game folder is required');
+  await this.download();
+  if(this.state.phase!=='complete')throw Error('Server files download could not be completed: '+this.state.message);
+  const bundle=this.lastBundle??await(async()=>{const provider=this.providerFactory(),release=await provider.resolve(this.source.channel);return authenticateRelease(await provider.envelope(release),this.source,release);})();
+  const grant=await this.cache();
+  this.update({phase:'downloading',message:'Installing verified server files & mods (SkyUI) to Skyrim…'});
+  const allowedFiles=bundle.manifest.files.filter(f=>f.distribution==='allowed'&&f.package);
+  for(const file of allowedFiles){
+   const payloadPath=path.join(grant.payloads,file.package!.sha256+'.bin');
+   await noLinks(payloadPath);
+   const st=await fs.stat(payloadPath);
+   if(st.size!==file.package!.size)throw Error(`Payload size mismatch for ${file.path}`);
+   const h=await hashFile(payloadPath,PAYLOAD_LIMIT);
+   if(h.sha256!==file.package!.sha256)throw Error(`Payload hash mismatch for ${file.path}`);
+   const destPath=path.join(gameDirectory,...file.path.split('/'));
+   await fs.mkdir(path.dirname(destPath),{recursive:true});
+   try{await fs.chmod(destPath,0o666);}catch{}
+   await fs.copyFile(payloadPath,destPath);
+   const destHash=await hashFile(destPath,PAYLOAD_LIMIT);
+   if(destHash.sha256!==file.package!.sha256||destHash.size!==file.package!.size)throw Error(`Failed to verify installed file: ${file.path}`);
+  }
+  const pluginsToActivate=allowedFiles.filter(f=>/\.(?:esp|esm)$/i.test(f.path)).map(f=>path.basename(f.path));
+  if(pluginsToActivate.length>0){
+   const pluginsFile=path.join(orderDirectory,'plugins.txt');
+   await fs.mkdir(orderDirectory,{recursive:true});
+   let existing='',bom='',newline='\r\n';
+   try{
+    const raw=await fs.readFile(pluginsFile,'utf8');
+    bom=raw.startsWith('\uFEFF')?'\uFEFF':'';
+    existing=raw.slice(bom.length);
+    if(existing.includes('\r\n'))newline='\r\n';else if(existing.includes('\n'))newline='\n';
+   }catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;existing='# This file is used by Skyrim to keep track of your downloaded content.\r\n# Please do not modify this file.\r\n';}
+   const lines=existing.split(/\r?\n/);
+   if(lines.length>0&&lines[lines.length-1]==='')lines.pop();
+   for(const plugin of pluginsToActivate){
+    const lower=plugin.toLowerCase();let found=false;
+    for(let i=0;i<lines.length;i++){
+     const line=lines[i]!.trim();
+     if(line.replace(/^\*/,'').trim().toLowerCase()===lower){lines[i]='*'+plugin;found=true;break;}
+    }
+    if(!found)lines.push('*'+plugin);
+   }
+   const newContent=bom+lines.join(newline)+newline;
+   try{await fs.chmod(pluginsFile,0o666);}catch{}
+   await fs.writeFile(pluginsFile,newContent,'utf8');
+  }
+  this.update({phase:'complete',installed:true,message:'Server files & mods (SkyUI) installed and activated in plugins.txt! Ready to play.'});
   return this.snapshot();
  }
  /** Trusted Main supplies an authenticated reference and an existing target capability. */
