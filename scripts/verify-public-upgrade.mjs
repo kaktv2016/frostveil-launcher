@@ -2,7 +2,7 @@
 // an owner's workstation: registry, shortcuts and app identity require a fresh VM.
 import fs from 'node:fs/promises';import path from 'node:path';import os from 'node:os';import assert from 'node:assert/strict';
 import {spawn,execFile} from 'node:child_process';import {promisify} from 'node:util';import {createHash} from 'node:crypto';import {createRequire} from 'node:module';
-import {build} from 'esbuild';import {extractFile} from '@electron/asar';import {_electron as electron,expect} from '@playwright/test';
+import {build} from 'esbuild';import {extractFile,uncache} from '@electron/asar';import {_electron as electron,expect} from '@playwright/test';
 assert.equal(process.platform,'win32');assert.equal(process.env.GITHUB_ACTIONS,'true','Public installer acceptance runs only on a disposable hosted runner');assert.equal(process.env.RUNNER_ENVIRONMENT,'github-hosted');
 delete process.env.GH_TOKEN;delete process.env.GITHUB_TOKEN;
 const output=path.resolve('.local/public-upgrade');await fs.mkdir(output,{recursive:true});
@@ -26,7 +26,8 @@ const bytes=Buffer.from(await response.arrayBuffer());assert.equal(bytes.length,
 await core.verifyDownloadedInstaller(oldFile,oldInstaller.sha512,[],undefined,{envelope:oldEnvelope,source:core.productionLauncherUpdateSource,release:old,installedVersion:'0.1.5'});
 async function run(file,args){return new Promise((resolve,reject)=>{const child=spawn(file,args,{windowsHide:true,stdio:'ignore'});child.once('error',reject);child.once('exit',code=>code===0?resolve():reject(Error('Owned installer exited '+code)));});}
 await run(oldFile,['/S','--no-desktop-shortcut','/D='+install]);
-assert.equal(JSON.parse(extractFile(path.join(install,'resources/app.asar'),'package.json')).version,'0.1.6');
+function installedVersion(){const archive=path.join(install,'resources/app.asar');uncache(archive);return JSON.parse(extractFile(archive,'package.json')).version;}
+assert.equal(installedVersion(),'0.1.6');
 // NSIS temporarily removes/replaces the executable. Record the verified original
 // location before handoff; transient absence is not evidence of update failure.
 const expectedExe=(await fs.realpath(exe)).toLowerCase();
@@ -42,7 +43,7 @@ try{
  const state=await page.evaluate(()=>window.launcher.status());assert.equal(state.launcherUpdate.publisherTrust,'verified');assert.equal(state.launcherUpdate.canDownload,true);
  await page.evaluate(()=>window.launcher.downloadUpdate());const downloaded=await page.evaluate(()=>window.launcher.status());assert.equal(downloaded.launcherUpdate.verification,'installer-verified');assert.equal(downloaded.launcherUpdate.canInstall,true);checks.push('Actual public0.1.6 application verified and downloaded public0.1.7 through normal production updater');
  try{await page.evaluate(()=>window.launcher.installUpdate());}catch(e){if(!/closed|destroyed/i.test(String(e)))throw e;}
- const restarted=await until(async()=>{const p=(await ownedProcesses()).find(p=>p.id!==oldPid&&p.window!=='0');if(!p)return;const pkg=JSON.parse(extractFile(path.join(install,'resources/app.asar'),'package.json'));return pkg.version==='0.1.7'?p:undefined;},'actual new installed application window');
+ const restarted=await until(async()=>{const p=(await ownedProcesses()).find(p=>p.id!==oldPid&&p.window!=='0');if(!p)return;return installedVersion()==='0.1.7'?p:undefined;},'actual new installed application window');
  assert.equal((await ownedProcesses()).some(p=>p.id===oldPid),false);assert.equal(await fs.readFile(path.join(storage,'settings.json'),'utf8'),settings);assert.deepEqual(await snapshot(),before);checks.push('Default NSIS handoff exited old process, upgraded real installed files and restarted new application window');checks.push('Settings and authenticated ownership/journals/backup bytes preserved exactly');
  await closeOwned(restarted);await app.close().catch(()=>{});app=await electron.launch({executablePath:exe,args:[],env,timeout:30000});const updated=await app.firstWindow();
  await updated.waitForFunction(async()=>(await window.launcher.status()).version==='0.1.7');await updated.getByRole('button',{name:/^Updates/}).click();await expect(updated.getByRole('button',{name:'Download Server Files',exact:true})).toBeEnabled();
@@ -51,5 +52,5 @@ try{
  await updated.screenshot({path:path.join(output,'public-update-and-download.png'),fullPage:true});
  const result={status:'PASS',verifiedAt:new Date().toISOString(),from:'0.1.6',to:'0.1.7',productionPublicKeysOnly:true,anonymous:true,loopback:false,substituteInstallCallback:false,realGameWrites:false,runner:'disposable github-hosted Windows',checks,pack:{id:pack.packId,version:pack.version,files:pack.files},oldReleaseId:old.id,newReleaseId:(await metadataFor('v0.1.7')).id};
  await fs.writeFile(path.join(output,'report.json'),JSON.stringify(result,null,2)+'\n');console.log(JSON.stringify(result));
-}catch(e){await fs.writeFile(path.join(output,'failure.json'),JSON.stringify({error:String(e),checks,processes:await ownedProcesses().catch(()=>[]),installedVersion:await fs.readFile(path.join(install,'resources/app.asar')).then(()=>JSON.parse(extractFile(path.join(install,'resources/app.asar'),'package.json')).version).catch(()=>null)},null,2));throw e;}
+}catch(e){await fs.writeFile(path.join(output,'failure.json'),JSON.stringify({error:String(e),checks,processes:await ownedProcesses().catch(()=>[]),installedVersion:await fs.readFile(path.join(install,'resources/app.asar')).then(()=>installedVersion()).catch(()=>null)},null,2));throw e;}
 finally{await app?.close().catch(()=>{});for(const p of (await ownedProcesses().catch(()=>[])).filter(p=>p.window!=='0'))await closeOwned(p).catch(()=>{});}
