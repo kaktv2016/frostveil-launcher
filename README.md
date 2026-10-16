@@ -1,25 +1,57 @@
-# Skyrim RP Launcher — L1
+# Frostveil Launcher
 
-Current work: [Frostveil L2 self-update/source repository](L2.md), version0.1.1. L1 sections below preserve foundation context; L2 implements launcher update state/IPC/UI but real download/install is signing-gated. Modpack updates remain future work.
+Windows Electron/React/TypeScript launcher, version **0.1.6**. Current production
+release execution and evidence: [release report](FROSTVEIL_PRODUCTION_RELEASE_REPORT.md).
+Real-game installation remains a separate owner-approved operation:
+[installation readiness](FROSTVEIL_REAL_INSTALL_READY.md).
 
-Standalone Windows Electron/React/TypeScript/Vite/Tailwind app. Game integration is read-only: detects the existing Steam AppID489830 installation (registry + multiple libraryfolders + appmanifest), supports native folder selection, checks real version resources and a local hash baseline, creates bounded integration backups, and launches only the existing SKSE loader after the user clicks Play.
+## Current capabilities
 
-## Local workflow
+- Steam AppID 489830 discovery, game-folder selection, Skyrim/SKSE resource versions,
+  client-file verification, integration backup and Play through the existing SKSE loader.
+- Independent Ed25519 Launcher update and Modpack publisher identities. Installer
+  asset identity, size, SHA-256/SHA-512 and cached bytes are verified before NSIS
+  execution. Downgrade/mutation and installation while Skyrim/SKSE is running are
+  blocked. `latest.yml` alone cannot authorize an installer.
+- Manifest/runtime/plugin/offline-server verification, anonymous fixed-repository
+  GitHub transfers, ownership-aware plans, journals, backups, rollback and recovery.
+- Real Modpack writes require a fresh Main-owned plan, compatible preflight and
+  explicit native confirmation of its hash. Renderer input cannot select publishers,
+  arbitrary roots or bypass confirmation.
 
-Node24.11.1 was used; dependencies are pinned in package-lock.json. No global installs or Git client required for end users.
+The original production keys are pinned after encrypted offline backup recovery
+verification. Publication and player acceptance are still in progress; use the
+release report for actual published URLs/IDs rather than candidate files. The first
+approved pack contains three first-party metadata/reference files only. Bethesda,
+SKSE and SkyMP files remain external verification requirements, not redistributed
+payloads. Nexus/third-party mod integration is not included.
+
+## Development and verification
+
+Node **24.11.1** was used. Dependencies are pinned in `package-lock.json`.
 
 ```powershell
 npm ci
 npm run typecheck
 npm test
 npm run build
-npm start
-npm run package:dir
-npm run package:nsis
 npm run smoke
+npm run package:nsis
+node scripts/verify-artifacts.mjs
+node scripts/verify-l3-artifacts.mjs
+node scripts/verify-l4a-artifacts.mjs
+node scripts/verify-l4b-artifacts.mjs
+node scripts/verify-l4c-artifacts.mjs
 ```
 
-`test` uses inert temporary files and injected versions/process adapters. `smoke` launches only Electron against generated fixtures and explicitly blocks real game launch. To smoke the packaged app:
+The full suite builds/executes disposable Windows NSIS installers and launches an
+isolated installed Electron application to test its update/restart. It also exercises
+inert Skyrim-shaped fixtures and interrupted own-child recovery. It does not launch
+Skyrim or change the real game/server. Do not package concurrently with the full
+suite because the NSIS regression rebuilds `dist/`.
+
+`npm start` opens the development application. Smoke uses generated fixtures and
+blocks real game launch. To smoke the unpacked build:
 
 ```powershell
 $env:LAUNCHER_SMOKE_EXE=(Resolve-Path 'release/win-unpacked/Skyrim RP Launcher.exe').Path
@@ -27,45 +59,36 @@ npm run smoke
 Remove-Item Env:LAUNCHER_SMOKE_EXE
 ```
 
-No lint configuration is installed; strict TypeScript and focused tests are the configured gates. No SkyMP engine build, game repair, installer execution, server restart, commit, remote creation or publication is part of this workflow.
+Builds use `--publish never`; CI repository permissions are read-only. Production
+publication is an explicit reviewed operation. Candidate/signing scripts are offline
+engineering tools; placeholder IDs must never become final release bindings.
 
-## Compatibility evidence
+## Runtime and storage
 
-The public `assets/local-baseline.json` pins Skyrim Steam1.6.1170.0 and SKSE file version0.2.2.6 (release2.2.6) but intentionally has no machine-specific client hashes. The developer's existing 24-file baseline is preserved in `%LOCALAPPDATA%/SkyrimRPLauncher/compatibility-profile.json` and ignored `.local/`, not uploaded. Main loads the private profile when present; absent client evidence blocks Play. Evidence is the user's solo-tested local client, **not an invented upstream SkyMP version**. Native components include SkyrimPlatform.dll, MpClientPlugin.dll and SkyrimPlatformImpl.dll with their required dependencies/address database/client JS/config/UI. Public distribution client profiles require separate verification in a future phase.
+Local baseline: Skyrim Steam **1.6.1170.0**, SKSE release **2.2.6** (file version
+**0.2.2.6**). `assets/local-baseline.json` deliberately contains no machine-specific
+client hashes. An existing reviewed profile at
+`%LOCALAPPDATA%/SkyrimRPLauncher/compatibility-profile.json` supplies the client
+baseline; absent evidence blocks Play. A production pack manifest does not silently
+replace this L1 profile. First-player baseline provisioning still needs review.
 
-Every file is classified LOCAL BASELINE MATCH / MISSING / DIFFERENT / UNVERIFIED. Unknown versions or modified same-version executables block Play. Baseline configuration changes are intentional source changes requiring review/rebuild, not an automatic “trust current files” button. Exact build versions for unversioned DLLs remain unverified even when their baseline hashes match.
+App ID `dev.skyrimrp.launcher`, product/executable `Skyrim RP Launcher` and existing
+`%LOCALAPPDATA%/SkyrimRPLauncher` storage are preserved. Integration backups are not
+full game/save backups. Private profiles/keys, downloaded bytes, ownership data,
+journals and game assets are excluded from published source/packages.
 
-READY means local compatibility only; server connection remains NOT TESTED. Play revalidates, checks SkyrimSE and SKSE processes, uses a fixed loader with no shell/renderer arguments, serializes operations, and observes early startup failures. A 15-second startup guard covers the loader-to-game handoff; after that, existing game/loader detection prevents duplicates. Process creation is not proof of in-game loading or multiplayer connection.
+## Acceptance limits
 
-## Files and privileges
+The owner previously verified Play opens Skyrim and connects to the local server.
+Production pack installation and in-game acceptance remain pending. File integrity,
+offline snapshot match and actual live compatibility are separate findings. Active
+Creation Club light-plugin compatibility remains **UNVERIFIED**; activation is preserved.
 
-- `src/main/{discovery,installation,windows,files}.ts`: registry/VDF, PE versions, path/hash checks and OS adapters.
-- `src/main/{backup,launch,authorization,session-state,index}.ts`: bounded backup, fixed Play, sender/input validation, per-installation UI state and Electron lifecycle.
-- `src/shared/contracts.ts`, `src/main/updates.ts`: typed IPC and disabled future update contracts/fixture validation.
-- `src/preload/index.ts`: only status/scan/choose/channel/backup/play; no raw Node, shell, filesystem or IPC exposed.
-- `src/renderer/`: locally bundled original CSS/SVG interface, English/Thai text; dashboard/settings/updates/diagnostics.
-- `.github/workflows/windows.yml`: lockfile Windows checks/package/smoke; no publish step. CI itself is not yet run on GitHub.
+Installed Launcher **0.1.4** needs one manual bootstrap to 0.1.6. The first release
+does not prove a public 0.1.6 → 0.1.7 update; that requires a separately approved
+later release. The installer lacks Authenticode; first installation may require
+manual Windows confirmation. Subsequent update trust uses Ed25519 signatures and
+exact installer bytes.
 
-Sandbox/context isolation on; Node integration off; strict CSP/custom local protocol, navigation/popups/webview/permissions blocked. Launcher settings/logs live under `%LOCALAPPDATA%/SkyrimRPLauncher`; diagnostics are bounded to60 entries. No credentials are read into renderer or embedded.
-
-## Backups
-
-UI action creates a unique verified backup under `%LOCALAPPDATA%/SkyrimRPLauncher/backups/`. Exact allowlist: SkyrimPlatform.ini, skymp5-client.js, skymp5-client-settings.txt and rp-chat/index.html at their existing relative paths. Max32 files and32MiB total; links/junctions, redirected parents and unsafe paths are rejected. Original SHA/size, installation path/identifier, timestamp and copy SHA are recorded; source changes during copying fail verification. Missing files are listed as skipped; an empty backup is a diagnostic snapshot, not a full Skyrim backup. Failed/partial backups remain marked FAILED and are never overwritten. Selecting another installation clears the previous backup status.
-
-No automatic restore or modification is implemented. L2 must require a verified backup tied to the exact affected installation/file and current original hash before changing any managed existing file; staged downloads and a separate journal/rollback design remain future work.
-
-## Update and distribution gates
-
-Launcher self-update: planned electron-updater/public GitHub Releases, separate semver and stable/beta preferences. Owner/repository are null; no updater is instantiated or contacted. Modpack update: separate versioned manifest with compatibility, hashes/sizes, component ownership and permission metadata. L1 parses only synthetic fixtures. Untrusted metadata is not proof of redistribution rights or authenticity, and no downloads/installation/deletion/apply methods exist.
-
-L2 trust model: verify Ed25519 signed payload before parsing/planning; pinned key-ID→public-key map, overlapping trusted keys for rotation, retire compromised keys through authenticated launcher releases. Windows Authenticode publisher validation, updater manifest authenticity and modpack signatures are distinct controls. Hashes alone authenticate none of these. Release metadata conventions must match the pinned builder/updater versions; builder26 docs differ from v27 signed-manifest requirements.
-
-Local `--publish never` build is explicitly unsigned/not a production release. `electron-builder.production.example.json` is a nonfunctional template with forceCodeSigning=true and required placeholders. Missing publisher/signing credentials, manifest signing keys, GitHub owner/repos and distribution permissions block production readiness but do not block local L1. No verification switch is disabled to make packaging pass. No auto-update compatibility claim until a later installed-build update test.
-
-References checked: [Electron security](https://www.electronjs.org/docs/latest/tutorial/security), [process model](https://www.electronjs.org/docs/latest/tutorial/process-model), [Vite requirements](https://vite.dev/guide/), [builder26 updates](https://www.electron.build/v26/docs/features/auto-update/), [Windows signing](https://www.electron.build/docs/features/code-signing/code-signing-win/), [signed manifest changes](https://www.electron.build/docs/migration/v27-breaking-changes/).
-
-## Manual acceptance
-
-2026-10-14: user confirmed **Play opens the real game and connects to the existing server successfully**. Installer installation and the other individual manual checks below are not separately confirmed; auto-updates remain disabled.
-
-Open the unpacked launcher or install the **local unsigned** NSIS package yourself. Confirm detected path/runtime/SKSE/client status, re-scan, native folder selection, baseline backup, and channel preferences. With Skyrim closed, click Play once; the user has verified this opens the game and joins the server. Click again while running and verify refusal. Installer installation and remaining checks still require confirmation. The launcher does not automate menus or configure the server.
+Earlier context: [L1](L1.md), [L2](L2.md), [L3](L3.md), [L4-A](L4A_REPORT.md),
+[L4-B](L4B_REPORT.md), [L4-C](L4C_REPORT.md).

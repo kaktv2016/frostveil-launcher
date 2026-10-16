@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';import fs from 'node:fs/promises';import {listPackage,extractFile} from '@electron/asar';
+import {assertProductionTrust} from './production-trust-audit.mjs';
+const archive='release/win-unpacked/resources/app.asar',entries=listPackage(archive),main=extractFile(archive,'dist/main.cjs').toString(),preload=extractFile(archive,'dist/preload.cjs').toString(),source=JSON.parse(await fs.readFile('package.json','utf8')),pkg=JSON.parse(extractFile(archive,'package.json').toString());
+assert.equal(entries.some(p=>/(?:^|[\/\\])(?:managed-installations|managed-history|management-session\.json|management-plan\.json|downloads|transactions|auth-key|\.local|tests|trusted-versions\.json|plugins\.txt|loadorder\.txt|Skyrim\.ccc)(?:[\/\\]|$)/i.test(p)),false,'Managed private evidence packaged');
+assert.equal(/BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY/.test(main),false,'Private key packaged');
+assert.equal(main.includes('302e020100300506032b657004220420'),false,'Fixture private key packaged');
+assert.equal(main.includes('frostveil-level-b-test-20261015'),false,'Level B test publisher keyId packaged');
+assert.equal(main.includes('c9d19a50b06f2d55c5e9a31c6ba85b947c021581faa56c44231679223ce31391'),false,'Level B test publisher fingerprint packaged');
+assert.equal(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/.test(main),false,'GitHub token packaged');
+assert.equal(/[A-Z]:[/\\]+Users[/\\]+[^/\\]+/i.test(main),false,'Personal user path packaged in main');
+assert.equal(/[A-Z]:[/\\]+Users[/\\]+[^/\\]+/i.test(preload),false,'Personal user path packaged in preload');
+assert.equal(pkg.version,'0.1.6');assert.equal(pkg.version,source.version);assert.equal(source.build.appId,'dev.skyrimrp.launcher');assert.equal(source.build.productName,'Skyrim RP Launcher');
+assert.ok(main.includes('REAL INSTALLATION PLAN NOT AUTHORIZED'));assert.ok(main.includes('PRODUCTION NOT CONFIGURED'));assert.ok(main.includes('realWriteAuthorized: false'));assert.ok(main.includes('frostveil-launcher-update.json'));assertProductionTrust(main);
+console.log('L4-C + Player Distribution packaged source/trust/boundary/privacy audit PASSED; version 0.1.6, no private keys, tokens, personal paths or unapproved trust promotion.');

@@ -1,3 +1,6 @@
+import {ManagementService} from './management/service';import {runManagementFixtureDemo} from './management/demo';
+import {readTestProfile} from './distribution/level-b';
+import {DistributionService} from './distribution/service';
 import {app,BrowserWindow,ipcMain,dialog,protocol,net} from 'electron';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -12,6 +15,8 @@ import {contained,relativePath,safeDirectory,noLinks,checkExistingAncestors} fro
 import {updateState} from './updates';
 import {selectInstallation} from './session-state';
 import {createUpdater} from './update-bootstrap';
+import {InstallerSandboxDemo} from './installer/demo';
+import {ModpackVerifier,mandatoryPackPolicy} from './modpack/service';
 import type {Dashboard,Profile,Settings} from '../shared/contracts';
 
 const smoke=process.argv.includes('--smoke');
@@ -50,10 +55,20 @@ async function start(){
   }catch{return new Response('Not found',{status:404});}
  });
  const updater=await createUpdater(!!fixture);
+ const modpack=new ModpackVerifier(fixture??storage,app.getVersion(),fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition'),version);
+ const levelBEnabled=process.argv.includes('--distribution-level-b'),profileIndex=process.argv.indexOf('--level-b-profile'),levelBProfileFile=levelBEnabled&&profileIndex>=0?process.argv[profileIndex+1]:undefined;if(levelBEnabled&&(!levelBProfileFile||!path.isAbsolute(levelBProfileFile)))throw Error('Explicit absolute public test profile required');const levelBProfile=levelBProfileFile?await readTestProfile(levelBProfileFile):undefined;
+ const distribution=new DistributionService(storage,levelBProfile);await distribution.initialize();state.distribution=distribution.snapshot();
+ const management=new ManagementService(storage,app.getVersion(),()=>({directory:settings.directory,orderDirectory:fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition'),runtime:state.scan,channel:settings.channel,iniDirectory:fixture?path.join(fixture,'ini'):path.join(app.getPath('documents'),'My Games','Skyrim Special Edition')}),async(plan,hash)=>{if(smoke)return false;const answer=await dialog.showMessageBox(window,{type:'warning',title:'Review exact Skyrim modpack plan',message:'Authorize this exact installation transaction?',detail:hash+'\n'+JSON.stringify(plan,null,2),buttons:['Cancel','Authorize this plan'],defaultId:0,cancelId:0,noLink:true});return answer.response===1;},version);await management.initialize();state.management=management.snapshot();
+ const installer=new InstallerSandboxDemo(storage);await installer.initialize();state.installer=installer.snapshot();
+ state.modpack=modpack.snapshot();
  state.launcherUpdate=updater.snapshot();
  const window=new BrowserWindow({width:1180,height:780,minWidth:960,minHeight:680,show:false,backgroundColor:'#101310',title:'Frostveil Launcher',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true}});
  const unsubscribeUpdate=updater.subscribe(snapshot=>{state.launcherUpdate=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:update-state',snapshot);});
- window.once('closed',()=>{unsubscribeUpdate();updater.dispose();});
+ const unsubscribePack=modpack.subscribe(snapshot=>{state.modpack=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:modpack-state',snapshot);});
+ const unsubscribeDistribution=distribution.subscribe(snapshot=>{state.distribution=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:distribution-state',snapshot);});
+ const unsubscribeManagement=management.subscribe(snapshot=>{state.management=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:management-state',snapshot);});
+ const unsubscribeInstaller=installer.subscribe(snapshot=>{state.installer=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:installer-state',snapshot);});
+ window.once('closed',()=>{unsubscribeManagement();management.dispose();unsubscribeDistribution();distribution.dispose();unsubscribeInstaller();installer.dispose();unsubscribeUpdate();unsubscribePack();modpack.dispose();updater.dispose();});
  window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
  window.webContents.on('will-navigate',(event,url)=>{if(url!=='app://launcher/index.html')event.preventDefault();});
  window.webContents.session.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
@@ -61,21 +76,40 @@ async function start(){
  window.webContents.on('will-attach-webview',event=>event.preventDefault());
  const handler=(name:string,fn:(arg:unknown)=>Promise<void>)=>ipcMain.handle('launcher:'+name,async(event,arg)=>{
   if(event.sender!==window.webContents||!authorize(event.senderFrame?.url??'',event.senderFrame===window.webContents.mainFrame))throw Error('Unauthorized IPC sender');
-  if(name==='status'){await fn(arg);return structuredClone(state);}
+  if(name==='status'||name==='cancel-management'||name==='cancel-distribution'||name==='cancel-modpack'||name==='cancel-installer-sandbox'){await fn(arg);return structuredClone(state);}
   if(busy)throw Error('Another operation is in progress');busy=true;
   try{await fn(arg);return structuredClone(state);}catch(error){const message=error instanceof Error?error.message:'Operation failed';await log(message);throw Error(message);}finally{busy=false;}
  });
  const noArgument=(arg:unknown)=>{if(arg!==undefined)throw Error('Unexpected IPC input');};
  handler('status',async arg=>{noArgument(arg);});
+ handler('inspect-management',async arg=>{noArgument(arg);await scan();await management.inspect();});
+ handler('prepare-management',async arg=>{await scan();await management.prepare(arg);});
+ handler('apply-management',async arg=>{await scan();await management.apply(arg);});
+ handler('cancel-management',async arg=>{noArgument(arg);management.cancel();});
+ handler('rollback-management',async arg=>{noArgument(arg);await scan();await management.rollback();});
+ handler('recover-management',async arg=>{noArgument(arg);await scan();await management.recover();});
+ handler('management-fixture',async arg=>{noArgument(arg);state.managementFixture={phase:'running',message:'Disposable installation fixture running',stage:'starting',checks:[]};const emit=()=>window.webContents.send('launcher:management-fixture-state',state.managementFixture);emit();try{const result=await runManagementFixtureDemo(stage=>{state.managementFixture!.stage=stage;emit();});state.managementFixture={phase:'complete',message:'REALISTIC SANDBOX VERIFIED — real Skyrim not modified',stage:'complete',checks:result.checks};}catch(error){state.managementFixture={phase:'error',message:error instanceof Error?error.message:'Fixture failed',stage:'error',checks:[]};throw error;}finally{emit();}});
+
  handler('scan',async arg=>{noArgument(arg);await scan();});
- handler('choose',async arg=>{noArgument(arg);const selected=fixture?path.join(fixture,'game'):(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Select folder containing SkyrimSE.exe'})).filePaths[0];if(selected){selectInstallation(state,selected);await scan();}});
+ handler('choose',async arg=>{noArgument(arg);const selected=fixture?path.join(fixture,'game'):(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Select folder containing SkyrimSE.exe'})).filePaths[0];if(selected){selectInstallation(state,selected);modpack.invalidate();await scan();}});
  handler('channel',async arg=>{if(arg!=='stable')throw Error('Beta is disabled until channel isolation is verified');settings.channel=validateSettings({directory:settings.directory,channel:arg}).channel;state.updates=updateState(settings.channel);await writeLocal(settingsPath,settings);});
  handler('check-update',async arg=>{noArgument(arg);await updater.check();state.launcherUpdate=updater.snapshot();});
  handler('download-update',async arg=>{noArgument(arg);await updater.download();state.launcherUpdate=updater.snapshot();});
  handler('install-update',async arg=>{noArgument(arg);await updater.install();state.launcherUpdate=updater.snapshot();});
  handler('defer-update',async arg=>{noArgument(arg);updater.defer();state.launcherUpdate=updater.snapshot();});
+ handler('scan-modpack',async arg=>{noArgument(arg);if(!settings.directory)throw Error('Select a game installation first');await scan();await modpack.scan(settings.directory,settings.channel,state.scan);});
+ handler('level-b-sandbox',async arg=>{noArgument(arg);if(!levelBProfileFile)throw Error('TEST DISTRIBUTION disabled in ordinary mode');await distribution.runGitHubTest(await readTestProfile(levelBProfileFile));});
+ handler('check-distribution',async arg=>{noArgument(arg);await distribution.check();});
+ handler('preview-distribution',async arg=>{noArgument(arg);state.distribution=distribution.snapshot();});
+ handler('distribution-sandbox',async arg=>{noArgument(arg);await distribution.runLocal();});
+ handler('cancel-distribution',async arg=>{noArgument(arg);distribution.cancel();});
+ handler('rollback-distribution',async arg=>{noArgument(arg);await distribution.rollback();});
+ handler('recover-distribution',async arg=>{noArgument(arg);await distribution.recover();});
+ handler('installer-sandbox',async arg=>{noArgument(arg);await installer.run();});
+ handler('cancel-installer-sandbox',async arg=>{noArgument(arg);installer.cancel();});
+ handler('cancel-modpack',async arg=>{noArgument(arg);modpack.cancel();});
  handler('backup',async arg=>{noArgument(arg);if(!settings.directory)throw Error('Select a game installation first');state.backup=null;state.backup=await createBackup(settings.directory,path.join(storage,'backups'),profile);await log(`Verified integration backup: ${state.backup.files} files (${state.backup.skipped.length} skipped); not a full game backup`);});
- handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');await launch.play(async()=>{const current=await scan();if(!current)throw Error('No installation selected');return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
+ handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');await launch.play(async()=>{const current=await scan();if(!current)throw Error('No installation selected');if(mandatoryPackPolicy){await modpack.scan(settings.directory,settings.channel,current);modpack.enforce();}return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
  app.on('second-instance',()=>{if(window.isMinimized())window.restore();window.focus();});
  window.once('ready-to-show',()=>{window.show();});
  await window.loadURL('app://launcher/index.html');

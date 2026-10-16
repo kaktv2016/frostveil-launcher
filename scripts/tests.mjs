@@ -1,5 +1,7 @@
 import {build} from 'esbuild';
 import {spawnSync} from 'node:child_process';
-await build({entryPoints:['tests/core.test.ts','tests/updater.test.ts'],outdir:'.test-build',outExtension:{'.js':'.cjs'},bundle:true,platform:'node',format:'cjs',packages:'external'});
-const result=spawnSync(process.execPath,['--test','.test-build/core.test.cjs','.test-build/updater.test.cjs'],{stdio:'inherit'});
+import fs from 'node:fs/promises';
+const tests=(await fs.readdir('tests')).filter(f=>f.endsWith('.test.ts')).map(f=>'tests/'+f);
+await build({entryPoints:[...tests,'tests/installer-worker.ts'],outdir:'.test-build',outExtension:{'.js':'.cjs'},bundle:true,platform:'node',format:'cjs',packages:'external'});
+const result=spawnSync(process.execPath,['--test',...tests.map(f=>'.test-build/'+f.slice(6).replace(/\.ts$/,'.cjs'))],{stdio:'inherit'});
 process.exit(result.status??1);

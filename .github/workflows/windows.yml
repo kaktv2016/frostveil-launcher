@@ -15,10 +15,17 @@ jobs:
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
       - run: npm run typecheck
-      - run: npm test
+      - name: L1-L4-C regressions, signed updater, isolated NSIS upgrade and recovery
+        run: npm test
       - run: npm run build
       - run: npm run package:nsis
       - run: node scripts/verify-artifacts.mjs
+      - run: node scripts/verify-l3-artifacts.mjs
+      - run: node scripts/verify-l4a-artifacts.mjs
+      - run: node scripts/verify-l4b-artifacts.mjs
+      - run: node scripts/verify-l4c-artifacts.mjs
+      - run: node scripts/sandbox-smoke.mjs
+      - run: node scripts/distribution-smoke.mjs
       - run: npm run smoke
       - name: Packaged fixture smoke
         shell: pwsh
