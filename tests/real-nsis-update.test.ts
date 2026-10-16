@@ -31,7 +31,7 @@ function runProcess(command:string,args:string[],cwd:string):Promise<{code:numbe
  });
 }
 
-interface DisposableBoot {localData:string;profile:string;events:string;closeRequest:string;}
+interface DisposableBoot {localData:string;temp:string;profile:string;events:string;closeRequest:string;}
 async function buildDisposableNsisInstaller(projectRoot:string,outDir:string,version:string,boot:DisposableBoot):Promise<string>{
  await fs.mkdir(outDir,{recursive:true});
  const injected=path.join(outDir,'disposable-entry');await fs.mkdir(injected);
@@ -41,6 +41,9 @@ async function buildDisposableNsisInstaller(projectRoot:string,outDir:string,ver
  const prelude=`
 const __fvBoot=${JSON.stringify(boot)};
 process.env.LOCALAPPDATA=__fvBoot.localData;
+// RDS/Explorer can restart in a different session TEMP (for example Temp/2).
+// Keep the test-only allowlisted temporary root identical across both versions.
+process.env.TEMP=__fvBoot.temp;process.env.TMP=__fvBoot.temp;
 process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST='1';
 if(!process.argv.includes('--launcher-update-test'))process.argv.push('--launcher-update-test','--launcher-update-test-profile',__fvBoot.profile);
 const __fvFs=require('node:fs'),__fvApp=require('electron').app;
@@ -112,7 +115,7 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
  const installDir=path.join(tempRoot,'installed-app');
  const isolatedLocalData=path.join(tempRoot,'isolated-local-app-data'),storage=path.join(isolatedLocalData,'SkyrimRPLauncher');
  const userDataDir=path.join(storage,'user-data');
- const boot:DisposableBoot={localData:isolatedLocalData,profile:path.join(tempRoot,'update-test-profile.json'),events:path.join(tempRoot,'boot-events.jsonl'),closeRequest:path.join(tempRoot,'close-request')};
+ const boot:DisposableBoot={localData:isolatedLocalData,temp:os.tmpdir(),profile:path.join(tempRoot,'update-test-profile.json'),events:path.join(tempRoot,'boot-events.jsonl'),closeRequest:path.join(tempRoot,'close-request')};
  await fs.mkdir(installDir,{recursive:true});
  await fs.mkdir(userDataDir,{recursive:true});
 
