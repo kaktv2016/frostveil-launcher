@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {load} from 'js-yaml';
 import {EventEmitter} from 'node:events';
+import {inc} from 'semver';
 import {LauncherUpdateService,type UpdateEngine} from './launcher-update-service';
 import {NsisEngine} from './updater-engine';
 import {
@@ -16,7 +17,7 @@ import {authenticode,gameRunning} from './windows';
 // Public signer subjects may be pinned here if Authenticode is ever used in addition to Ed25519 manifests.
 export const trustedPublisherNames:readonly string[]=[];
 class FixtureEngine extends EventEmitter implements UpdateEngine {
- readonly info={version:'0.1.7',files:[{url:'fixture.exe',sha512:'a'.repeat(88),size:10}],releaseNotes:'Synthetic fixture update — never installed',keyId:'fixture-ed25519',minimumLauncherVersion:'0.1.0'};
+ readonly info={version:inc(app.getVersion(),'patch')!,files:[{url:'fixture.exe',sha512:'a'.repeat(88),size:10}],releaseNotes:'Synthetic fixture update — never installed',keyId:'fixture-ed25519',minimumLauncherVersion:'0.1.0'};
  async check(){return this.info;}async download(){this.emit('progress',{percent:50,transferred:5,total:10,bytesPerSecond:5});await new Promise(r=>setTimeout(r,50));this.emit('downloaded',this.info);}
  install(){throw Error('Fixture self-install blocked');}cancel(){}
 }
