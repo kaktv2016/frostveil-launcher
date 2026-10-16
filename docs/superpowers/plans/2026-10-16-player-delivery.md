@@ -24,30 +24,30 @@
 
 Files: src/main/management/downloads.ts, shared management contracts, Main/preload, renderer controls, tests/production-downloads.test.ts.
 
-- [ ] RED: actual signed loopback bytes stage without a game root; unknown signatures/cache corruption/unsafe pointers fail; cancelled requests stay retryable.
-- [ ] Implement ProductionDownloads using existing generated sandbox capability, MetadataStore and PackageDownloader. Main owns fixed source/provider; renderer cannot supply paths/URLs/keys.
-- [ ] Expose download/cancel and truthful download-only state; stage into existing managed installation cache on later review without rewriting unowned game files.
-- [ ] GREEN: tests and source Electron smoke verify downloader controls and game-write separation.
+- [x] RED: actual signed loopback bytes stage without a game root; unknown signatures/cache corruption/unsafe pointers fail; existing streamed-downloader cancellation/resume regressions remain passing.
+- [x] Implement ProductionDownloads using existing generated sandbox capability, MetadataStore and PackageDownloader. Main owns fixed source/provider; renderer cannot supply paths/URLs/keys.
+- [x] Expose download/cancel and truthful download-only state; stage into existing managed installation cache on later review without rewriting unowned game files.
+- [x] GREEN: tests and source Electron smoke verify downloader controls and game-write separation.
 
 ## Task2 — Safe player install and external component explanation
 
 Files: management eligibility helper/service/planner tests; renderer management/download panels; external SkyUI source/read-only audit helper.
 
-- [ ] RED: existing-light UNVERIFIED may permit only exact Frostveil data/reference extension/prefix set, ready runtime, no hard blockers/managers, zero activation writes and unchanged server master indices. Script/plugin/BSA/native/unknown cases remain refused.
-- [ ] Implement scoped eligibility on prepare and both revalidation paths; retain warning and live UNVERIFIED. Never edit activation to clear warnings.
-- [ ] Provide fixed official SkyUI source action and read-only file verification/ESL warning. No automatic SkyUI install and no license claims.
-- [ ] Derive fresh-player L1 baseline only from authenticated production metadata when local baseline is absent; preserve supplied local profiles and all native external-only requirements.
-- [ ] GREEN: meaningful transaction/security tests, fixture real install/rollback/recovery and protected-file comparison.
+- [x] RED: existing-light UNVERIFIED may permit only exact Frostveil data/reference extension/prefix set, ready runtime, no hard blockers/managers, zero activation writes and unchanged server master indices. Script/plugin/BSA/native/unknown cases remain refused.
+- [x] Implement scoped eligibility on prepare and both revalidation paths; retain warning and live UNVERIFIED. Never edit activation to clear warnings.
+- [x] Provide fixed official SkyUI source action and read-only file verification/ESL warning. No automatic SkyUI install and no license claims.
+- [x] Derive fresh-player L1 baseline only from authenticated production metadata when local baseline is absent; preserve supplied local profiles and all native external-only requirements.
+- [x] GREEN: meaningful transaction/security tests, fixture real install/rollback/recovery and protected-file comparison.
 
 ## Task3 — Actual public Launcher upgrade
 
 Files: package version0.1.7, release audit/version expectations, read-only GitHub download/upgrade script and manually dispatched Windows workflow.
 
-- [ ] Tests/typecheck/NSIS/package/privacy/source+packaged smoke pass; normal reviewed commit/push; release-source CI passes.
-- [ ] Rebuild final sealed installer after changes. Draft-first v0.1.7 with actual asset IDs, independent readback and production signature. No old release edits or setting changes.
-- [ ] Anonymous normal production engine download verification.
-- [ ] Dispatch isolated Windows public upgrade: download authentic old v0.1.6 installer, install only in fresh runner, launch its actual app, use normal public updater IPC to acquire/install v0.1.7, verify old exit/new window/process/version and preserved settings/ownership/backups. No substitute callback, key or loopback transport.
-- [ ] Record exact source/release IDs/hashes and results. Manual game smoke instructions remain for owner; no game launch by agent.
+- [x] Tests/typecheck/NSIS/package/privacy/source+packaged smoke pass; normal reviewed commit/push; release-source CI passes.
+- [x] Rebuild final sealed installer after changes. Draft-first v0.1.7 with actual asset IDs, independent readback and production signature. No old release edits or setting changes.
+- [x] Anonymous normal production engine download verification.
+- [x] Dispatch isolated Windows public upgrade: download authentic old v0.1.6 installer, install only in fresh runner, launch its actual app, use normal public updater IPC to acquire/install v0.1.7, verify old exit/new window/process/version and preserved settings/ownership/backups. No substitute callback, key or loopback transport.
+- [x] Record exact source/release IDs/hashes and results. Manual game smoke instructions remain for owner; no game launch by agent.
 
 ## Review focus
 
@@ -56,3 +56,7 @@ Files: package version0.1.7, release audit/version expectations, read-only GitHu
 - Download-only completion never implies installed status or multiplayer compatibility.
 - MSIX/8.3 path spellings require existing root identity/link protections, never weaker containment.
 - Failed public updater or unavailable SkyUI permission remains an explicit incomplete acceptance item, not a PASS.
+
+## Verified outcome
+
+Public v0.1.7 release 414941556, application source 0eb5a8c178fc56cfedcd30e22d1e001981961687. Windows CI 38900192464 passed 436/436 tests and all package/smoke gates. Actual anonymous public installed-app update plus normal UI pack acquisition passed hosted run 38902696119 using harness source 77f191ca7571e136fb1bce8aec0d04872119aae3. Harness-only corrections and earlier failed attempts are recorded in FROSTVEIL_PLAYER_DELIVERY_REPORT.md; published application/assets were unchanged. No real game writes. SkyUI remains external-only/BLOCKED pending redistribution permission and compatibility evidence.
