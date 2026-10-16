@@ -111,7 +111,7 @@ test('state subscriptions receive isolated snapshots and dispose revokes further
  }finally{f.service.dispose();await fs.rm(f.root,{recursive:true,force:true});}
 });
 
-test('persisted session opened before L1 scan rebinds recovery evidence after scan completes',async()=>{
+test('persisted session opened before L1 scan rebinds recovery evidence across canonical Windows path spellings',async()=>{
  const f=await fixture();
  const {registerRealTarget}=await import('../src/main/installer/managed-target');
  const {MetadataStore}=await import('../src/main/installer/metadata');
@@ -119,7 +119,8 @@ test('persisted session opened before L1 scan rebinds recovery evidence after sc
  await fs.writeFile(path.join(f.game,'SkyrimSE.exe'),'inert');
  let runtime:any=null;
  const readyRuntime={directory:f.game,ready:true,runtime:'1.6.1170.0',skseLoader:'0.2.2.6',skseRuntime:'0.2.2.6',nativeLauncherAvailable:false,files:[{path:'skse64_1_6_1170.dll',required:true,category:'skse' as const,sha256:'',size:5,status:'verified' as const}],errors:[],scannedAt:new Date().toISOString()};
- const service=new ManagementService(f.storage,'0.1.6',()=>({directory:f.game,orderDirectory:f.profile,channel:'stable',runtime}),async()=>{throw Error('Startup/rebind must not ask for write approval');},versionReader,unconfiguredSource);
+ const selectedStorage=process.platform==='win32'?f.storage.toLowerCase():f.storage;
+ const service=new ManagementService(selectedStorage,'0.1.6',()=>({directory:f.game,orderDirectory:f.profile,channel:'stable',runtime}),async()=>{throw Error('Startup/rebind must not ask for write approval');},versionReader,unconfiguredSource);
  try{
   const grant=await registerRealTarget(f.game,f.profile,f.storage,readyRuntime,versionReader);
   const store=await MetadataStore.create(grant);

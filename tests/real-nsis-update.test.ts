@@ -44,7 +44,8 @@ process.env.LOCALAPPDATA=__fvBoot.localData;
 process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST='1';
 if(!process.argv.includes('--launcher-update-test'))process.argv.push('--launcher-update-test','--launcher-update-test-profile',__fvBoot.profile);
 const __fvFs=require('node:fs'),__fvApp=require('electron').app;
-function __fvEvent(kind){__fvFs.appendFileSync(__fvBoot.events,JSON.stringify({kind,version:__fvApp.getVersion(),pid:process.pid,argv:process.argv})+String.fromCharCode(10));}
+function __fvEvent(kind,detail){__fvFs.appendFileSync(__fvBoot.events,JSON.stringify({kind,detail,version:__fvApp.getVersion(),pid:process.pid,argv:process.argv,temp:require('node:os').tmpdir()})+String.fromCharCode(10));}
+const __fvError=console.error;console.error=(...args)=>{__fvEvent('stderr',args.map(String).join(' '));__fvError(...args);};
 __fvEvent('start');
 __fvApp.on('browser-window-created',(_event,win)=>win.webContents.once('did-finish-load',()=>__fvEvent('ready')));
 __fvApp.on('before-quit',()=>__fvEvent('quit'));

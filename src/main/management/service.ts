@@ -29,7 +29,10 @@ const uuid=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const DEFAULT_SCOPE_NOTICE='Managed Modpack writes apply only to approved Data/* paths and plugins.txt/loadorder.txt; official Bethesda files, SKSE/SkyMP binaries, saves, and unrelated third-party mods are never overwritten.';
 function configuredSource(source:DistributionSource){return source.mode==='production'&&Object.values(source.keys).some(k=>k.environment==='production'&&!k.revoked&&typeof k.expiresAt==='string'&&Number.isFinite(Date.parse(k.expiresAt))&&Date.parse(k.expiresAt)>Date.now());}
 function withoutClock(plan:ManagedPlan){const {createdAt:_created,expiresAt:_expires,...bound}=plan;return bound;}
-function sameSelection(a:Context,g:SandboxGrant){return path.resolve(a.directory).toLowerCase()===g.installation.toLowerCase()&&path.resolve(a.orderDirectory).toLowerCase()===g.configDirectory!.toLowerCase();}
+async function sameSelection(a:Context,g:SandboxGrant){
+ await noLinks(a.directory);await noLinks(a.orderDirectory);
+ return (await fs.realpath(a.directory)).toLowerCase()===g.installation.toLowerCase()&&(await fs.realpath(a.orderDirectory)).toLowerCase()===g.configDirectory!.toLowerCase();
+}
 function message(error:unknown){const code=(error as NodeJS.ErrnoException)?.code;if(code&&/^[A-Z0-9_]+$/.test(code))return'Modpack operation failed: '+code;return error instanceof Error&&error.message.length<300?error.message:'Modpack operation failed; retained evidence requires review';}
 
 /** Main owns the selected installation and native confirmation. No renderer target, source or key is accepted. */
@@ -150,7 +153,7 @@ export class ManagementService {
   try{
    const file=await safeFile(this.storage,'management-session.json');pointerFound=true;const stat=await fs.stat(file);if(stat.nlink!==1||stat.size>4096)throw Error('Unsafe managed session pointer');
    const raw=JSON.parse(await fs.readFile(file,'utf8'));
-   const parent=path.resolve(this.storage,'managed-installations');
+   const parent=path.join(await fs.realpath(this.storage),'managed-installations');
    if(!raw||Object.keys(raw).sort().join(',')!=='directory,id'||typeof raw.directory!=='string'||typeof raw.id!=='string'||!uuid.test(raw.id)||path.dirname(raw.directory)!==parent||!contained(parent,raw.directory)||!/^[a-f0-9]{64}$/.test(path.basename(raw.directory)))throw Error('Untrusted managed session pointer');
    const context=currentContext??await this.context();if(!context.runtime?.ready)throw Error('Current L1 runtime selection required before opening recovery evidence');
    const store=await MetadataStore.recover(raw.directory,(directory,grant)=>adoptRealTarget(directory,grant,context.directory,context.orderDirectory,context.runtime!,this.versionReader));
@@ -233,7 +236,7 @@ export class ManagementService {
   finally{this.finish(controller);}return this.snapshot();
  }
  private async revalidate(prepared:Prepared){
-  const context=await this.context(true);if(!sameSelection(context,prepared.grant)||context.channel!==prepared.plan.channel)throw Error('Selected installation or release channel changed');
+  const context=await this.context(true);if(!await sameSelection(context,prepared.grant)||context.channel!==prepared.plan.channel)throw Error('Selected installation or release channel changed');
   await checkRoots(prepared.grant);const bundle=authenticateRelease(prepared.bundle.envelope,this.source,prepared.bundle.release);
   const preflight=await this.preflight(context);if(preflight.status!=='READY')throw Error(preflight.blockers[0]??preflight.manual[0]??'Current preflight is not ready');
   const engine=await SandboxInstaller.open(prepared.grant,{}),receipt=await engine.receipt(),activation=await this.activation(preflight,bundle,receipt,prepared.plan.intent,await this.headers(prepared));
@@ -274,7 +277,7 @@ export class ManagementService {
   this.idle();if(!this.initialized)await this.initialize();if(!this.grant)throw Error('No validated managed transaction is available for '+mode);
   const grant=this.grant,{controller,revision}=this.start();this.clearPlan();
   try{
-   const context=await this.context(true);if(!sameSelection(context,grant)||!context.runtime?.ready)throw Error('Current trusted Skyrim selection is required for recovery');
+   const context=await this.context(true);if(!await sameSelection(context,grant)||!context.runtime?.ready)throw Error('Current trusted Skyrim selection is required for recovery');
    const preflight=await this.preflight(context);if(preflight.status!=='READY')throw Error(preflight.blockers[0]??preflight.manual[0]??'Recovery preflight is not ready');
    const {store,records,receipt}=await this.history(grant),reader=await SandboxInstaller.open(grant,{}),candidate=mode==='rollback'?await reader.rollbackCandidate():undefined;
    const selected=mode==='rollback'?records.filter(j=>j.id===candidate):records.filter(j=>!terminal.has(j.state));if(!selected.length)throw Error('No '+mode+' candidate is available');
@@ -292,7 +295,7 @@ export class ManagementService {
    const plan=freezePlan({...saved.plan,intent:mode==='rollback'?'remove':'repair',createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+120000).toISOString(),receiptDigest:planDigest(receipt),actions,blockers:[],manual:['Restore only files attributable to the selected transaction; external changes must be preserved.'],release:{...(saved.plan.release as object),restoration:{operation:mode,journals:journalBinding}},downloadBytes:0,backupBytes:0,requiredBytes:actions.reduce((n,a)=>n+a.size*2,1024*1024)}) as ManagedPlan;
    this.update({phase:'awaiting-review',status:'RECOVERY REVIEW REQUIRED',message:'Review the exact restoration operations before native confirmation.',plan,planHash:planDigest(plan),realWriteAuthorized:false});
    const token=await this.authorizer.request(plan);cancelled(controller.signal);
-   const freshContext=await this.context(true);if(!sameSelection(freshContext,grant))throw Error('Recovery installation selection changed');
+   const freshContext=await this.context(true);if(!await sameSelection(freshContext,grant))throw Error('Recovery installation selection changed');
    const fresh=await this.preflight(freshContext);if(fresh.status!=='READY')throw Error('Recovery preflight changed');
    if(planDigest(await reader.receipt())!==plan.receiptDigest)throw Error('Recovery ownership receipt changed');
    for(const binding of journalBinding)if(planDigest(await store.read('transactions/'+binding.id+'/journal.json'))!==binding.digest)throw Error('Recovery journal changed');
