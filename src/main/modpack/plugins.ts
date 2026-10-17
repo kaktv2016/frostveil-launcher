@@ -30,7 +30,8 @@ export async function checkPlugins(root:string,requirements:PluginRequirement[],
    if(status==='verified'&&(!h||evidence.source==='unverified')){status='unknown';reason='Effective runtime order unverified';}
    if(status==='verified'&&p.role==='server-required'&&(h!.light||p.filename.toLowerCase().endsWith('.esl'))){status='unknown';reason='Pinned SkyMP ESL/light mapping is not verified';}
    if(status==='verified'){for(const master of [...new Set([...p.masters,...h!.masters])]){const m=active.findIndex(n=>n.toLowerCase()===master.toLowerCase());if(m<0||m>=index){status='incompatible';reason='Missing/inactive/misordered master: '+master;break;}}
-    if(status==='verified'&&p.role==='server-required'&&evidence.fullOrder.findIndex(n=>n.toLowerCase()===p.filename.toLowerCase())!==p.order){status='incompatible';reason='Required full-plugin index differs from server';}
+    const serverFullOrder=evidence.fullOrder.filter(n=>OFFICIAL.some(o=>o.toLowerCase()===n.toLowerCase())||requirements.some(r=>r.filename.toLowerCase()===n.toLowerCase()));
+    if(status==='verified'&&p.role==='server-required'&&evidence.fullOrder.findIndex(n=>n.toLowerCase()===p.filename.toLowerCase())!==p.order&&serverFullOrder.findIndex(n=>n.toLowerCase()===p.filename.toLowerCase())!==p.order){status='incompatible';reason='Required full-plugin index differs from server';}
     if(status==='verified'&&p.role==='client-only'){const expected=requirements.filter(x=>x.role==='client-only').sort((a,b)=>a.order-b.order);const observed=active.filter(n=>expected.some(x=>x.filename.toLowerCase()===n.toLowerCase()));if(observed.findIndex(n=>n.toLowerCase()===p.filename.toLowerCase())!==expected.findIndex(x=>x.filename===p.filename)){status='incompatible';reason='Client-only relative order mismatch';}}
    }
    evidence.plugins.push({filename:p.filename,status,light:h?.light,masters:h?.masters,reason});

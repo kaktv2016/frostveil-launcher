@@ -109,7 +109,8 @@ export async function planActivation(game:string,requirements:PluginRequirement[
   const resulting=ordered.map(n=>names.get(n)!);
   const full=resulting.filter(n=>!headers.get(key(n))!.light&&!/\.esl$/i.test(n));
   if(full.length>254)throw Error('Full-plugin count exceeds supported SkyMP indices');
-  for(const p of required.values())if(p.role==='server-required'&&full.findIndex(n=>key(n)===key(p.filename))!==p.order)throw Error('Server-required full-plugin index conflicts with implicit masters or dependencies: '+p.filename);
+  const serverFull=full.filter(n=>OFFICIAL.some(o=>key(o)===key(n))||required.has(key(n)));
+  for(const p of required.values())if(p.role==='server-required'&&full.findIndex(n=>key(n)===key(p.filename))!==p.order&&serverFull.findIndex(n=>key(n)===key(p.filename))!==p.order)throw Error('Server-required full-plugin index conflicts with implicit masters or dependencies: '+p.filename);
   plan.active=resulting;plan.order=full;
   const current=active.filter(n=>implicitKeys.has(key(n))||activation.lines.some(l=>l.enabled&&l.name&&key(l.name)===key(n)));
   if(current.map(key).join('|')===resulting.map(key).join('|')&&!activation.lines.some(l=>l.enabled&&l.name&&deactivate.has(key(l.name))))return plan;
