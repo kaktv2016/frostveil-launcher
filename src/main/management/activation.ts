@@ -83,7 +83,7 @@ export async function planActivation(game:string,requirements:PluginRequirement[
   for(const line of activation.lines)if(line.enabled&&line.name&&!deactivate.has(key(line.name))&&!active.some(n=>key(n)===key(line.name!))){await header(line.name,required.has(key(line.name)));active.push(line.name);}
   for(const p of required.values()){
    const h=await header(p.filename,true);
-   if(h.light||/\.esl$/i.test(p.filename))throw Error('Pinned SkyMP ESL/light plugin activation is unsupported or unverified: '+p.filename);
+   if(p.role==='server-required'&&(h.light||/\.esl$/i.test(p.filename)))throw Error('Pinned SkyMP ESL/light plugin activation is unsupported or unverified: '+p.filename);
    if(!active.some(n=>key(n)===key(p.filename)))active.push(p.filename);
   }
   const nodes=active.map(key),edges=new Map(nodes.map(n=>[n,new Set<string>()])),indegree=new Map(nodes.map(n=>[n,0]));
