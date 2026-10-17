@@ -122,7 +122,25 @@ export class ProductionDownloads {
    const file=bundle.manifest.files.find(f=>f.path.toLowerCase()==='data/'+filename.toLowerCase());if(!file||!await this.matches(game,file))throw Error('Required plugin bytes unavailable: '+filename);
    const header=await readPluginHeader(await safeFile(game,file.path));requirements.push({filename,required:true,role:'client-only',order:nextOrder++,masters:header.masters,sha256:file.sha256});
   }
-  const inputs=await readOrderInputs(game,order),plan=await planActivation(game,requirements,inputs);
+  const inputs=await readOrderInputs(game,order);
+  const implicit=/^(?:Skyrim|Update|Dawnguard|HearthFires|Dragonborn)\.esm$/i;
+  const reqNames=new Set(bundle.manifest.requiredPlugins.map(p=>p.filename.toLowerCase()));
+  let extraFullMasters=0;
+  const seenExtra=new Set<string>();
+  const cccNames=(inputs.cccText??'').replace(/^\uFEFF/,'').split(/\r?\n/).map(l=>l.trim()).filter(l=>l&&!l.startsWith('#'));
+  const activeNames=(inputs.pluginsText??'').replace(/^\uFEFF/,'').split(/\r?\n/).map(l=>l.trim()).filter(l=>l.startsWith('*')).map(l=>l.slice(1).trim());
+  for(const [name,fromCcc] of [...cccNames.map(n=>[n,true] as const),...activeNames.map(n=>[n,false] as const)]){
+   const lower=name.toLowerCase();
+   if(implicit.test(name)||reqNames.has(lower)||seenExtra.has(lower))continue;
+   try{
+    const h=await readPluginHeader(await safeFile(game,'Data/'+name));
+    const isLight=h.light||/\.esl$/i.test(name);
+    const isMaster=fromCcc||h.master||/\.(esm|esl)$/i.test(name);
+    if(!isLight&&isMaster){extraFullMasters++;seenExtra.add(lower);}
+   }catch{/* ignore missing files */}
+  }
+  const adjustedReqs=requirements.map(p=>({...p,order:!implicit.test(p.filename)&&p.role==='server-required'?p.order+extraFullMasters:p.order}));
+  const plan=await planActivation(game,adjustedReqs,inputs);
   if(plan.status!=='ready')return plan;
   // SSE uses plugins.txt; keep its existing diagnostic loadorder mirror consistent too.
   const active=new Set(plan.active.map(p=>p.toLowerCase())),raw=inputs.loadorderText??'',bom=raw.startsWith('\uFEFF')?'\uFEFF':'',newline=raw.includes('\r\n')?'\r\n':'\n';

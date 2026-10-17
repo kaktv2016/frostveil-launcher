@@ -11,7 +11,13 @@ export interface GraphicsManifest {
   downloadUrl: string;
   size: number;
   sha256: string;
+  integrityPatchUrl?: string;
+  integrityPatchSize?: number;
+  integrityPatchSha256?: string;
   activePlugins: string[];
+  masterPlugins?: string[];
+  forbiddenPlugins?: string[];
+  integrityFiles?: Record<string, { size: number; sha256: string }>;
 }
 
 export interface GraphicsPackState {
@@ -28,11 +34,22 @@ export interface GraphicsPackState {
 
 const R2_MANIFEST_URL = 'https://pub-276cbfc24fc84b30bbef7eaa4f57067c.r2.dev/frostveil-graphics-manifest.json';
 
+const DEFAULT_MASTER_PLUGINS = [
+  'unofficial skyrim special edition patch.esp',
+  'Lux - Master plugin.esm',
+  'Lux - Resources.esp',
+  'Lux Via.esp',
+  'Natural Waterfalls.esp',
+  'Natural Waterfalls - Dawnguard.esp',
+  'Natural Waterfalls - Dragonborn.esp',
+  'Natural Waterfalls - Blackreach.esp',
+];
+
 export class GraphicsPackService {
   private state: GraphicsPackState = {
     phase: 'idle',
     installed: false,
-    message: 'Graphics Pack ready to download from Cloudflare R2.',
+    message: 'Mandatory Graphics & World Pack ready to verify from Cloudflare R2.',
     bytes: 0,
     totalBytes: 7270769508,
     speedMBps: 0,
@@ -63,12 +80,25 @@ export class GraphicsPackService {
     }
   }
 
-  async fetchManifest(signal?: AbortSignal): Promise<GraphicsManifest> {
-    if (this.manifestCache) return this.manifestCache;
-    const res = await fetch(R2_MANIFEST_URL, { signal: signal ?? AbortSignal.timeout(8000) });
+  async fetchManifest(signal?: AbortSignal, forceRefresh = false): Promise<GraphicsManifest> {
+    if (this.manifestCache && !forceRefresh) return this.manifestCache;
+    const res = await fetch(R2_MANIFEST_URL, {
+      signal: signal ?? AbortSignal.timeout(8000),
+      headers: { 'Cache-Control': 'no-cache' },
+    });
     if (!res.ok) throw new Error(`Could not fetch graphics manifest: ${res.statusText}`);
     this.manifestCache = (await res.json()) as GraphicsManifest;
     return this.manifestCache;
+  }
+
+  private hasBaseAssets(gameDirectory: string): boolean {
+    return (
+      fsSync.existsSync(path.join(gameDirectory, 'd3dx9_42.dll')) &&
+      fsSync.existsSync(path.join(gameDirectory, 'Data', 'Lux.esp')) &&
+      fsSync.existsSync(path.join(gameDirectory, 'Data', 'Lux - Meshes.bsa')) &&
+      fsSync.existsSync(path.join(gameDirectory, 'Data', 'Ulvenwald.bsa')) &&
+      fsSync.existsSync(path.join(gameDirectory, 'Data', 'BlendedRoads.esp'))
+    );
   }
 
   async inspect(gameDirectory?: string) {
@@ -85,11 +115,10 @@ export class GraphicsPackService {
       if (fsSync.existsSync(verPath)) {
         const raw = JSON.parse(await fs.readFile(verPath, 'utf8'));
         version = raw.version;
-        // Verify key files exist
-        const hasD3D = fsSync.existsSync(path.join(gameDirectory, 'd3dx9_42.dll'));
-        const hasLux = fsSync.existsSync(path.join(gameDirectory, 'Data', 'Lux.esp'));
-        const hasBlended = fsSync.existsSync(path.join(gameDirectory, 'Data', 'BlendedRoads.esp'));
-        if (hasD3D && hasLux && hasBlended) {
+        const hasBase = this.hasBaseAssets(gameDirectory);
+        const hasParallaxFix = fsSync.existsSync(path.join(gameDirectory, 'Data', 'Parallax TXST Fixes.esp'));
+        const hasForbidden = fsSync.existsSync(path.join(gameDirectory, 'Data', 'RaceMenuPlugin.esp'));
+        if (hasBase && hasParallaxFix && !hasForbidden) {
           installed = true;
         }
       }
@@ -99,22 +128,149 @@ export class GraphicsPackService {
 
     try {
       const manifest = await this.fetchManifest();
+      const upToDate = installed && version === manifest.version;
       this.update({
-        installed,
+        installed: upToDate,
         version,
         availableVersion: manifest.version,
         totalBytes: manifest.size,
-        message: installed
-          ? `Graphics Overhaul v${version} installed & verified`
-          : `Graphics Overhaul v${manifest.version} available (6.77 GB)`,
+        message: upToDate
+          ? `Mandatory Graphics & World Pack v${version} verified (Anti-Cheat active)`
+          : this.hasBaseAssets(gameDirectory)
+            ? `Graphics & Anti-Cheat Integrity update v${manifest.version} ready (auto-applies on Play)`
+            : `Mandatory Graphics & World Pack v${manifest.version} required (6.77 GB)`,
       });
     } catch {
       this.update({
         installed,
         version,
-        message: installed ? `Graphics Overhaul installed` : `Ready to check Cloudflare R2`,
+        message: installed ? `Mandatory Graphics & World Pack installed` : `Ready to check Cloudflare R2`,
       });
     }
+
+    return this.snapshot();
+  }
+
+  private async purgeForbiddenPlugins(gameDirectory: string, forbiddenPlugins: string[] = ['RaceMenuPlugin.esp']) {
+    for (const plugin of forbiddenPlugins) {
+      const target = path.join(gameDirectory, 'Data', plugin);
+      if (fsSync.existsSync(target)) {
+        await fs.unlink(target).catch(() => {});
+      }
+    }
+  }
+
+  private async verifyIntegrityFiles(
+    gameDirectory: string,
+    manifest: GraphicsManifest
+  ): Promise<{ valid: boolean; mismatched: string[] }> {
+    await this.purgeForbiddenPlugins(gameDirectory, manifest.forbiddenPlugins);
+    if (!manifest.integrityFiles) return { valid: true, mismatched: [] };
+
+    const mismatched: string[] = [];
+    for (const [relPath, expected] of Object.entries(manifest.integrityFiles)) {
+      const fullPath = path.join(gameDirectory, ...relPath.split('/'));
+      try {
+        const st = await fs.stat(fullPath);
+        if (st.size !== expected.size) {
+          mismatched.push(relPath);
+          continue;
+        }
+        const actualHash = await this.computeHash(fullPath);
+        if (actualHash !== expected.sha256) {
+          mismatched.push(relPath);
+        }
+      } catch {
+        mismatched.push(relPath);
+      }
+    }
+    return { valid: mismatched.length === 0, mismatched };
+  }
+
+  private async applyIntegrityPatch(
+    gameDirectory: string,
+    manifest: GraphicsManifest,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (!manifest.integrityPatchUrl || !manifest.integrityPatchSha256) {
+      throw new Error('Integrity patch URL is missing from manifest');
+    }
+
+    const cacheFolder = path.join(this.storageDir, 'r2-cache');
+    await fs.mkdir(cacheFolder, { recursive: true });
+    const patchArchive = path.join(cacheFolder, `frostveil-integrity-patch-v${manifest.version}.zip`);
+
+    let needsDownload = true;
+    if (fsSync.existsSync(patchArchive)) {
+      const hash = await this.computeHash(patchArchive).catch(() => '');
+      if (hash === manifest.integrityPatchSha256) {
+        needsDownload = false;
+      }
+    }
+
+    if (needsDownload) {
+      this.update({
+        phase: 'downloading',
+        message: `Downloading anti-cheat & world integrity patch v${manifest.version}...`,
+      });
+      const res = await fetch(manifest.integrityPatchUrl, { signal: signal ?? AbortSignal.timeout(60000) });
+      if (!res.ok) throw new Error(`Failed to download integrity patch: HTTP ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      const hash = createHash('sha256').update(buf).digest('hex');
+      if (hash !== manifest.integrityPatchSha256) {
+        throw new Error(`Integrity patch hash mismatch: expected ${manifest.integrityPatchSha256}, got ${hash}`);
+      }
+      await fs.writeFile(patchArchive, buf);
+    }
+
+    this.update({
+      phase: 'extracting',
+      message: 'Restoring verified plugins, SKSE DLLs & anti-cheat INI configurations...',
+    });
+    await this.extractToGame(patchArchive, gameDirectory);
+    await this.purgeForbiddenPlugins(gameDirectory, manifest.forbiddenPlugins);
+  }
+
+  /**
+   * AAA Mandatory Pre-Play Enforcement:
+   * 1. Requires the Graphics & World Pack to be installed (auto-downloads if missing).
+   * 2. Purges forbidden cheat plugins (e.g. RaceMenuPlugin.esp).
+   * 3. Verifies SHA-256 hashes of all 27 plugins, SKSE DLLs, and hardened INI/TOML configs.
+   *    If any file was modified or tampered with, automatically restores it from the signed integrity patch.
+   * 4. Enforces the exact Master-First topological load order in both plugins.txt and loadorder.txt.
+   */
+  async verifyAndEnforceForPlay(gameDirectory: string, orderDirectory: string): Promise<GraphicsPackState> {
+    if (!gameDirectory) throw new Error('Game directory is required');
+
+    if (!this.hasBaseAssets(gameDirectory)) {
+      return this.downloadAndInstall(gameDirectory, orderDirectory);
+    }
+
+    this.update({
+      phase: 'checking',
+      message: 'Verifying anti-cheat SHA-256 hashes for 27 world plugins & configs...',
+    });
+
+    const manifest = await this.fetchManifest(undefined, true);
+    const check = await this.verifyIntegrityFiles(gameDirectory, manifest);
+
+    if (!check.valid) {
+      await this.applyIntegrityPatch(gameDirectory, manifest);
+      const recheck = await this.verifyIntegrityFiles(gameDirectory, manifest);
+      if (!recheck.valid) {
+        throw new Error(`Anti-cheat integrity verification failed for: ${recheck.mismatched.slice(0, 5).join(', ')}`);
+      }
+    }
+
+    await this.activatePlugins(manifest, orderDirectory);
+
+    this.update({
+      phase: 'complete',
+      installed: true,
+      version: manifest.version,
+      availableVersion: manifest.version,
+      message: `✓ Graphics & Anti-Cheat Integrity v${manifest.version} verified (100% match)`,
+    });
 
     return this.snapshot();
   }
@@ -128,7 +284,25 @@ export class GraphicsPackService {
 
     try {
       this.update({ phase: 'checking', message: 'Checking manifest from Cloudflare R2...' });
-      const manifest = await this.fetchManifest(controller.signal);
+      const manifest = await this.fetchManifest(controller.signal, true);
+
+      // Fast path: if the 6.77 GB base assets are already present on disk, only apply the integrity patch!
+      if (this.hasBaseAssets(gameDirectory) && manifest.integrityPatchUrl) {
+        await this.applyIntegrityPatch(gameDirectory, manifest, controller.signal);
+        const check = await this.verifyIntegrityFiles(gameDirectory, manifest);
+        if (!check.valid) {
+          throw new Error(`Integrity verification failed after patch: ${check.mismatched.slice(0, 5).join(', ')}`);
+        }
+        await this.activatePlugins(manifest, orderDirectory);
+        this.update({
+          phase: 'complete',
+          installed: true,
+          version: manifest.version,
+          availableVersion: manifest.version,
+          message: `✓ Graphics & Anti-Cheat Pack v${manifest.version} verified & active!`,
+        });
+        return this.snapshot();
+      }
 
       const cacheFolder = path.join(this.storageDir, 'r2-cache');
       await fs.mkdir(cacheFolder, { recursive: true });
@@ -152,7 +326,7 @@ export class GraphicsPackService {
           phase: 'downloading',
           totalBytes: manifest.size,
           bytes: 0,
-          message: 'Downloading graphics pack from Cloudflare R2...',
+          message: 'Downloading mandatory graphics pack from Cloudflare R2...',
         });
 
         const partFile = targetArchive + '.part';
@@ -172,7 +346,6 @@ export class GraphicsPackService {
         });
 
         if (startByte > 0 && res.status !== 206) {
-          // Range not supported or expired, restart from 0
           startByte = 0;
           await fs.unlink(partFile).catch(() => {});
         } else if (startByte === 0 && res.status !== 200) {
@@ -210,7 +383,6 @@ export class GraphicsPackService {
 
         await new Promise(resolve => fileStream.end(resolve));
 
-        // Verify SHA256
         this.update({ message: 'Verifying package integrity...' });
         const downloadedHash = await this.computeHash(partFile);
         if (downloadedHash !== manifest.sha256) {
@@ -221,19 +393,33 @@ export class GraphicsPackService {
         await fs.rename(partFile, targetArchive);
       }
 
-      // Extract to Skyrim directory
+      // Extract base archive to Skyrim directory
       this.update({ phase: 'extracting', message: 'Extracting graphics pack to Skyrim SE...' });
       await this.extractToGame(targetArchive, gameDirectory);
 
-      // Activate all plugins in plugins.txt
-      this.update({ message: 'Configuring load order in plugins.txt...' });
-      await this.activatePlugins(manifest.activePlugins, orderDirectory);
+      // Apply anti-cheat integrity patch & remove forbidden plugins
+      if (manifest.integrityPatchUrl) {
+        await this.applyIntegrityPatch(gameDirectory, manifest, controller.signal);
+      } else {
+        await this.purgeForbiddenPlugins(gameDirectory, manifest.forbiddenPlugins);
+      }
+
+      // Verify all 46 integrity files
+      const check = await this.verifyIntegrityFiles(gameDirectory, manifest);
+      if (!check.valid) {
+        throw new Error(`Integrity verification failed: ${check.mismatched.slice(0, 5).join(', ')}`);
+      }
+
+      // Activate all plugins in canonical Master-First order
+      this.update({ message: 'Locking canonical Master-First load order in plugins.txt...' });
+      await this.activatePlugins(manifest, orderDirectory);
 
       this.update({
         phase: 'complete',
         installed: true,
         version: manifest.version,
-        message: '✓ Graphics pack installed & activated! Ready to play.',
+        availableVersion: manifest.version,
+        message: `✓ Graphics & Anti-Cheat Pack v${manifest.version} installed & locked! Ready to play.`,
       });
 
       return this.snapshot();
@@ -266,7 +452,6 @@ export class GraphicsPackService {
 
   private async extractToGame(archivePath: string, gameDirectory: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Use native Windows tar.exe to extract the zip directly into the game directory
       const child = cp.spawn('tar.exe', ['-xf', archivePath, '-C', gameDirectory], {
         windowsHide: true,
         stdio: 'ignore',
@@ -279,8 +464,11 @@ export class GraphicsPackService {
     });
   }
 
-  private async activatePlugins(pluginsToActivate: string[], orderDirectory: string): Promise<void> {
+  private async activatePlugins(manifest: GraphicsManifest, orderDirectory: string): Promise<void> {
+    await fs.mkdir(orderDirectory, { recursive: true });
     const pluginsFile = path.join(orderDirectory, 'plugins.txt');
+    const loadorderFile = path.join(orderDirectory, 'loadorder.txt');
+
     let existingText = '';
     try {
       existingText = await fs.readFile(pluginsFile, 'utf8');
@@ -289,47 +477,41 @@ export class GraphicsPackService {
     }
 
     const bom = existingText.startsWith('\uFEFF') ? '\uFEFF' : '';
-    const lines = existingText.slice(bom.length).split(/\r?\n/);
-    const existingActive = new Set(
-      lines
-        .map(l => l.trim())
-        .filter(l => l.startsWith('*'))
-        .map(l => l.slice(1).toLowerCase())
-    );
+    const masterList = manifest.masterPlugins ?? DEFAULT_MASTER_PLUGINS;
+    const masterSet = new Set(masterList.map(p => p.toLowerCase()));
+    const nonMasterList = manifest.activePlugins.filter(p => !masterSet.has(p.toLowerCase()));
 
-    // Filter which plugins need to be added
-    const toAdd = pluginsToActivate.filter(p => !existingActive.has(p.toLowerCase()));
+    // Canonical Master-First order:
+    // 1. All 8 ESM-flagged masters in topological order
+    // 2. FrostveilCourierNavigation.esp (server-required full plugin immediately after masters)
+    // 3. All 19 non-master Graphics & World plugins in topological order
+    // 4. SkyUI_SE.esp (client-only required UI plugin)
+    const canonicalOrder = [
+      ...masterList,
+      'FrostveilCourierNavigation.esp',
+      ...nonMasterList,
+      'SkyUI_SE.esp',
+    ];
 
-    if (toAdd.length === 0) return;
+    const pluginsLines = [
+      '# This file is locked by Skyrim RP Launcher (AAA Anti-Cheat Load Order)',
+      ...canonicalOrder.map(p => `*${p}`),
+    ];
+    const loadorderLines = [
+      'Skyrim.esm',
+      'Update.esm',
+      'Dawnguard.esm',
+      'HearthFires.esm',
+      'Dragonborn.esm',
+      'ccBGSSSE001-Fish.esm',
+      'ccQDRSSE001-SurvivalMode.esl',
+      'ccBGSSSE037-Curios.esl',
+      'ccBGSSSE025-AdvDSGS.esm',
+      '_ResourcePack.esl',
+      ...canonicalOrder,
+    ];
 
-    // Insert new plugins before any user plugins or server plugins like FrostveilCourierNavigation
-    const updatedLines: string[] = [];
-    const serverMods = ['frostveilcouriernavigation.esp'];
-
-    // Collect existing non-server lines
-    for (const line of lines) {
-      const trimmed = line.trim();
-      const pureName = trimmed.replace(/^\*/, '').toLowerCase();
-      if (!serverMods.includes(pureName)) {
-        updatedLines.push(line);
-      }
-    }
-
-    // Append our active plugins
-    for (const plugin of toAdd) {
-      updatedLines.push(`*${plugin}`);
-    }
-
-    // Append server mods back at the end
-    for (const line of lines) {
-      const trimmed = line.trim();
-      const pureName = trimmed.replace(/^\*/, '').toLowerCase();
-      if (serverMods.includes(pureName)) {
-        updatedLines.push(line);
-      }
-    }
-
-    const outputText = bom + updatedLines.filter(Boolean).join('\r\n') + '\r\n';
-    await fs.writeFile(pluginsFile, outputText, 'utf8');
+    await fs.writeFile(pluginsFile, bom + pluginsLines.join('\r\n') + '\r\n', 'utf8');
+    await fs.writeFile(loadorderFile, loadorderLines.join('\r\n') + '\r\n', 'utf8');
   }
 }

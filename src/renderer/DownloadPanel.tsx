@@ -12,20 +12,20 @@ export function DownloadPanel({state,external,graphicsPack,busy,onDownload,onCan
  <p className="ok">ระบบจะดูแลการติดตั้งและเปิด mod ใน plugins.txt ให้เสร็จสิ้นโดยอัตโนมัติ ไม่ต้องแก้ไขไฟล์เอง</p>
  <hr/>
  <div className="section-title">
-  <h3>Frostveil Graphics &amp; Lighting Overhaul</h3>
+  <h3>Frostveil Graphics &amp; World Pack (Mandatory • Anti-Cheat)</h3>
   <button className="primary" disabled={busy || graphicsPack?.phase==='downloading' || graphicsPack?.phase==='extracting'} onClick={onDownloadGraphics}>
-   {graphicsPack?.installed ? 'Reinstall Graphics Pack' : 'Download Graphics Pack (6.77 GB)'}
+   {graphicsPack?.installed ? 'Verify & Repair Graphics Pack' : 'Install Mandatory Graphics Pack (6.77 GB)'}
   </button>
  </div>
- <p>ม็อดกราฟิก แสงเงา ต้นไม้ และโมเดลความละเอียดสูงรวม 27 ตัว (Community Shaders, Lux, SMIM, Complex Parallax, Tomato Landscape ฯลฯ) ดาวน์โหลดตรงจาก Cloudflare R2 ความเร็วสูง</p>
- <p className={graphicsPack?.installed ? 'ok' : 'muted'}>{graphicsPack?.message ?? 'Graphics Pack ready to download from Cloudflare R2.'}</p>
- <p>Status: {graphicsPack?.installed ? 'INSTALLED & ACTIVATED (27 plugins)' : 'NOT INSTALLED (Optional)'}{graphicsPack?.speedMBps ? ` · Speed: ${graphicsPack.speedMBps.toFixed(1)} MB/s` : ''}</p>
+ <p>ม็อดกราฟิก แสงเงา ต้นไม้ สะพาน และโมเดลโลก 27 ตัว (บังคับเหมือนกันทุกคนเพื่อความยุติธรรม 100% ป้องกันการปิดหญ้า/ปรับขนาด Hitbox และล็อกค่า SHA-256 ทุกไฟล์ก่อนเข้าเล่น)</p>
+ <p className={graphicsPack?.installed ? 'ok' : 'muted'}>{graphicsPack?.message ?? 'Mandatory Graphics & World Pack ready to verify from Cloudflare R2.'}</p>
+ <p>Status: {graphicsPack?.installed ? `VERIFIED & LOCKED (v${graphicsPack.version ?? '1.0.1'} · 27 plugins · SHA-256 Anti-Cheat)` : 'REQUIRED BEFORE PLAY'}{graphicsPack?.speedMBps ? ` · Speed: ${graphicsPack.speedMBps.toFixed(1)} MB/s` : ''}</p>
  {graphicsPack?.totalBytes && (graphicsPack.phase==='downloading' || graphicsPack.bytes>0) ? <>
   <progress aria-label="Graphics pack download" max={graphicsPack.totalBytes} value={graphicsPack.bytes}/>
   <p>{(graphicsPack.bytes / (1024 * 1024)).toFixed(0)} MB / {(graphicsPack.totalBytes / (1024 * 1024)).toFixed(0)} MB</p>
  </> : null}
  {['checking','downloading','extracting'].includes(graphicsPack?.phase??'')&&<button className="secondary" onClick={onCancelGraphics}>Cancel Download</button>}
- <p className="ok">ระบบจะทำการแตกไฟล์และเรียง load order ใน plugins.txt ให้โดยอัตโนมัติ ผู้เล่นไม่ต้องตั้งค่าอะไรเอง</p>
+ <p className="ok">ระบบจะตรวจสอบ SHA-256 ทั้ง 46 ไฟล์ ลบม็อดที่ถูกแบน (เช่น RaceMenuPlugin.esp) และล็อกลำดับ Master-First ใน plugins.txt อัตโนมัติทุกครั้งที่กด Play</p>
  <hr/><h3>SkyUI · UI mod</h3><p>SkyUI เป็น dependency ภายนอกที่ต้องติดตั้งจากแหล่งทางการ แพ็กนี้ไม่แจกไฟล์ SkyUI; Launcher ตรวจไฟล์และเปิดใช้งานตามรายการที่เซิร์ฟเวอร์กำหนด</p>
  <div className="actions"><button className="secondary" disabled={busy} onClick={onSource}>SkyUI Official Download</button><button className="secondary" disabled={busy} onClick={onInspect}>Check My SkyUI Files</button></div>
  {external&&<><p className="muted">{external.message}</p>{external.files.map(f=><p key={f.name}>{f.name}: {f.verified?'Matches supplied 6.0 reference':'Missing / different version / unsafe file'}</p>)}<p>Files verified: {String(external.filesVerified)} · ESL: {String(external.light)} · Installation: {external.installation}</p></>}
