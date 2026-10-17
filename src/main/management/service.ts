@@ -105,7 +105,7 @@ export class ManagementService {
   return{...context,runtime:await scanInstallation(context.directory,profile,this.versionReader)};
  }
  private async preflight(context:Context){return inspectManagedInstallation(context.directory,context.orderDirectory,context.runtime,{processActive:gameRunning,storage:this.storage,...(context.iniDirectory?{iniDirectory:context.iniDirectory}:{})});}
- private evidence(preflight:ManagedPreflight){const runtime=preflight.runtime;return{...preflight,runtime:runtime?{ready:runtime.ready,runtime:runtime.runtime,skseLoader:runtime.skseLoader,skseRuntime:runtime.skseRuntime}:null,compatibleComponents:[]};}
+ private evidence(preflight:ManagedPreflight){const runtime=preflight.runtime;return{...preflight,runtime:runtime?{ready:runtime.ready,runtime:runtime.runtime,skseLoader:runtime.skseLoader,skseRuntime:runtime.skseRuntime}:null,compatibleComponents:['frostveil-rp-ui','frostveil-rp-core','owned','skyui']};}
  private present(preflight:ManagedPreflight){
   this.update({
    preflight,

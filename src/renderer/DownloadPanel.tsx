@@ -1,16 +1,32 @@
 import React from 'react';
 import type {Dashboard} from '../shared/contracts';
-export function DownloadPanel({state,external,busy,onDownload,onCancel,onSource,onInspect}:{state:Dashboard['productionDownloads'];external:Dashboard['externalMod'];busy:boolean;onDownload:()=>void;onCancel:()=>void;onSource:()=>void;onInspect:()=>void}){
- return <section className="panel" data-testid="production-download-panel"><div className="section-title"><h3>Server files &amp; mods</h3><button className="primary" disabled={busy} onClick={onDownload}>Download Server Files</button></div>
- <p>ดาวน์โหลดไฟล์ที่เซิร์ฟเวอร์กำหนดจาก GitHub และตรวจลายเซ็นก่อนเก็บไว้ใน cache ขั้นตอนนี้ยังไม่ติดตั้งหรือแก้ไฟล์เกม</p>
- <p data-testid="production-download-status" className={state?.phase==='complete'?'ok':'muted'}>{state?.message??'Not downloaded'}</p>
- <p>Pack: {state?.packId??'Not checked'} · Version: {state?.version??'Unknown'} · Signature: {state?.signature??'UNVERIFIED'} · Installation: NOT INSTALLED BY DOWNLOAD</p>
+export function DownloadPanel({state,external,graphicsPack,busy,onDownload,onCancel,onSource,onInspect,onDownloadGraphics,onCancelGraphics}:{state:Dashboard['productionDownloads'];external:Dashboard['externalMod'];graphicsPack?:Dashboard['graphicsPack'];busy:boolean;onDownload:()=>void;onCancel:()=>void;onSource:()=>void;onInspect:()=>void;onDownloadGraphics?:()=>void;onCancelGraphics?:()=>void;}){
+ return <section className="panel" data-testid="production-download-panel"><div className="section-title"><h3>Server files &amp; mods</h3><button className="primary" disabled={busy} onClick={onDownload}>{state?.installed?'Reinstall Server Files':'Download & Install Server Files'}</button></div>
+ <p>กด Play เพื่อตรวจ hash และติดตั้งไฟล์เซิร์ฟเวอร์ที่ขาดหรือไม่ตรงให้อัตโนมัติ ปุ่มนี้ใช้ซ่อมไฟล์แยกได้เช่นกัน</p>
+ <p data-testid="production-download-status" className={state?.installed||state?.phase==='complete'?'ok':'muted'}>{state?.message??'Not downloaded'}</p>
+ <p>Pack: {state?.packId??'Not checked'} · Version: {state?.version??'Unknown'} · Signature: {state?.signature??'UNVERIFIED'} · Installation: {state?.installed?'INSTALLED & ACTIVATED (Ready to play)':'NOT INSTALLED'}</p>
  {state?.totalBytes? <><progress aria-label="Server files download" max={state.totalBytes} value={state.bytes}/><p>{state.bytes.toLocaleString()} / {state.totalBytes.toLocaleString()} bytes</p></>:null}
  {state?.files.map(f=><p className="path" key={f.name}>{f.verified?'✓':'…'} {f.name} · {f.size.toLocaleString()} bytes</p>)}
  {!!state?.externalRequirements&&<p className="muted">{state.externalRequirements} external game/runtime requirements are verified from the player's own installation; they are not included in this download.</p>}
  {['checking','downloading'].includes(state?.phase??'')&&<button className="secondary" onClick={onCancel}>Cancel Download</button>}
- <p>เมื่อดาวน์โหลดเสร็จ ให้เลือกเกมและกด Review Install ด้านล่าง ตรวจรายการแล้วจึงกด Apply Reviewed Plan เพื่อยืนยันติดตั้งด้วยตัวเอง</p>
- <hr/><h3>SkyUI · external mod</h3><p>SkyUI ไม่ได้รวมอยู่ใน GitHub pack ของเรา ผู้เล่นดาวน์โหลดจากเจ้าของได้เอง ไฟล์ตัวอย่างรุ่น 6.0 เป็น ESL จึงยังไม่เปิดให้ Launcher ติดตั้งจนกว่าจะยืนยันความเข้ากันได้กับ SkyMP</p>
+ <p className="ok">ระบบจะดูแลการติดตั้งและเปิด mod ใน plugins.txt ให้เสร็จสิ้นโดยอัตโนมัติ ไม่ต้องแก้ไขไฟล์เอง</p>
+ <hr/>
+ <div className="section-title">
+  <h3>Frostveil Graphics &amp; Lighting Overhaul</h3>
+  <button className="primary" disabled={busy || graphicsPack?.phase==='downloading' || graphicsPack?.phase==='extracting'} onClick={onDownloadGraphics}>
+   {graphicsPack?.installed ? 'Reinstall Graphics Pack' : 'Download Graphics Pack (6.77 GB)'}
+  </button>
+ </div>
+ <p>ม็อดกราฟิก แสงเงา ต้นไม้ และโมเดลความละเอียดสูงรวม 27 ตัว (Community Shaders, Lux, SMIM, Complex Parallax, Tomato Landscape ฯลฯ) ดาวน์โหลดตรงจาก Cloudflare R2 ความเร็วสูง</p>
+ <p className={graphicsPack?.installed ? 'ok' : 'muted'}>{graphicsPack?.message ?? 'Graphics Pack ready to download from Cloudflare R2.'}</p>
+ <p>Status: {graphicsPack?.installed ? 'INSTALLED & ACTIVATED (27 plugins)' : 'NOT INSTALLED (Optional)'}{graphicsPack?.speedMBps ? ` · Speed: ${graphicsPack.speedMBps.toFixed(1)} MB/s` : ''}</p>
+ {graphicsPack?.totalBytes && (graphicsPack.phase==='downloading' || graphicsPack.bytes>0) ? <>
+  <progress aria-label="Graphics pack download" max={graphicsPack.totalBytes} value={graphicsPack.bytes}/>
+  <p>{(graphicsPack.bytes / (1024 * 1024)).toFixed(0)} MB / {(graphicsPack.totalBytes / (1024 * 1024)).toFixed(0)} MB</p>
+ </> : null}
+ {['checking','downloading','extracting'].includes(graphicsPack?.phase??'')&&<button className="secondary" onClick={onCancelGraphics}>Cancel Download</button>}
+ <p className="ok">ระบบจะทำการแตกไฟล์และเรียง load order ใน plugins.txt ให้โดยอัตโนมัติ ผู้เล่นไม่ต้องตั้งค่าอะไรเอง</p>
+ <hr/><h3>SkyUI · UI mod</h3><p>SkyUI เป็น dependency ภายนอกที่ต้องติดตั้งจากแหล่งทางการ แพ็กนี้ไม่แจกไฟล์ SkyUI; Launcher ตรวจไฟล์และเปิดใช้งานตามรายการที่เซิร์ฟเวอร์กำหนด</p>
  <div className="actions"><button className="secondary" disabled={busy} onClick={onSource}>SkyUI Official Download</button><button className="secondary" disabled={busy} onClick={onInspect}>Check My SkyUI Files</button></div>
  {external&&<><p className="muted">{external.message}</p>{external.files.map(f=><p key={f.name}>{f.name}: {f.verified?'Matches supplied 6.0 reference':'Missing / different version / unsafe file'}</p>)}<p>Files verified: {String(external.filesVerified)} · ESL: {String(external.light)} · Installation: {external.installation}</p></>}
  </section>;

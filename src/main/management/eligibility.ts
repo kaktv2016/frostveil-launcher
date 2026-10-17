@@ -4,7 +4,7 @@ import type {ManagedPlan} from '../../shared/management-contracts';
 
 export const EXISTING_LIGHT_NOTICE='Existing active light/ESL plugins are preserved; their gameplay compatibility with the pinned SkyMP build is unverified.';
 const same=(a:string,b:string)=>a.toLowerCase()===b.toLowerCase();
-const inert=(p:string)=>/^data\/frostveil\/[a-z0-9_/-]+\.(?:ini|json|txt)$/i.test(p)||/^data\/interface\/frostveil\/[a-z0-9_/-]+\.(?:html|css|json|png)$/i.test(p);
+const inert=(p:string)=>/^data\/frostveil\/[a-z0-9_/-]+\.(?:ini|json|txt)$/i.test(p)||/^data\/interface\/frostveil\/[a-z0-9_/-]+\.(?:html|css|json|png)$/i.test(p)||/^data\/SkyUI_SE\.(?:esp|bsa)$/i.test(p);
 function warningOnly(p:ManagedPreflight){
  return p.status==='UNVERIFIED'&&p.runtime?.ready&&!p.managerDetected&&!p.processActive&&!p.blockers.length&&p.activation?.status==='ready'&&p.permissions.gameReadable&&p.permissions.gameWriteAccess&&p.permissions.configReadable&&p.permissions.configWriteAccess&&p.manual.length===1&&p.manual[0]===EXISTING_LIGHT_NOTICE&&p.activation.active.some(n=>p.plugins.some(x=>same(x.name,n)&&(x.light||/\.esl$/i.test(n))));
 }

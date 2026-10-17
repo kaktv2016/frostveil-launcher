@@ -1,4 +1,5 @@
 import {ProductionDownloads} from './management/downloads';import {inspectSkyUI,SKYUI_SOURCE} from './management/external-mods';
+import {GraphicsPackService} from './management/graphics-pack';
 import {ManagementService} from './management/service';import {runManagementFixtureDemo} from './management/demo';
 import {readTestProfile} from './distribution/level-b';
 import {DistributionService} from './distribution/service';
@@ -38,7 +39,8 @@ async function start(){
  let settings:Settings={directory:fixture?path.join(fixture,'game'):'',channel:'stable'};
  try{settings=validateSettings(JSON.parse(await fs.readFile(settingsPath,'utf8')));}catch{/* first start or invalid local settings: safe defaults */}
  const state:Dashboard={version:app.getVersion(),settings,scan:null,backup:null,updates:updateState(settings.channel),server:'NOT TESTED',events:[]};
- const downloads=new ProductionDownloads(storage,app.getVersion());state.productionDownloads=downloads.snapshot();
+ const downloads=new ProductionDownloads(storage,app.getVersion(),undefined,undefined,fixture?async()=>false:gameRunning);state.productionDownloads=downloads.snapshot();
+ const graphicsPack=new GraphicsPackService(storage);state.graphicsPack=graphicsPack.snapshot();
  const writeLocal=async(file:string,data:unknown)=>{try{await noLinks(file);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}await fs.writeFile(file,JSON.stringify(data,null,2));};
  const log=async(message:string)=>{state.events.unshift(new Date().toISOString()+' '+message);state.events=state.events.slice(0,60);await writeLocal(path.join(storage,'diagnostics.json'),state.events);};
  const version=fixture?async(file:string)=>path.basename(file)==='SkyrimSE.exe'?profile.runtime:profile.skseVersion:fileVersion;
@@ -49,8 +51,10 @@ async function start(){
   if(settings.directory&&!profile.files.length&&!fixture&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{profile=await downloads.baselineProfile();}catch(error){await log('Signed public baseline unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
   state.scan=settings.directory?await scanInstallation(settings.directory,profile,version):null;
   if(!settings.directory)await log('No Steam installation detected; select a game folder');else await log(state.scan?.ready?'Installation matches local baseline; server connection NOT TESTED':'Installation incompatible/unverified — Play blocked');
-  if(settings.directory){const orderDir=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');if(!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')&&!await downloads.isInstalled(settings.directory,orderDir)){try{await log('1-Click Auto-Install: Installing server files & activating SkyUI...');await downloads.installAndActivate(settings.directory,orderDir);await log('Server files and SkyUI installed and activated in plugins.txt');}catch(error){await log('Auto-install failed: '+(error instanceof Error?error.message:'Unknown error'));}}downloads.setInstalled(await downloads.isInstalled(settings.directory,orderDir));}
+  if(settings.directory&&!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){const orderDir=path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');try{await downloads.inspectInstallation(settings.directory,orderDir);}catch(error){downloads.setInstalled(false);await log('Server pack check unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
+  if(settings.directory&&!fixture&&!smoke){try{await graphicsPack.inspect(settings.directory);}catch(error){await log('Graphics pack check unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
   state.productionDownloads=downloads.snapshot();
+  state.graphicsPack=graphicsPack.snapshot();
   await writeLocal(settingsPath,settings);return state.scan;
  };
  const root=path.join(__dirname,'renderer');
@@ -69,12 +73,13 @@ async function start(){
  state.launcherUpdate=updater.snapshot();
  const window=new BrowserWindow({width:1180,height:780,minWidth:960,minHeight:680,show:true,backgroundColor:'#101310',title:'Frostveil Launcher',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true}});
  const unsubscribeDownloads=downloads.subscribe(snapshot=>{state.productionDownloads=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:production-downloads-state',snapshot);});
+ const unsubscribeGraphicsPack=graphicsPack.subscribe(snapshot=>{state.graphicsPack=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:graphics-pack-state',snapshot);});
  const unsubscribeUpdate=updater.subscribe(snapshot=>{state.launcherUpdate=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:update-state',snapshot);});
  const unsubscribePack=modpack.subscribe(snapshot=>{state.modpack=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:modpack-state',snapshot);});
  const unsubscribeDistribution=distribution.subscribe(snapshot=>{state.distribution=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:distribution-state',snapshot);});
  const unsubscribeManagement=management.subscribe(snapshot=>{state.management=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:management-state',snapshot);});
  const unsubscribeInstaller=installer.subscribe(snapshot=>{state.installer=snapshot;if(!window.isDestroyed()&&!window.webContents.isDestroyed())window.webContents.send('launcher:installer-state',snapshot);});
- window.once('closed',()=>{unsubscribeDownloads();downloads.dispose();unsubscribeManagement();management.dispose();unsubscribeDistribution();distribution.dispose();unsubscribeInstaller();installer.dispose();unsubscribeUpdate();unsubscribePack();modpack.dispose();updater.dispose();});
+ window.once('closed',()=>{unsubscribeGraphicsPack();unsubscribeDownloads();downloads.dispose();unsubscribeManagement();management.dispose();unsubscribeDistribution();distribution.dispose();unsubscribeInstaller();installer.dispose();unsubscribeUpdate();unsubscribePack();modpack.dispose();updater.dispose();});
  window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
  window.webContents.on('will-navigate',(event,url)=>{if(url!=='app://launcher/index.html')event.preventDefault();});
  window.webContents.session.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
@@ -82,13 +87,15 @@ async function start(){
  window.webContents.on('will-attach-webview',event=>event.preventDefault());
  const handler=(name:string,fn:(arg:unknown)=>Promise<void>)=>ipcMain.handle('launcher:'+name,async(event,arg)=>{
   if(event.sender!==window.webContents||!authorize(event.senderFrame?.url??'',event.senderFrame===window.webContents.mainFrame))throw Error('Unauthorized IPC sender');
-  if(name==='status'||name==='cancel-server-files'||name==='cancel-management'||name==='cancel-distribution'||name==='cancel-modpack'||name==='cancel-installer-sandbox'){await fn(arg);return structuredClone(state);}
+  if(name==='status'||name==='cancel-server-files'||name==='cancel-graphics-pack'||name==='cancel-management'||name==='cancel-distribution'||name==='cancel-modpack'||name==='cancel-installer-sandbox'){await fn(arg);return structuredClone(state);}
   if(busy)throw Error('Another operation is in progress');busy=true;
   try{await fn(arg);return structuredClone(state);}catch(error){const message=error instanceof Error?error.message:'Operation failed';await log(message);throw Error(message);}finally{busy=false;}
  });
  const noArgument=(arg:unknown)=>{if(arg!==undefined)throw Error('Unexpected IPC input');};
  handler('download-server-files',async arg=>{noArgument(arg);if(smoke)throw Error('Production download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await downloads.installAndActivate(settings.directory,orderDirectory);await scan();await log('Server files and SkyUI installed and activated in plugins.txt');});
  handler('cancel-server-files',async arg=>{noArgument(arg);downloads.cancel();});
+ handler('download-graphics-pack',async arg=>{noArgument(arg);if(smoke)throw Error('Graphics download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await graphicsPack.downloadAndInstall(settings.directory,orderDirectory);await scan();await log('Graphics overhaul downloaded and installed from Cloudflare R2');});
+ handler('cancel-graphics-pack',async arg=>{noArgument(arg);graphicsPack.cancel();});
  handler('open-skyui-source',async arg=>{noArgument(arg);if(smoke)throw Error('External navigation is disabled in fixture smoke');await shell.openExternal(SKYUI_SOURCE);});
  handler('inspect-skyui',async arg=>{noArgument(arg);if(smoke)throw Error('External folders are disabled in fixture smoke');const selected=(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Choose extracted SkyUI folder (read-only verification)'})).filePaths[0];if(selected)state.externalMod=await inspectSkyUI(selected);});
  handler('status',async arg=>{noArgument(arg);});
@@ -119,7 +126,7 @@ async function start(){
  handler('cancel-installer-sandbox',async arg=>{noArgument(arg);installer.cancel();});
  handler('cancel-modpack',async arg=>{noArgument(arg);modpack.cancel();});
  handler('backup',async arg=>{noArgument(arg);if(!settings.directory)throw Error('Select a game installation first');state.backup=null;state.backup=await createBackup(settings.directory,path.join(storage,'backups'),profile);await log(`Verified integration backup: ${state.backup.files} files (${state.backup.skipped.length} skipped); not a full game backup`);});
- handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');if(settings.directory&&!smoke){const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');if(!await downloads.isInstalled(settings.directory,orderDirectory)){await log('1-Click Auto-Install: Installing server files & activating SkyUI...');await downloads.installAndActivate(settings.directory,orderDirectory);await scan();}}await launch.play(async()=>{const current=await scan();if(!current)throw Error('No installation selected');if(mandatoryPackPolicy){await modpack.scan(settings.directory,settings.channel,current);modpack.enforce();}return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
+ handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');if(!settings.directory)throw Error('Select your Skyrim installation first');await launch.play(async()=>{if(!smoke){const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await downloads.prepareForPlay(settings.directory,orderDirectory);}const current=await scan();if(!current)throw Error('No installation selected');if(mandatoryPackPolicy){await modpack.scan(settings.directory,settings.channel,current);modpack.enforce();}return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
  app.on('second-instance',()=>{window.show();if(window.isMinimized())window.restore();window.focus();});
  window.once('ready-to-show',()=>{window.show();});
  await window.loadURL('app://launcher/index.html');window.show();window.focus();
