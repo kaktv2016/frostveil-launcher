@@ -227,8 +227,43 @@ export class GraphicsPackService {
       phase: 'extracting',
       message: 'Restoring verified plugins, SKSE DLLs & anti-cheat INI configurations...',
     });
+    await this.repairNestedEmbersFolders(gameDirectory);
     await this.extractToGame(patchArchive, gameDirectory);
     await this.purgeForbiddenPlugins(gameDirectory, manifest.forbiddenPlugins);
+  }
+
+  private async repairNestedEmbersFolders(gameDirectory: string): Promise<void> {
+    const copyRecursive = async (srcDir: string, destDir: string): Promise<void> => {
+      if (!fsSync.existsSync(srcDir)) return;
+      const entries = await fs.readdir(srcDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const s = path.join(srcDir, entry.name);
+        const d = path.join(destDir, entry.name);
+        if (entry.isDirectory()) {
+          await fs.mkdir(d, { recursive: true });
+          await copyRecursive(s, d);
+        } else {
+          await fs.mkdir(path.dirname(d), { recursive: true });
+          await fs.copyFile(s, d);
+        }
+      }
+    };
+
+    const texRoot = path.join(gameDirectory, 'Data', 'textures');
+    for (const v of ['hd', 'common', 'embers', 'new', 'cs']) {
+      await copyRecursive(path.join(texRoot, v, 'textures'), texRoot).catch(() => {});
+    }
+    for (const v of ['common', 'cs', 'embers', 'hd', 'inferno', 'new']) {
+      await fs.rm(path.join(texRoot, v), { recursive: true, force: true }).catch(() => {});
+    }
+
+    const meshRoot = path.join(gameDirectory, 'Data', 'meshes');
+    for (const v of ['common', 'cs']) {
+      await copyRecursive(path.join(meshRoot, v, 'meshes'), meshRoot).catch(() => {});
+    }
+    for (const v of ['common', 'common-intense', 'cs', 'ehd', 'inferno', 'new', 'orange', 'vanilla', 'yellow', 'yellow-orange']) {
+      await fs.rm(path.join(meshRoot, v), { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   /**
