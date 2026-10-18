@@ -21,12 +21,16 @@ export class ProductionDownloads {
  private grant?:SandboxGrant;
  private controller?:AbortController;
  private lastBundle?:ReturnType<typeof authenticateRelease>;
+ private lastBundleAt=0;
+ private isDefaultProvider=false;
  private listeners=new Set<(state:ProductionDownloadState)=>void>();
  private disposed=false;
  private preparing=false;
  private cancellation=0;
  private checkCancellation(version:number){if(this.disposed||this.cancellation!==version)throw Error('Server file preparation cancelled');}
- constructor(private storage:string,private version:string,private source:DistributionSource=productionSource,private providerFactory=()=>new GitHubDistributionProvider(),private running:()=>Promise<boolean>=async()=>false){}
+ constructor(private storage:string,private version:string,private source:DistributionSource=productionSource,private providerFactory?:()=>GitHubDistributionProvider,private running:()=>Promise<boolean>=async()=>false){
+  if(!this.providerFactory){this.isDefaultProvider=true;this.providerFactory=()=>new GitHubDistributionProvider();}
+ }
  snapshot():ProductionDownloadState{return structuredClone(this.state);}
  subscribe(listener:(state:ProductionDownloadState)=>void){this.listeners.add(listener);return()=>{this.listeners.delete(listener);};}
  private update(patch:Partial<ProductionDownloadState>){if(this.disposed)return;this.state={...this.state,...patch};for(const listener of this.listeners){try{listener(this.snapshot());}catch{/* UI listeners cannot affect acquisition. */}}}
@@ -62,10 +66,7 @@ export class ProductionDownloads {
  }
  async baselineProfile():Promise<Profile>{
   if(this.disposed)throw Error('Download service disposed');
-  const provider=this.providerFactory(),release=await provider.resolve(this.source.channel),bundle=authenticateRelease(await provider.envelope(release),this.source,release);
-  this.lastBundle=bundle;
-  if(lt(this.version,bundle.manifest.minimumLauncherVersion))throw Error('Update Launcher before resolving the public baseline');
-  await safeDirectory(this.storage);await new VersionLedger(path.join(this.storage,'production-download-history')).accept(bundle.manifest.packId,bundle.manifest.channel,bundle.manifest.packVersion,bundle.manifestHash);
+  const bundle=await this.currentBundle();
   const pack=bundle.manifest,skseDll='skse64_'+pack.requiredSkyrimRuntime.split('.').slice(0,3).join('_')+'.dll';
   const files=pack.files.filter(f=>f.required&&f.distribution==='external-only');
   if(['SkyrimSE.exe','skse64_loader.exe',skseDll].some(p=>!files.some(f=>f.path.toLowerCase()===p.toLowerCase())))throw Error('Signed public runtime baseline is incomplete');
@@ -82,9 +83,9 @@ export class ProductionDownloads {
   const controller=new AbortController();this.controller=controller;
   this.update({phase:'checking',signature:'UNVERIFIED',message:'Verifying signed GitHub release.',files:[],bytes:0,totalBytes:0,installed:false});
   try{
-   const provider=this.providerFactory(),release=await provider.resolve(this.source.channel,undefined,controller.signal);
+   const provider=this.providerFactory!(),release=await provider.resolve(this.source.channel,undefined,controller.signal);
    const bundle=authenticateRelease(await provider.envelope(release,controller.signal),this.source,release);
-   this.lastBundle=bundle;
+   this.lastBundle=bundle;this.lastBundleAt=Date.now();
    if(lt(this.version,bundle.manifest.minimumLauncherVersion))throw Error('Update Launcher before downloading this pack');
    const grant=await this.cache();await new VersionLedger(path.join(this.storage,'production-download-history')).accept(bundle.manifest.packId,bundle.manifest.channel,bundle.manifest.packVersion,bundle.manifestHash);
    const wanted=new Set<string>();
@@ -101,10 +102,12 @@ export class ProductionDownloads {
  }
  setInstalled(installed:boolean){if(this.state.installed!==installed)this.update({installed,...(installed&&this.state.phase==='idle'?{message:'Server files & mods (SkyUI) are installed and active.'}:{})});}
  private async currentBundle(){
-  const provider=this.providerFactory(),release=await provider.resolve(this.source.channel);
+  if(this.isDefaultProvider&&this.lastBundle&&Date.now()-this.lastBundleAt<15000)return this.lastBundle;
+  const provider=this.providerFactory!(),release=await provider.resolve(this.source.channel);
   const bundle=authenticateRelease(await provider.envelope(release),this.source,release);
   if(lt(this.version,bundle.manifest.minimumLauncherVersion))throw Error('Update Launcher before playing this pack');
   await safeDirectory(this.storage);await new VersionLedger(path.join(this.storage,'production-download-history')).accept(bundle.manifest.packId,bundle.manifest.channel,bundle.manifest.packVersion,bundle.manifestHash);
+  this.lastBundle=bundle;this.lastBundleAt=Date.now();
   return bundle;
  }
  private async matches(game:string,file:{path:string;size:number;sha256:string}){
@@ -156,7 +159,9 @@ export class ProductionDownloads {
  async inspectInstallation(game:string,order:string){
   const bundle=await this.currentBundle();await noLinks(game);
   const missing:string[]=[],external:string[]=[];
-  for(const file of bundle.manifest.files.filter(f=>f.required))if(!await this.matches(game,file)){
+  const requiredFiles=bundle.manifest.files.filter(f=>f.required);
+  const matchResults=await Promise.all(requiredFiles.map(async file=>({file,ok:await this.matches(game,file)})));
+  for(const {file,ok} of matchResults)if(!ok){
    (file.distribution==='allowed'&&file.package?missing:external).push(file.path);
   }
   const plugins=this.requiredActivation(bundle);
@@ -178,10 +183,12 @@ export class ProductionDownloads {
    const before=await this.inspectInstallation(game,order);
    this.checkCancellation(cancellation);
    if(before.external.length)throw Error('External dependency missing or different (cannot auto-download): '+before.external.join(', '));
-   if(!before.installed){await this.installAndActivate(game,order);}
-   const after=await this.inspectInstallation(game,order);
-   this.checkCancellation(cancellation);
-   if(!after.installed)throw Error('Pack verification incomplete: '+[...after.missing,...after.external,...after.inactive].join(', '));
+   if(!before.installed){
+    await this.installAndActivate(game,order);
+    const after=await this.inspectInstallation(game,order);
+    this.checkCancellation(cancellation);
+    if(!after.installed)throw Error('Pack verification incomplete: '+[...after.missing,...after.external,...after.inactive].join(', '));
+   }
    this.update({phase:'complete',installed:true,message:'Signed server pack verified. Starting Skyrim…'});
    return this.snapshot();
   }catch(e){this.update({phase:this.cancellation!==cancellation?'cancelled':'error',installed:false,message:e instanceof Error?e.message:'Pack preparation failed'});throw e;}

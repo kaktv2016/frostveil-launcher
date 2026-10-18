@@ -167,23 +167,21 @@ export class GraphicsPackService {
     await this.purgeForbiddenPlugins(gameDirectory, manifest.forbiddenPlugins);
     if (!manifest.integrityFiles) return { valid: true, mismatched: [] };
 
-    const mismatched: string[] = [];
-    for (const [relPath, expected] of Object.entries(manifest.integrityFiles)) {
-      const fullPath = path.join(gameDirectory, ...relPath.split('/'));
-      try {
-        const st = await fs.stat(fullPath);
-        if (st.size !== expected.size) {
-          mismatched.push(relPath);
-          continue;
+    const entries = Object.entries(manifest.integrityFiles);
+    const results = await Promise.all(
+      entries.map(async ([relPath, expected]) => {
+        const fullPath = path.join(gameDirectory, ...relPath.split('/'));
+        try {
+          const st = await fs.stat(fullPath);
+          if (st.size !== expected.size) return relPath;
+          const actualHash = await this.computeHash(fullPath);
+          return actualHash === expected.sha256 ? null : relPath;
+        } catch {
+          return relPath;
         }
-        const actualHash = await this.computeHash(fullPath);
-        if (actualHash !== expected.sha256) {
-          mismatched.push(relPath);
-        }
-      } catch {
-        mismatched.push(relPath);
-      }
-    }
+      })
+    );
+    const mismatched = results.filter((r): r is string => r !== null);
     return { valid: mismatched.length === 0, mismatched };
   }
 
@@ -258,9 +256,6 @@ export class GraphicsPackService {
     }
 
     const meshRoot = path.join(gameDirectory, 'Data', 'meshes');
-    for (const v of ['common', 'cs']) {
-      await copyRecursive(path.join(meshRoot, v, 'meshes'), meshRoot).catch(() => {});
-    }
     for (const v of ['common', 'common-intense', 'cs', 'ehd', 'inferno', 'new', 'orange', 'vanilla', 'yellow', 'yellow-orange']) {
       await fs.rm(path.join(meshRoot, v), { recursive: true, force: true }).catch(() => {});
     }
@@ -529,7 +524,8 @@ export class GraphicsPackService {
     ];
 
     const pluginsLines = [
-      '# This file is locked by Skyrim RP Launcher (AAA Anti-Cheat Load Order)',
+      '# This file is used by Skyrim to keep track of your downloaded content.',
+      '# Please do not modify this file.',
       ...canonicalOrder.map(p => `*${p}`),
     ];
     const loadorderLines = [
@@ -546,7 +542,20 @@ export class GraphicsPackService {
       ...canonicalOrder,
     ];
 
-    await fs.writeFile(pluginsFile, bom + pluginsLines.join('\r\n') + '\r\n', 'utf8');
-    await fs.writeFile(loadorderFile, loadorderLines.join('\r\n') + '\r\n', 'utf8');
+    const nextPluginsText = bom + pluginsLines.join('\r\n') + '\r\n';
+    if (existingText !== nextPluginsText) {
+      await fs.writeFile(pluginsFile, nextPluginsText, 'utf8');
+    }
+
+    let existingLoadorder = '';
+    try {
+      existingLoadorder = await fs.readFile(loadorderFile, 'utf8');
+    } catch {
+      existingLoadorder = '';
+    }
+    const nextLoadorderText = loadorderLines.join('\r\n') + '\r\n';
+    if (existingLoadorder !== nextLoadorderText) {
+      await fs.writeFile(loadorderFile, nextLoadorderText, 'utf8');
+    }
   }
 }
