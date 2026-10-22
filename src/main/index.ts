@@ -1,3 +1,7 @@
+import {repairClientForPlay,clientRequirementForScan} from './client-repair';
+import {repairGraphicsSources} from './graphics-source-repair';
+import {sourceVerifiesLegacyTarget} from './navigation-repair-targets';
+import {loadGraphicsSourcePlan,graphicsSourceDirectories} from './graphics-source-plan';
 import {ProductionDownloads} from './management/downloads';import {inspectSkyUI,SKYUI_SOURCE} from './management/external-mods';
 import {GraphicsPackService} from './management/graphics-pack';
 import {ManagementService} from './management/service';import {runManagementFixtureDemo} from './management/demo';
@@ -13,7 +17,7 @@ import {fileVersion,steamRoots,gameRunning,startSkse} from './windows';
 import {createBackup} from './backup';
 import {GameLauncher} from './launch';
 import {authorize,validateSettings} from './authorization';
-import {contained,relativePath,safeDirectory,noLinks,checkExistingAncestors} from './files';
+import {contained,relativePath,safeDirectory,safeFile,noLinks,checkExistingAncestors} from './files';
 import {updateState} from './updates';
 import {selectInstallation} from './session-state';
 import {createUpdater} from './update-bootstrap';
@@ -45,10 +49,34 @@ async function start(){
  const log=async(message:string)=>{state.events.unshift(new Date().toISOString()+' '+message);state.events=state.events.slice(0,60);await writeLocal(path.join(storage,'diagnostics.json'),state.events);};
  const version=fixture?async(file:string)=>path.basename(file)==='SkyrimSE.exe'?profile.runtime:profile.skseVersion:fileVersion;
  const launch=new GameLauncher(fixture?async()=>false:gameRunning,fixture?async()=>{throw Error('Real game launch blocked in fixture smoke');}:startSkse);
+ let graphicsPreparation:AbortController|undefined;
+ const prepareGraphics=async(orderDirectory:string,forceDownload=false)=>{
+  if(graphicsPreparation)throw Error('Graphics preparation is already running');
+  const preparation=new AbortController();graphicsPreparation=preparation;
+  try{
+  if(await gameRunning())throw Error('Skyrim/SKSE is running; close it before graphics preparation');
+  if(await fileVersion(await safeFile(settings.directory,'SkyrimSE.exe'))!=='1.6.1170.0')throw Error('Original-source graphics repair requires the pinned Skyrim 1.6.1170.0 runtime');
+  const plan=await loadGraphicsSourcePlan(storage);
+  preparation.signal.throwIfAborted();
+  graphicsPack.setSourceRepairTargets(plan.files.map(f=>f.path).filter(sourceVerifiesLegacyTarget));
+  if(forceDownload)await graphicsPack.downloadAndInstall(settings.directory,orderDirectory);
+  else await graphicsPack.verifyAndEnforceForPlay(settings.directory,orderDirectory);
+  preparation.signal.throwIfAborted();
+  const result=await repairGraphicsSources(settings.directory,storage,gameRunning,plan,{
+   sourceDirectories:await graphicsSourceDirectories(storage),
+   signal:preparation.signal,
+   progress:(phase,done,total)=>{const count=total?(phase.startsWith('downloading ')?` ${((done??0)/1048576).toFixed(1)} / ${(total/1048576).toFixed(1)} MB`:` ${done}/${total}`):'';graphicsPack.reportSourceRepair(`Preparing player files · ${phase}${count}`);},
+  });
+  graphicsPack.reportSourceRepair(`Original mod assets verified · repair ${plan.version} · ${result.changed} files restored`,true);
+  await log(`Graphics source repair ${plan.version}: ${result.changed} files restored; verified R2 source cache available for automatic repairs`);
+  preparation.signal.throwIfAborted();
+  }finally{graphicsPreparation=undefined;}
+ };
  let busy=false;
  const scan=async(skipPackChecks=false)=>{
   if(!settings.directory){const choices=await discoverSteam(await steamRoots());settings.directory=choices[0]??'';}
   if(settings.directory&&!profile.files.length&&!fixture&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{profile=await downloads.baselineProfile();}catch(error){await log('Signed public baseline unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
+  if(!fixture)profile={...profile,files:await Promise.all(profile.files.map(f=>clientRequirementForScan(f,settings.directory)))};
   state.scan=settings.directory?await scanInstallation(settings.directory,profile,version):null;
   if(!settings.directory)await log('No Steam installation detected; select a game folder');else await log(state.scan?.ready?'Installation matches local baseline; server connection NOT TESTED':'Installation incompatible/unverified — Play blocked');
   if(!skipPackChecks&&settings.directory&&!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){const orderDir=path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');try{await downloads.inspectInstallation(settings.directory,orderDir);}catch(error){downloads.setInstalled(false);await log('Server pack check unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
@@ -94,8 +122,8 @@ async function start(){
  const noArgument=(arg:unknown)=>{if(arg!==undefined)throw Error('Unexpected IPC input');};
  handler('download-server-files',async arg=>{noArgument(arg);if(smoke)throw Error('Production download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await downloads.installAndActivate(settings.directory,orderDirectory);await scan();await log('Server files and SkyUI installed and activated in plugins.txt');});
  handler('cancel-server-files',async arg=>{noArgument(arg);downloads.cancel();});
- handler('download-graphics-pack',async arg=>{noArgument(arg);if(smoke)throw Error('Graphics download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await graphicsPack.downloadAndInstall(settings.directory,orderDirectory);await scan();await log('Graphics overhaul downloaded and installed from Cloudflare R2');});
- handler('cancel-graphics-pack',async arg=>{noArgument(arg);graphicsPack.cancel();});
+ handler('download-graphics-pack',async arg=>{noArgument(arg);if(smoke)throw Error('Graphics download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await prepareGraphics(orderDirectory,true);await scan();await log('Graphics pack and original-source assets verified');});
+ handler('cancel-graphics-pack',async arg=>{noArgument(arg);graphicsPreparation?.abort(Error('Graphics preparation cancelled'));graphicsPack.cancel();});
  handler('open-skyui-source',async arg=>{noArgument(arg);if(smoke)throw Error('External navigation is disabled in fixture smoke');await shell.openExternal(SKYUI_SOURCE);});
  handler('inspect-skyui',async arg=>{noArgument(arg);if(smoke)throw Error('External folders are disabled in fixture smoke');const selected=(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Choose extracted SkyUI folder (read-only verification)'})).filePaths[0];if(selected)state.externalMod=await inspectSkyUI(selected);});
  handler('status',async arg=>{noArgument(arg);});
@@ -126,7 +154,7 @@ async function start(){
  handler('cancel-installer-sandbox',async arg=>{noArgument(arg);installer.cancel();});
  handler('cancel-modpack',async arg=>{noArgument(arg);modpack.cancel();});
  handler('backup',async arg=>{noArgument(arg);if(!settings.directory)throw Error('Select a game installation first');state.backup=null;state.backup=await createBackup(settings.directory,path.join(storage,'backups'),profile);await log(`Verified integration backup: ${state.backup.files} files (${state.backup.skipped.length} skipped); not a full game backup`);});
- handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');if(!settings.directory)throw Error('Select your Skyrim installation first');await launch.play(async()=>{if(!smoke){const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');if(!fixture)await graphicsPack.verifyAndEnforceForPlay(settings.directory,orderDirectory);await downloads.prepareForPlay(settings.directory,orderDirectory);}const current=await scan(!smoke&&!fixture);if(!current)throw Error('No installation selected');if(mandatoryPackPolicy){await modpack.scan(settings.directory,settings.channel,current);modpack.enforce();}return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
+ handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');if(!settings.directory)throw Error('Select your Skyrim installation first');await launch.play(async()=>{if(!smoke){const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');if(!fixture){await prepareGraphics(orderDirectory);await repairClientForPlay(settings.directory,storage,gameRunning);}await downloads.prepareForPlay(settings.directory,orderDirectory);}const current=await scan(!smoke&&!fixture);if(!current)throw Error('No installation selected');if(mandatoryPackPolicy){await modpack.scan(settings.directory,settings.channel,current);modpack.enforce();}return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
  app.on('second-instance',()=>{window.show();if(window.isMinimized())window.restore();window.focus();});
  window.once('ready-to-show',()=>{window.show();});
  await window.loadURL('app://launcher/index.html');window.show();window.focus();

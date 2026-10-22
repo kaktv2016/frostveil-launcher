@@ -2,7 +2,31 @@ import test from 'node:test';import assert from 'node:assert/strict';import fs f
 import * as api from '../src/main/updates';import {fixture,keyId,publicKey,envelope} from './distribution-fixture';
 import {createHash} from 'node:crypto';
 import type {ServerProfile} from '../src/shared/modpack-contracts';
+import {repairGraphicsSources,type GraphicsSourcePlan} from '../src/main/graphics-source-repair';
+import {execFileSync} from 'node:child_process';
 const functions=api as any;
+
+test('Play adopts exact R2-repaired ESP/SWF, enables its quest plugin and never downloads the same bytes from GitHub',async()=>{
+ const f=await setup(),s=new functions.ProductionDownloads(f.storage,'0.1.18',f.source,f.provider);
+ try{const {game,order}=await seedPlayer(f),template=f.pack.manifest.files.find(x=>x.package)!,paths=['Data/FrostveilCourierNavigation.esp','Data/Interface/Frostveil/CourierQuestTint.swf'];
+  for(const file of f.pack.manifest.files.filter(x=>x.package)){await fs.mkdir(path.dirname(path.join(game,file.path)),{recursive:true});await fs.writeFile(path.join(game,file.path),f.pack.payloads.get(file.package!.assetId)!);}
+  const stage=path.join(f.storage,'source'),entries:GraphicsSourcePlan['files']=[];await fs.mkdir(stage);
+  for(const [i,p]of paths.entries()){
+   const bytes=await fs.readFile('../mod-work/frostveil-courier-navigation/payload/'+p),sha256=createHash('sha256').update(bytes).digest('hex'),assetId=999+i,name=path.basename(p);
+   const file={...structuredClone(template),path:p,role:i===0?'shared-plugin' as const:'client' as const,size:bytes.length,sha256,package:{...template.package!,assetId,assetName:name,size:bytes.length,sha256}};
+   f.pack.manifest.files.push(file);f.pack.payloads.set(assetId,bytes);f.pack.metadata.assets.push({id:assetId,name,size:bytes.length,state:'uploaded',digest:'sha256:'+sha256});
+   await fs.writeFile(path.join(stage,name),bytes);entries.push({path:p,size:bytes.length,sha256,source:{member:name}});
+   if(i===0){const plugin={filename:name,order:1,required:true,role:'server-required' as const,masters:['Skyrim.esm'],sha256};f.pack.manifest.requiredPlugins.push(plugin);(f.pack.server as ServerProfile).plugins.push({...plugin,size:bytes.length,crc32:0,light:false,headerVerified:true});}
+  }
+  const archive=path.join(stage,'navigation.zip');execFileSync('tar.exe',['-acf',archive,...paths.map(p=>path.basename(p))],{cwd:stage,windowsHide:true});const zip=await fs.readFile(archive),sha256=createHash('sha256').update(zip).digest('hex');
+  for(const entry of entries)Object.assign(entry.source,{archiveName:'navigation.zip',archiveSize:zip.length,archiveSha256:sha256,downloadUrl:`https://pub-276cbfc24fc84b30bbef7eaa4f57067c.r2.dev/sources/${sha256}.zip`});
+  Object.assign(f.pack.envelope,envelope(f.pack.manifest,f.pack.server));f.pack.metadata.assets.find(a=>a.id===100)!.size=Buffer.byteLength(JSON.stringify(f.pack.envelope));
+  await fs.writeFile(path.join(order,'plugins.txt'),'FrostveilCourierNavigation.esp\r\n');
+  const recipe={version:'1.0.13',files:entries};assert.equal((await repairGraphicsSources(game,f.storage,async()=>false,recipe,{sourceDirectories:[stage]})).changed,2);
+  await s.prepareForPlay(game,order);assert.equal(s.snapshot().installed,true);assert.equal(f.requests(),0);assert.match(await fs.readFile(path.join(order,'plugins.txt'),'utf8'),/\*FrostveilCourierNavigation\.esp/);
+  assert.equal((await repairGraphicsSources(game,f.storage,async()=>false,recipe,{sourceDirectories:[]})).changed,0);await s.prepareForPlay(game,order);assert.equal(f.requests(),0);
+ }finally{s.dispose();await f.close();}
+});
 test('Play activates shared quest ESP before existing SkyUI and repairs later order drift without redownloading',async()=>{
  const f=await setup(),s=new functions.ProductionDownloads(f.storage,'0.1.9',f.source,f.provider);
  try{const {game,order}=await seedPlayer(f),bytes=await fs.readFile('../mod-work/frostveil-courier-navigation/payload/Data/FrostveilCourierNavigation.esp'),sha256=createHash('sha256').update(bytes).digest('hex');

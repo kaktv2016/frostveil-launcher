@@ -17,7 +17,7 @@ try{
  const window=await app.firstWindow();const errors=[];window.on('pageerror',e=>errors.push(e.message));
  await window.getByText('READY — local compatibility baseline matches',{exact:true}).waitFor({timeout:30000});
  assert.equal(await window.evaluate(()=>typeof window.require),'undefined');
- assert.deepEqual(await window.evaluate(()=>Object.keys(window.launcher).sort()),['downloadServerFiles','cancelServerFiles','openSkyUISource','inspectSkyUI','onProductionDownloads','applyManagement','cancelManagement','inspectManagement','onManagement','onManagementFixture','prepareManagement','recoverManagement','rollbackManagement','runManagementFixture','backup','cancelDistribution','cancelInstallerSandbox','cancelModpackScan','checkDistribution','checkUpdate','chooseDirectory','deferUpdate','downloadUpdate','installUpdate','onDistribution','onInstaller','onModpack','onUpdate','play','previewDistribution','recoverDistribution','rollbackDistribution','runDistributionSandbox','runInstallerSandbox','runLevelBSandbox','scan','scanModpack','setChannel','status'].sort());
+ assert.deepEqual(await window.evaluate(()=>Object.keys(window.launcher).sort()),['downloadGraphicsPack','cancelGraphicsPack','onGraphicsPack','downloadServerFiles','cancelServerFiles','openSkyUISource','inspectSkyUI','onProductionDownloads','applyManagement','cancelManagement','inspectManagement','onManagement','onManagementFixture','prepareManagement','recoverManagement','rollbackManagement','runManagementFixture','backup','cancelDistribution','cancelInstallerSandbox','cancelModpackScan','checkDistribution','checkUpdate','chooseDirectory','deferUpdate','downloadUpdate','installUpdate','onDistribution','onInstaller','onModpack','onUpdate','play','previewDistribution','recoverDistribution','rollbackDistribution','runDistributionSandbox','runInstallerSandbox','runLevelBSandbox','scan','scanModpack','setChannel','status'].sort());
  await window.screenshot({path:'.local/dashboard.png'});
  await window.getByRole('button',{name:/^Installation/}).click();
  await window.getByRole('button',{name:'Create Baseline Backup',exact:true}).click();
@@ -68,7 +68,8 @@ try{
  const distribution=(await window.evaluate(()=>window.launcher.status())).distribution;assert.equal(distribution.phase,'complete');assert.equal(distribution.realInstallEnabled,false);assert.equal(distribution.checks.length,5);assert.equal(distribution.sourceMode,'LOCAL LOOPBACK TEST');assert.ok(distribution.downloadedPackages>=8);
  await window.getByRole('button',{name:'Rollback Sandbox Update',exact:true}).click();
  await window.getByTestId('distribution-status').filter({hasText:'Sandbox rollback verified'}).waitFor();
- assert.equal((await window.evaluate(()=>window.launcher.status())).distribution.installedVersion,'1.0.1');
+ // The rollback message precedes the asynchronous receipt refresh.
+ await expect.poll(async()=>(await window.evaluate(()=>window.launcher.status())).distribution.installedVersion,{timeout:10000}).toBe('1.0.1');
  await window.getByRole('button',{name:'Recover Distribution Sandbox',exact:true}).click();
  await window.getByTestId('distribution-status').filter({hasText:'Sandbox recovery verified'}).waitFor();
  await window.screenshot({path:'.local/distribution-sandbox.png',fullPage:true});

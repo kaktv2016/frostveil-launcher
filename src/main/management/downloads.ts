@@ -1,3 +1,4 @@
+import {effectiveClientRequirement}from'../client-repair';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID,createHash} from 'node:crypto';
@@ -110,7 +111,7 @@ export class ProductionDownloads {
   this.lastBundle=bundle;this.lastBundleAt=Date.now();
   return bundle;
  }
- private async matches(game:string,file:{path:string;size:number;sha256:string}){
+ private async matches(game:string,file:{path:string;size:number;sha256:string}){file=effectiveClientRequirement(file);
   try{const target=await safeFile(game,file.path),st=await fs.lstat(target);if(st.nlink!==1)throw Error('Hard-linked game file is not allowed');const hash=await hashFile(target,Math.max(PAYLOAD_LIMIT,file.size));return hash.size===file.size&&hash.sha256===file.sha256;}
   catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}
  }
@@ -207,7 +208,7 @@ export class ProductionDownloads {
   await this.acquire(async file=>!await this.matches(gameDirectory,file));
   this.checkCancellation(cancellation);
   if(this.state.phase!=='complete')throw Error('Server files download could not be completed: '+this.state.message);
-  const bundle=this.lastBundle??await(async()=>{const provider=this.providerFactory(),release=await provider.resolve(this.source.channel);return authenticateRelease(await provider.envelope(release),this.source,release);})();
+  const bundle=this.lastBundle??await(async()=>{const provider=this.providerFactory!(),release=await provider.resolve(this.source.channel);return authenticateRelease(await provider.envelope(release),this.source,release);})();
   const grant=await this.cache();
   this.update({phase:'downloading',message:'Installing verified server files & mods (SkyUI) to Skyrim…'});
   const allowedFiles=bundle.manifest.files.filter(f=>f.distribution==='allowed'&&f.package);
@@ -254,7 +255,7 @@ export class ProductionDownloads {
  /** Trusted Main supplies an authenticated reference and an existing target capability. */
  async stage(target:SandboxGrant,ref:PackageReference,signal?:AbortSignal){
   if(this.disposed)throw Error('Download service disposed');await checkRoots(target);
-  const source=await new PackageDownloader(await this.cache(),this.providerFactory().transport).acquire(ref,signal);
+  const source=await new PackageDownloader(await this.cache(),this.providerFactory!().transport).acquire(ref,signal);
   const destination=path.join(target.payloads,ref.sha256+'.bin');
   async function verified(file:string){await noLinks(file);const stat=await fs.lstat(file);if(!stat.isFile()||stat.nlink!==1)throw Error('Unsafe staged payload');const h=await hashFile(file,PAYLOAD_LIMIT);if(h.sha256!==ref.sha256||h.size!==ref.size)throw Error('Staged payload hash mismatch');}
   try{await verified(destination);return destination;}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}

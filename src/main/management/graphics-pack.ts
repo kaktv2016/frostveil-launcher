@@ -3,6 +3,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import cp from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { sourceVerifiesLegacyTarget } from '../navigation-repair-targets';
 
 export interface GraphicsManifest {
   version: string;
@@ -38,7 +39,6 @@ const DEFAULT_MASTER_PLUGINS = [
   'unofficial skyrim special edition patch.esp',
   'Lux - Master plugin.esm',
   'Lux - Resources.esp',
-  'Lux Via.esp',
   'Natural Waterfalls.esp',
   'Natural Waterfalls - Dawnguard.esp',
   'Natural Waterfalls - Dragonborn.esp',
@@ -57,6 +57,19 @@ export class GraphicsPackService {
   private listeners = new Set<(state: GraphicsPackState) => void>();
   private controller?: AbortController;
   private manifestCache?: GraphicsManifest;
+  private sourceRepairTargets = new Set<string>();
+
+  /** These assets have a second, hash-pinned source verifier before Play. */
+  setSourceRepairTargets(targets: string[]) {
+    if (targets.some(p => !sourceVerifiesLegacyTarget(p))) {
+      throw new Error('Only reviewed graphics/navigation assets may use source repair targets');
+    }
+    this.sourceRepairTargets = new Set(targets.map(p => p.toLowerCase()));
+  }
+
+  reportSourceRepair(message: string, complete = false) {
+    this.update({ phase: complete ? 'complete' : 'checking', message });
+  }
 
   constructor(private storageDir: string) {}
 
@@ -95,8 +108,7 @@ export class GraphicsPackService {
     return (
       fsSync.existsSync(path.join(gameDirectory, 'd3dx9_42.dll')) &&
       fsSync.existsSync(path.join(gameDirectory, 'Data', 'Lux.esp')) &&
-      fsSync.existsSync(path.join(gameDirectory, 'Data', 'Lux - Meshes.bsa')) &&
-      fsSync.existsSync(path.join(gameDirectory, 'Data', 'Ulvenwald.bsa')) &&
+      fsSync.existsSync(path.join(gameDirectory, 'Data', 'Ulvenwald.esp')) &&
       fsSync.existsSync(path.join(gameDirectory, 'Data', 'BlendedRoads.esp'))
     );
   }
@@ -117,8 +129,7 @@ export class GraphicsPackService {
         version = raw.version;
         const hasBase = this.hasBaseAssets(gameDirectory);
         const hasParallaxFix = fsSync.existsSync(path.join(gameDirectory, 'Data', 'Parallax TXST Fixes.esp'));
-        const hasForbidden = fsSync.existsSync(path.join(gameDirectory, 'Data', 'RaceMenuPlugin.esp'));
-        if (hasBase && hasParallaxFix && !hasForbidden) {
+        if (hasBase && hasParallaxFix) {
           installed = true;
         }
       }
@@ -151,23 +162,16 @@ export class GraphicsPackService {
     return this.snapshot();
   }
 
-  private async purgeForbiddenPlugins(gameDirectory: string, forbiddenPlugins: string[] = ['RaceMenuPlugin.esp']) {
-    for (const plugin of forbiddenPlugins) {
-      const target = path.join(gameDirectory, 'Data', plugin);
-      if (fsSync.existsSync(target)) {
-        await fs.unlink(target).catch(() => {});
-      }
-    }
-  }
-
   private async verifyIntegrityFiles(
     gameDirectory: string,
     manifest: GraphicsManifest
   ): Promise<{ valid: boolean; mismatched: string[] }> {
-    await this.purgeForbiddenPlugins(gameDirectory, manifest.forbiddenPlugins);
     if (!manifest.integrityFiles) return { valid: true, mismatched: [] };
 
-    const entries = Object.entries(manifest.integrityFiles);
+    // Source repair runs after any legacy base extraction. It verifies every
+    // excluded asset and prevents old hashes from reintroducing the v106 meshes.
+    const entries = Object.entries(manifest.integrityFiles)
+      .filter(([p]) => !this.sourceRepairTargets.has(p.toLowerCase()));
     const results = await Promise.all(
       entries.map(async ([relPath, expected]) => {
         const fullPath = path.join(gameDirectory, ...relPath.split('/'));
@@ -207,18 +211,68 @@ export class GraphicsPackService {
     }
 
     if (needsDownload) {
+      const totalBytes = manifest.integrityPatchSize || 0;
       this.update({
         phase: 'downloading',
+        bytes: 0,
+        totalBytes,
         message: `Downloading anti-cheat & world integrity patch v${manifest.version}...`,
       });
-      const res = await fetch(manifest.integrityPatchUrl, { signal: signal ?? AbortSignal.timeout(60000) });
+
+      const res = await fetch(manifest.integrityPatchUrl, { signal: signal ?? AbortSignal.timeout(900000) });
       if (!res.ok) throw new Error(`Failed to download integrity patch: HTTP ${res.status}`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      const hash = createHash('sha256').update(buf).digest('hex');
+      if (!res.body) throw new Error('Response body is null');
+
+      const tempFile = patchArchive + '.part';
+      const fileStream = fsSync.createWriteStream(tempFile);
+      const hashStream = createHash('sha256');
+      const reader = res.body.getReader();
+      let bytesDownloaded = 0;
+      let lastTime = Date.now();
+      let bytesSinceLast = 0;
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        fileStream.write(Buffer.from(value));
+        hashStream.update(value);
+        bytesDownloaded += value.length;
+        bytesSinceLast += value.length;
+
+        const now = Date.now();
+        if (now - lastTime >= 500) {
+          const speed = (bytesSinceLast / (now - lastTime)) * 1000;
+          const pct = totalBytes > 0 ? Math.round((bytesDownloaded / totalBytes) * 100) : 0;
+          this.update({
+            phase: 'downloading',
+            bytes: bytesDownloaded,
+            totalBytes: totalBytes || bytesDownloaded,
+            speedMBps: speed / (1024 * 1024),
+            message: `Downloading integrity patch v${manifest.version} (${pct}%)...`,
+          });
+          lastTime = now;
+          bytesSinceLast = 0;
+        }
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        fileStream.end((err?: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+
+      const hash = hashStream.digest('hex');
       if (hash !== manifest.integrityPatchSha256) {
+        await fs.unlink(tempFile).catch(() => {});
         throw new Error(`Integrity patch hash mismatch: expected ${manifest.integrityPatchSha256}, got ${hash}`);
       }
-      await fs.writeFile(patchArchive, buf);
+
+      if (fsSync.existsSync(patchArchive)) {
+        await fs.unlink(patchArchive).catch(() => {});
+      }
+      await fs.rename(tempFile, patchArchive);
     }
 
     this.update({
@@ -227,7 +281,6 @@ export class GraphicsPackService {
     });
     await this.repairNestedEmbersFolders(gameDirectory);
     await this.extractToGame(patchArchive, gameDirectory);
-    await this.purgeForbiddenPlugins(gameDirectory, manifest.forbiddenPlugins);
   }
 
   private async repairNestedEmbersFolders(gameDirectory: string): Promise<void> {
@@ -251,22 +304,17 @@ export class GraphicsPackService {
     for (const v of ['hd', 'common', 'embers', 'new', 'cs']) {
       await copyRecursive(path.join(texRoot, v, 'textures'), texRoot).catch(() => {});
     }
-    for (const v of ['common', 'cs', 'embers', 'hd', 'inferno', 'new']) {
-      await fs.rm(path.join(texRoot, v), { recursive: true, force: true }).catch(() => {});
-    }
+    // Retain source folders and existing normal textures. Flattening must never
+    // delete another mod's files, even when a copy fails.
 
-    const meshRoot = path.join(gameDirectory, 'Data', 'meshes');
-    for (const v of ['common', 'common-intense', 'cs', 'ehd', 'inferno', 'new', 'orange', 'vanilla', 'yellow', 'yellow-orange']) {
-      await fs.rm(path.join(meshRoot, v), { recursive: true, force: true }).catch(() => {});
-    }
   }
 
   /**
    * AAA Mandatory Pre-Play Enforcement:
    * 1. Requires the Graphics & World Pack to be installed (auto-downloads if missing).
-   * 2. Purges forbidden cheat plugins (e.g. RaceMenuPlugin.esp).
+   * 2. Preserves existing enabled plugins omitted from the manifest.
    * 3. Verifies SHA-256 hashes of all 27 plugins, SKSE DLLs, and hardened INI/TOML configs.
-   *    If any file was modified or tampered with, automatically restores it from the signed integrity patch.
+   *    Source-managed assets are verified separately after the legacy patch.
    * 4. Enforces the exact Master-First topological load order in both plugins.txt and loadorder.txt.
    */
   async verifyAndEnforceForPlay(gameDirectory: string, orderDirectory: string): Promise<GraphicsPackState> {
@@ -293,6 +341,7 @@ export class GraphicsPackService {
     }
 
     await this.activatePlugins(manifest, orderDirectory);
+    await this.enforceSkyrimPrefs();
 
     this.update({
       phase: 'complete',
@@ -324,6 +373,7 @@ export class GraphicsPackService {
           throw new Error(`Integrity verification failed after patch: ${check.mismatched.slice(0, 5).join(', ')}`);
         }
         await this.activatePlugins(manifest, orderDirectory);
+        await this.enforceSkyrimPrefs();
         this.update({
           phase: 'complete',
           installed: true,
@@ -431,8 +481,7 @@ export class GraphicsPackService {
       if (manifest.integrityPatchUrl) {
         await this.applyIntegrityPatch(gameDirectory, manifest, controller.signal);
       } else {
-        await this.purgeForbiddenPlugins(gameDirectory, manifest.forbiddenPlugins);
-      }
+          }
 
       // Verify all 46 integrity files
       const check = await this.verifyIntegrityFiles(gameDirectory, manifest);
@@ -443,6 +492,7 @@ export class GraphicsPackService {
       // Activate all plugins in canonical Master-First order
       this.update({ message: 'Locking canonical Master-First load order in plugins.txt...' });
       await this.activatePlugins(manifest, orderDirectory);
+      await this.enforceSkyrimPrefs();
 
       this.update({
         phase: 'complete',
@@ -523,6 +573,16 @@ export class GraphicsPackService {
       'SkyUI_SE.esp',
     ];
 
+    // Retain enabled mods absent from the remote canonical list. A manifest is
+    // not permission to disable the player's unrelated installed plugins.
+    const canonicalNames = new Set(canonicalOrder.map(p => p.toLowerCase()));
+    const retained = existingText.replace(/^\uFEFF/, '').split(/\r?\n/)
+      .map(line => line.trim()).filter(line => line.startsWith('*'))
+      .map(line => line.slice(1).trim())
+      .filter(name => !canonicalNames.has(name.toLowerCase()));
+    for (const name of retained) {
+      if (!canonicalNames.has(name.toLowerCase())) {canonicalOrder.push(name);canonicalNames.add(name.toLowerCase());}
+    }
     const pluginsLines = [
       '# This file is used by Skyrim to keep track of your downloaded content.',
       '# Please do not modify this file.',
@@ -556,6 +616,47 @@ export class GraphicsPackService {
     const nextLoadorderText = loadorderLines.join('\r\n') + '\r\n';
     if (existingLoadorder !== nextLoadorderText) {
       await fs.writeFile(loadorderFile, nextLoadorderText, 'utf8');
+    }
+  }
+
+  private async enforceSkyrimPrefs(): Promise<void> {
+    try {
+      const userProfile = process.env.USERPROFILE || (process.env.HOMEDRIVE && process.env.HOMEPATH ? `${process.env.HOMEDRIVE}${process.env.HOMEPATH}` : '');
+      const prefsPath = path.join(userProfile, 'Documents', 'My Games', 'Skyrim Special Edition', 'SkyrimPrefs.ini');
+      if (fsSync.existsSync(prefsPath)) {
+        let content = await fs.readFile(prefsPath, 'utf8');
+        let changed = false;
+
+        // Ensure 3D skinned tree limit is at least 300 for dense Ulvenwald forests
+        if (/uiMaxSkinnedTreesToRender=\d+/i.test(content)) {
+          const match = content.match(/uiMaxSkinnedTreesToRender=(\d+)/i);
+          if (match && parseInt(match[1]!, 10) < 300) {
+            content = content.replace(/uiMaxSkinnedTreesToRender=\d+/i, 'uiMaxSkinnedTreesToRender=300');
+            changed = true;
+          }
+        } else if (content.includes('[Trees]')) {
+          content = content.replace('[Trees]', '[Trees]\r\nuiMaxSkinnedTreesToRender=300');
+          changed = true;
+        }
+
+        // Disable vanilla buggy SAO on alpha grass/flowers
+        if (content.includes('bSAOEnable=1')) {
+          content = content.replace(/bSAOEnable=1/g, 'bSAOEnable=0');
+          changed = true;
+        }
+
+        // Enable land shadows
+        if (content.includes('bDrawLandShadows=0')) {
+          content = content.replace(/bDrawLandShadows=0/g, 'bDrawLandShadows=1');
+          changed = true;
+        }
+
+        if (changed) {
+          await fs.writeFile(prefsPath, content, 'utf8');
+        }
+      }
+    } catch {
+      /* ignore if Documents folder is unavailable */
     }
   }
 }

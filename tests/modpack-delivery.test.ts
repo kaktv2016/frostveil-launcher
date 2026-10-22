@@ -491,7 +491,7 @@ test('Modpack Delivery #1–#5: valid Ed25519 manifest accepted; tampered manife
      publicKey:modpackPub,
      environment:'test',
      revoked:false,
-     expiresAt:'2026-10-21T00:00:00.000Z'
+     expiresAt:new Date(Date.now()+86400000).toISOString()
     }
    }
   };
