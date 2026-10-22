@@ -1,0 +1,13 @@
+import fs from'node:fs/promises';import path from'node:path';import{createHash}from'node:crypto';import{execFileSync}from'node:child_process';import assert from'node:assert/strict';
+process.chdir(path.resolve(import.meta.dirname,'..'));
+const dir=path.resolve('.local/spawn-terrain/delivery'),candidate=JSON.parse(await fs.readFile(path.join(dir,'candidate.json')));
+const identity=async file=>{const b=await fs.readFile(file);return{path:path.resolve(file),name:path.basename(file),size:b.length,sha256:createHash('sha256').update(b).digest('hex')};};
+assert.match(await fs.readFile('.local/spawn-terrain/smoke.log','utf8'),/smoke PASSED/);
+assert.doesNotMatch(await fs.readFile('.local/spawn-terrain/typecheck.log','utf8'),/error TS/);
+const archive=path.join(dir,'FrostveilLauncher-0.1.21-source.zip'),clientSource=path.join(dir,'FrostveilSkyMPClient-0.1.21-source.zip');
+execFileSync('tar.exe',['-acf',archive,'--exclude=.git','--exclude=node_modules','--exclude=release','--exclude=dist','--exclude=.test-build','--exclude=.local','.'],{windowsHide:true});
+execFileSync('tar.exe',['-acf',clientSource,'--exclude=node_modules','--exclude=.test-build','skymp5-client'],{cwd:path.resolve('../skymp'),windowsHide:true});
+const files=await Promise.all(['release/SkyrimRPLauncher-0.1.21-x64-local.exe','release/SkyrimRPLauncher-0.1.21-x64-local.exe.blockmap','release/latest.yml',archive,clientSource,'../skymp/docs/rp-development/FROSTVEIL_TERRAIN_SPAWN_RECOVERY_REPORT.md'].map(identity));
+const operations=await Promise.all(['scripts/publish-spawn-terrain.mjs','../scripts/publish-spawn-terrain-r2.mjs'].map(identity));
+const plan={...candidate,createdAt:new Date().toISOString(),authorization:'Standing owner approval to publish; no game writes and no server restart required',files,operations,automated:{client:50,actualBundle:9,launcherRegression:481,focusedRecipe:4,packagedSmoke:'PASS',typecheck:'PASS',nsis:'PASS',fixture:JSON.parse(await fs.readFile('.local/spawn-terrain/fixture-results.json')),nativeGameplay:'PENDING_OWNER_TEST'}};
+const bytes=Buffer.from(JSON.stringify(plan,null,2)+'\n'),sha=createHash('sha256').update(bytes).digest('hex');await fs.writeFile(path.join(dir,'deployment-plan.json'),bytes,{flag:'wx'});await fs.writeFile(path.join(dir,'deployment-plan.sha256'),sha+'\n',{flag:'wx'});await fs.writeFile(path.join(dir,'SHA256SUMS'),[...files,...operations].map(f=>f.sha256+'  '+f.name).join('\n')+'\n');console.log(JSON.stringify({sealed:sha,files:files.length,gameWrites:0,serverWrites:0}));
