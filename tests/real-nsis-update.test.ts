@@ -20,6 +20,13 @@ import {
  type LauncherUpdateSource
 } from '../src/main/update-integrity';
 
+async function removeLockedTree(target:string):Promise<void>{
+ for(let attempt=0;;attempt++){
+  try{await fs.rm(target,{recursive:true,force:true});return;}
+  catch(error){const code=(error as NodeJS.ErrnoException).code;if(!['EBUSY','EPERM'].includes(code??'')||attempt>=31)throw error;await new Promise(r=>setTimeout(r,250));}
+ }
+}
+
 function runProcess(command:string,args:string[],cwd:string):Promise<{code:number|null;stdout:string;stderr:string}>{
  return new Promise((resolve,reject)=>{
   const child=spawn(command,args,{cwd,windowsHide:true,stdio:['ignore','pipe','pipe']});
@@ -105,10 +112,16 @@ setInterval(()=>{if(__fvFs.existsSync(__fvBoot.closeRequest))__fvApp.quit();},10
  return path.join(outDir,`FrostveilDisposable-${version}-x64.exe`);
 }
 
-test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to signed 0.1.6 NSIS build in isolated temp directory while preserving user settings and ownership',async()=>{
+test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to signed 0.1.6 NSIS build in isolated temp directory while preserving user settings and ownership',{timeout:300000},async()=>{
  const projectRoot=path.resolve('.');
+ // Measured: two real packages ~112-117s, installation/update ~55s, Windows cleanup ~3s.
+ // 300s includes build time; individual ready waits remain bounded at 30/90s.
+ // Both real IPC handoff and verified engine install below are required.
+ const trace=path.resolve('.local/cursor-renderer/stages.jsonl');await fs.mkdir(path.dirname(trace),{recursive:true});await fs.writeFile(trace,'');
+ const stage=async(name:string,phase:'start'|'done',detail?:unknown)=>{const item={at:new Date().toISOString(),elapsedMs:performance.now(),name,phase,detail};await fs.appendFile(trace,JSON.stringify(item)+'\n');console.log('NSIS_STAGE',JSON.stringify(item));};
+ const timed=async<T>(name:string,fn:()=>Promise<T>):Promise<T>=>{await stage(name,'start');try{const value=await fn();await stage(name,'done');return value;}catch(error){await stage(name,'done',{error:String(error)});throw error;}};
  // Ensure dist/ is built before packaging disposable NSIS installers
- const buildRes=await runProcess(process.execPath,['scripts/build.mjs'],projectRoot);
+ const buildRes=await timed('build',()=>runProcess(process.execPath,['scripts/build.mjs'],projectRoot));
  assert.equal(buildRes.code,0,`Build failed: ${buildRes.stderr}`);
 
  const tempRoot=await fs.mkdtemp(path.join(os.tmpdir(),'frostveil-real-nsis-'));
@@ -155,11 +168,11 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
 
  let httpServer:http.Server|undefined;
  try{
-  const installer015=await buildDisposableNsisInstaller(projectRoot,path.join(tempRoot,'build-015'),'0.1.5',boot);
-  const installer016=await buildDisposableNsisInstaller(projectRoot,path.join(tempRoot,'build-016'),'0.1.6',boot);
+  const installer015=await timed('package-015',()=>buildDisposableNsisInstaller(projectRoot,path.join(tempRoot,'build-015'),'0.1.5',boot));
+  const installer016=await timed('package-016',()=>buildDisposableNsisInstaller(projectRoot,path.join(tempRoot,'build-016'),'0.1.6',boot));
 
   // Install 0.1.5 silently into isolated temp installDir
-  const install015Res=await runProcess(installer015,['/S',`/D=${installDir}`],tempRoot);
+  const install015Res=await timed('install-015',()=>runProcess(installer015,['/S',`/D=${installDir}`],tempRoot));
   assert.equal(install015Res.code,0,'NSIS 0.1.5 silent install failed');
 
   const asarPath=path.join(installDir,'resources','app.asar');
@@ -266,20 +279,20 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
   await fs.writeFile(updateProfile,JSON.stringify({schemaVersion:1,repository:'kaktv2016/frostveil-launcher',loopbackOrigin:origin,installDirectory:installDir,keyId,publicKey,fingerprint:createHash('sha256').update(keyPair.publicKey.export({type:'spki',format:'der'})).digest('hex'),expiresAt,revoked:false}));
   const env:Record<string,string>={...Object.fromEntries(Object.entries(process.env).filter((entry):entry is [string,string]=>typeof entry[1]==='string')),LOCALAPPDATA:isolatedLocalData,FROSTVEIL_DISPOSABLE_UPDATE_TEST:'1'};
   delete env.ELECTRON_RUN_AS_NODE;
-  const installedApp=await electron.launch({executablePath:path.join(installDir,'Frostveil Disposable Test.exe'),args:['--launcher-update-test','--launcher-update-test-profile',updateProfile],env,timeout:30000});
+  const installedApp=await timed('launch-installed',()=>electron.launch({executablePath:path.join(installDir,'Frostveil Disposable Test.exe'),args:['--launcher-update-test','--launcher-update-test-profile',updateProfile],env,timeout:30000}));
   try{
-   const page=await installedApp.firstWindow();
-   await page.waitForFunction(async()=> (await window.launcher.status()).launcherUpdate?.state==='available',undefined,{timeout:30000});
+   const page=await timed('first-window',()=>installedApp.firstWindow());
+   await timed('update-check-available',()=>page.waitForFunction(async()=> (await window.launcher.status()).launcherUpdate?.state==='available',undefined,{timeout:30000}));
    const state=await page.evaluate(()=>window.launcher.status());
    assert.equal(state.version,'0.1.5');assert.equal(state.launcherUpdate?.publisherTrust,'verified');
    assert.equal(state.launcherUpdate?.keyId,keyId);assert.equal(state.launcherUpdate?.canDownload,true);
    assert.deepEqual(state.settings,JSON.parse(settingsContent));
-   await page.evaluate(()=>window.launcher.downloadUpdate());
+   await timed('download-verify',()=>page.evaluate(()=>window.launcher.downloadUpdate()));
    assert.equal((await page.evaluate(()=>window.launcher.status())).launcherUpdate?.verification,'installer-verified');
    // No replacement callback: exercise the actual Main IPC -> service -> verified
    // handoff -> spawn (--updated /S --force-run /D) -> installed app restart.
-   await page.evaluate(()=>window.launcher.installUpdate());
-   await until(async()=> (await events()).some(e=>e.kind==='ready'&&e.version==='0.1.6'),'installed application restart');
+   await timed('handoff-install',()=>page.evaluate(()=>window.launcher.installUpdate()));
+   await timed('new-app-ready',()=>until(async()=> (await events()).some(e=>e.kind==='ready'&&e.version==='0.1.6'),'installed application restart'));
    const history=await events();
    assert.ok(history.some(e=>e.kind==='quit'&&e.version==='0.1.5'),'Old installed application exited through its normal quit event');
    assert.ok(history.some(e=>e.kind==='start'&&e.version==='0.1.6'&&e.argv.includes('--updated')),'NSIS force-run restarted the installed new version');
@@ -288,7 +301,7 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
    assert.deepEqual(await snapshotMetadata(),metadataBefore,'Authenticated ownership, journals and backup bytes survived the real app update');
    assert.deepEqual(await fixtureStore.read('ownership.json'),receiptBefore);
    assert.equal(await fs.readFile(settingsFile,'utf8'),settingsContent);
-  }finally{await fs.writeFile(boot.closeRequest,'close owned disposable test application');await installedApp.close().catch(()=>{});}
+  }finally{await timed('close-app',async()=>{await fs.writeFile(boot.closeRequest,'close owned disposable test application');await installedApp.close().catch(()=>{});});}
 
   const engine=new NsisEngine([],{
    source,
@@ -310,16 +323,16 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
    gameRunning:async()=>false
   });
 
-  await service.check();
+  await timed('engine-check',()=>service.check());
   assert.equal(service.snapshot().state,'available');
   assert.equal(service.snapshot().availableVersion,'0.1.6');
   assert.equal(service.snapshot().verification,'manifest-verified');
 
-  await service.download();
+  await timed('engine-download',()=>service.download());
   assert.equal(service.snapshot().state,'downloaded');
   assert.equal(service.snapshot().verification,'installer-verified');
 
-  await service.install();
+  await timed('engine-install',()=>service.install());
   assert.equal(service.snapshot().state,'installing');
 
   // Verify the installed app on disk was genuinely upgraded from 0.1.5 to 0.1.6!
@@ -339,7 +352,10 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
  }finally{
   await fs.writeFile(boot.closeRequest,'close owned disposable test application').catch(()=>{});
   if(httpServer){
+   await stage('http-close','start');
+   httpServer.closeAllConnections();
    await new Promise<void>(r=>httpServer!.close(()=>r()));
+   await stage('http-close','done');
   }
   const uninstaller=path.join(installDir,'Uninstall Frostveil Disposable Test.exe');
   try{
@@ -347,6 +363,6 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
    await runProcess(uninstaller,['/currentuser','/S'],tempRoot);
   }catch{/* Ignore if not installed */}
   assert.equal(path.dirname(path.resolve(tempRoot)),path.resolve(os.tmpdir()));
-  await fs.rm(tempRoot,{recursive:true,force:true}).catch(()=>{});
+  await timed('cleanup-temp',()=>removeLockedTree(tempRoot));
  }
 });

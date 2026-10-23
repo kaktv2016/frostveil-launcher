@@ -25,7 +25,7 @@ let state;try{state=await read(statePath);}catch(e){if(e.code!=='ENOENT')throw e
 let release;
 const notes='Adds scoped DirectX cursor visibility for Frostveil dialogue. Pins native SkyrimPlatformImpl.dll via recipe 1.0.17; 648 other targets unchanged. Restores cursor on ESC/loading/disconnect. Owner Skyrim acceptance pending. Corresponding source SHA-256: '+plan.files.find(f=>f.name.endsWith('-source.zip')).sha256+'.';
 if(state)release=api('repos/'+repo+'/releases/'+state.id);
-else{assert.equal(api('repos/'+repo+'/releases/latest').tag_name,'v0.1.21');release=mutate('POST','repos/'+repo+'/releases',{tag_name:tag,target_commitish:api('repos/'+repo+'/commits/main').sha,name:'Frostveil Launcher 0.1.22 — Terrain Spawn Recovery',draft:true,prerelease:false,body:notes});await fs.writeFile(statePath,JSON.stringify({id:release.id,planSHA256:expected}));}
+else{assert.equal(api('repos/'+repo+'/releases/latest').tag_name,'v0.1.21');release=mutate('POST','repos/'+repo+'/releases',{tag_name:tag,target_commitish:api('repos/'+repo+'/commits/main').sha,name:'Frostveil Launcher 0.1.22 — Dialogue Cursor',draft:true,prerelease:false,body:notes});await fs.writeFile(statePath,JSON.stringify({id:release.id,planSHA256:expected}));}
 assert.equal(release.tag_name,tag);if(state)assert.equal(state.planSHA256,expected);
 async function upload(file){const old=release.assets.find(a=>a.name===file.name);if(old){assert.equal(old.digest,'sha256:'+file.sha256);assert.equal(old.size,file.size);return;}assert.equal(release.draft,true);await verify(file);call(['release','upload',tag,file.path,'--repo',repo]);release=api('repos/'+repo+'/releases/'+release.id);}
 for(const file of plan.files)await upload(file);
