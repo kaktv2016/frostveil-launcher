@@ -1,0 +1,9 @@
+import fs from 'node:fs/promises';import path from 'node:path';import assert from 'node:assert/strict';import{createHash}from'node:crypto';import{createRequire}from'node:module';
+const require=createRequire(path.resolve('../scripts/package.json'));const{S3Client,PutObjectCommand}=require('@aws-sdk/client-s3');
+const dir=path.resolve('.local/gui-motion/delivery'),candidate=JSON.parse(await fs.readFile(path.join(dir,'candidate.json')));
+const source=await fs.readFile('../scripts/upload-to-r2.mjs','utf8');function setting(name){const match=source.match(new RegExp('const '+name+' = [\'\"]([^\'\"]+)[\'\"]'));assert.ok(match);return match[1];}
+const client=new S3Client({region:'auto',endpoint:'https://'+setting('accountId')+'.r2.cloudflarestorage.com',credentials:{accessKeyId:setting('accessKeyId'),secretAccessKey:setting('secretAccessKey')}});
+const specs=[{...candidate.client,file:path.join(dir,'SkyrimPlatformImpl.dll')},{...candidate.archive,file:candidate.archive.path},{...candidate.recipe,file:path.join(dir,'source-repair-plan.json')}];const checks=[];
+for(const spec of specs){const bytes=await fs.readFile(spec.file);assert.equal(bytes.length,spec.size);assert.equal(createHash('sha256').update(bytes).digest('hex'),spec.sha256);await client.send(new PutObjectCommand({Bucket:setting('bucketName'),Key:new URL(spec.url).pathname.slice(1),Body:bytes}));const response=await fetch(spec.url,{signal:AbortSignal.timeout(60000)});assert.equal(response.status,200);const actual=Buffer.from(await response.arrayBuffer());assert.equal(actual.length,spec.size);assert.equal(createHash('sha256').update(actual).digest('hex'),spec.sha256);checks.push({sha256:spec.sha256,size:actual.length});}
+await fs.writeFile(path.join(dir,'r2-verification.json'),JSON.stringify({anonymousVerification:'PASS',checks}));console.log('R2 upload and anonymous hashes verified: '+checks.length);
+
