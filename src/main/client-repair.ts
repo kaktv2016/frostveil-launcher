@@ -20,3 +20,7 @@ export async function repairClientForPlay(game:string,storage:string,running:()=
 }
 
 export async function clientRequirementForScan<T extends {path:string;size:number;sha256:string}>(file:T,game:string,pin:Pin=clientRepairPin):Promise<T>{const next=effectiveClientRequirement(file,pin);if(next===file)return file;try{const actual=await hashFile(await safeFile(game,pin.path),8*1024*1024);if(actual.sha256===pin.sha256&&actual.size===pin.size)return next;}catch{}return file;}
+
+const nativeTransition={path:'Data/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll',size:15668224,sha256:'18b530ef76a5b84d6da090b5e9c87f7e93b436e02104b48aa1602a8b26d6e30a',url:'',previous:{size:15668224,sha256:'ce58aa2ddddb72e8c941d4fde5edcdfa5398815e33cf95efead0fd71608e4666'}};
+export function effectiveNativeRequirement<T extends {path:string;size:number;sha256:string}>(file:T):T{return effectiveClientRequirement(file,nativeTransition);}
+export async function nativeRequirementForScan<T extends {path:string;size:number;sha256:string}>(file:T,game:string):Promise<T>{const next=effectiveNativeRequirement(file);if(next===file)return file;try{const actual=await hashFile(await safeFile(game,next.path),32*1024*1024);if(actual.size===next.size&&actual.sha256===next.sha256)return next;}catch{}return file;}

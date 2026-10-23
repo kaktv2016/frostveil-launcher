@@ -1,4 +1,4 @@
-import {effectiveClientRequirement}from'../client-repair';
+import {effectiveClientRequirement,effectiveNativeRequirement}from'../client-repair';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID,createHash} from 'node:crypto';
@@ -111,7 +111,7 @@ export class ProductionDownloads {
   this.lastBundle=bundle;this.lastBundleAt=Date.now();
   return bundle;
  }
- private async matches(game:string,file:{path:string;size:number;sha256:string}){file=effectiveClientRequirement(file);
+ private async matches(game:string,file:{path:string;size:number;sha256:string}){file=effectiveNativeRequirement(effectiveClientRequirement(file));
   try{const target=await safeFile(game,file.path),st=await fs.lstat(target);if(st.nlink!==1)throw Error('Hard-linked game file is not allowed');const hash=await hashFile(target,Math.max(PAYLOAD_LIMIT,file.size));return hash.size===file.size&&hash.sha256===file.sha256;}
   catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}
  }

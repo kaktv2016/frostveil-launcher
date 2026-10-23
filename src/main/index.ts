@@ -1,4 +1,4 @@
-import {repairClientForPlay,clientRequirementForScan} from './client-repair';
+import {repairClientForPlay,clientRequirementForScan,nativeRequirementForScan} from './client-repair';
 import {repairGraphicsSources} from './graphics-source-repair';
 import {sourceVerifiesLegacyTarget} from './navigation-repair-targets';
 import {loadGraphicsSourcePlan,graphicsSourceDirectories} from './graphics-source-plan';
@@ -76,7 +76,7 @@ async function start(){
  const scan=async(skipPackChecks=false)=>{
   if(!settings.directory){const choices=await discoverSteam(await steamRoots());settings.directory=choices[0]??'';}
   if(settings.directory&&!profile.files.length&&!fixture&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{profile=await downloads.baselineProfile();}catch(error){await log('Signed public baseline unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
-  if(!fixture)profile={...profile,files:await Promise.all(profile.files.map(f=>clientRequirementForScan(f,settings.directory)))};
+  if(!fixture)profile={...profile,files:await Promise.all(profile.files.map(async f=>nativeRequirementForScan(await clientRequirementForScan(f,settings.directory),settings.directory)))};
   state.scan=settings.directory?await scanInstallation(settings.directory,profile,version):null;
   if(!settings.directory)await log('No Steam installation detected; select a game folder');else await log(state.scan?.ready?'Installation matches local baseline; server connection NOT TESTED':'Installation incompatible/unverified — Play blocked');
   if(!skipPackChecks&&settings.directory&&!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){const orderDir=path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');try{await downloads.inspectInstallation(settings.directory,orderDir);}catch(error){downloads.setInstalled(false);await log('Server pack check unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}

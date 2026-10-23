@@ -1,0 +1,3 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {effectiveNativeRequirement}from'../src/main/client-repair';
+const old={path:'Data/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll',size:15668224,sha256:'ce58aa2ddddb72e8c941d4fde5edcdfa5398815e33cf95efead0fd71608e4666'};
+test('reviewed native transition corrects signed old requirement without accepting arbitrary DLLs',()=>{assert.equal(effectiveNativeRequirement(old).sha256,'18b530ef76a5b84d6da090b5e9c87f7e93b436e02104b48aa1602a8b26d6e30a');for(const unknown of [{...old,sha256:'0'.repeat(64)},{...old,size:1},{...old,path:'Data/SKSE/Plugins/other.dll'}])assert.equal(effectiveNativeRequirement(unknown),unknown);});
