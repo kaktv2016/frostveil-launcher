@@ -8,7 +8,7 @@ import {graphicsSourcePin} from './graphics-source-pin';
 import {durableWrite} from './installer/metadata';
 export function decodeGraphicsSourcePlan(bytes:Buffer,pin:{size:number;sha256:string}):GraphicsSourcePlan{
  if(bytes.length!==pin.size||createHash('sha256').update(bytes).digest('hex')!==pin.sha256)throw Error('Graphics source recipe hash identity mismatch');
- const result=JSON.parse(bytes.toString('utf8'));if(!['1.0.7','1.0.8','1.0.9','1.0.10','1.0.11','1.0.12','1.0.13','1.0.14','1.0.15','1.0.16','1.0.17','1.0.18'].includes(result.version)||!Array.isArray(result.files))throw Error('Unexpected graphics source recipe');return result;
+ const result=JSON.parse(bytes.toString('utf8'));if(!['1.0.7','1.0.8','1.0.9','1.0.10','1.0.11','1.0.12','1.0.13','1.0.14','1.0.15','1.0.16','1.0.17','1.0.18','1.0.19'].includes(result.version)||!Array.isArray(result.files))throw Error('Unexpected graphics source recipe');return result;
 }
 export async function loadGraphicsSourcePlan(storage:string):Promise<GraphicsSourcePlan>{
  const root=path.join(storage,'graphics-source-recipes');await safeDirectory(root);const name=graphicsSourcePin.sha256+'.json';
