@@ -20,12 +20,7 @@ import {
  type LauncherUpdateSource
 } from '../src/main/update-integrity';
 
-async function removeLockedTree(target:string):Promise<void>{
- for(let attempt=0;;attempt++){
-  try{await fs.rm(target,{recursive:true,force:true});return;}
-  catch(error){const code=(error as NodeJS.ErrnoException).code;if(!['EBUSY','EPERM'].includes(code??'')||attempt>=31)throw error;await new Promise(r=>setTimeout(r,250));}
- }
-}
+import {removeLockedTree} from './helpers/locked-tree';
 
 function runProcess(command:string,args:string[],cwd:string):Promise<{code:number|null;stdout:string;stderr:string}>{
  return new Promise((resolve,reject)=>{
