@@ -53,7 +53,7 @@ export class NpcDevelopmentProfile {
    if(j.state!=='prepared'||plan.expiresAt<=Date.now())throw Error('Local plan expired or recovery required');await this.verifyWrites(plan,'before');
    await this.store.write(journalPath,{state:'applying',plan});
    try{for(const w of plan.writes){await checkManagedRoots(this.grant);if(await this.running())throw Error('Game started during activation');await durableWrite(await this.target(w.slot),Buffer.from(w.after,'base64'));}await this.verifyWrites(plan,'after');await this.store.write(journalPath,{state:'active',plan});}
-   catch(error){await this.store.write(journalPath,{state:'recovery-required',plan});throw error;}
+   catch(error){await this.store.write(journalPath,{state:'recovery-required',plan});if(!await this.running()){try{await this.restore(plan);}catch(recovery){await this.store.write(journalPath,{state:'recovery-required',plan});throw new Error('Local activation failed; exact configuration recovery remains required',{cause:recovery});}}throw error;}
   }finally{await unlock();}
  }
  async status(){const j=await this.current();if(!j||j.state!=='active')return {active:false,state:j?.state??'absent',trust:'LOCAL OWNED REFERENCE ONLY'};await this.checkFiles();await this.verifyWrites(j.plan,'after');const input=await readOrderInputs(this.grant.installation,this.grant.configDirectory!),activation=await planActivation(this.grant.installation,[],input);if(activation.status!=='ready'||activation.configWrites.length||!activation.active.includes('FrostveilNPCTest.esp'))throw Error('Development plugin is not verifiably active');return{active:true,state:j.state,profileHash:planDigest(this.policy),fullOrder:activation.order,trust:'LOCAL OWNED REFERENCE ONLY'};}
@@ -61,11 +61,14 @@ export class NpcDevelopmentProfile {
   const j=await this.current();if(!j||j.state==='reverted')return;if(await confirm(j.plan.digest)!==true)throw Error('Local revert declined');if(await this.running())throw Error('Game process active');
   const unlock=await this.store.lease();try{
    await checkManagedRoots(this.grant);const current=await this.current();if(!current||planDigest(current.plan)!==planDigest(j.plan))throw Error('Concurrent profile change');
-   // Preflight every target before restoring either; preserve later owner edits.
-   for(const w of j.plan.writes){const b=await fs.readFile(await this.target(w.slot));if(!b.equals(Buffer.from(w.after,'base64'))&&!b.equals(Buffer.from(w.before,'base64')))throw Error('Configuration changed; revert conflict retained');}
-   await this.store.write(journalPath,{state:'reverting',plan:j.plan});
-   for(const w of [...j.plan.writes].reverse()){await checkManagedRoots(this.grant);if(await this.running())throw Error('Game started during revert');await durableWrite(await this.target(w.slot),Buffer.from(w.before,'base64'));}
-   await this.verifyWrites(j.plan,'before');await this.store.write(journalPath,{state:'reverted',plan:j.plan});
+   await this.restore(j.plan);
   }finally{await unlock();}
+ }
+ private async restore(plan:LocalPlan){
+  // Preflight every target before restoring either; preserve later owner edits.
+  for(const w of plan.writes){const b=await fs.readFile(await this.target(w.slot));if(!b.equals(Buffer.from(w.after,'base64'))&&!b.equals(Buffer.from(w.before,'base64')))throw Error('Configuration changed; revert conflict retained');}
+  await this.store.write(journalPath,{state:'reverting',plan});
+  for(const w of [...plan.writes].reverse()){await checkManagedRoots(this.grant);if(await this.running())throw Error('Game started during revert');const file=await this.target(w.slot),current=await fs.readFile(file),before=Buffer.from(w.before,'base64');if(current.equals(before))continue;if(!current.equals(Buffer.from(w.after,'base64')))throw Error('Concurrent profile edit; revert conflict retained');await durableWrite(file,before);}
+  await this.verifyWrites(plan,'before');await this.store.write(journalPath,{state:'reverted',plan});
  }
 }

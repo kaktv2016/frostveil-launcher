@@ -31,3 +31,8 @@ test('external edits after preparation and unauthenticated journal changes canno
  const {g,profile}=await fixture();const plan=await profile.prepare();await fs.appendFile(path.join(g.configDirectory!,'plugins.txt'),'# owner changed');await assert.rejects(profile.activate(plan,async()=>true),/changed|conflict/);
  const journal=path.join(g.metadata,'npc-development/journal.json');const raw=JSON.parse(await fs.readFile(journal,'utf8'));raw.body=raw.body.replace('prepared','active');await fs.writeFile(journal,JSON.stringify(raw));await assert.rejects(profile.status(),/authentication/);
 });
+test('closed-game failure after the first config write automatically restores it and skips untouched targets',async()=>{
+ let inject=false,calls=0;const {g,profile}=await fixture(async()=>{if(inject&&++calls===3){inject=false;throw Error('injected closed-game failure');}return false;});
+ const file=path.join(g.configDirectory!,'plugins.txt'),before=await fs.readFile(file),plan=await profile.prepare();inject=true;
+ await assert.rejects(profile.activate(plan,async()=>true),/injected/);assert.deepEqual(await fs.readFile(file),before);assert.equal((await profile.status()).state,'reverted');
+});
