@@ -36,3 +36,15 @@ test('closed-game failure after the first config write automatically restores it
  const file=path.join(g.configDirectory!,'plugins.txt'),before=await fs.readFile(file),plan=await profile.prepare();inject=true;
  await assert.rejects(profile.activate(plan,async()=>true),/injected/);assert.deepEqual(await fs.readFile(file),before);assert.equal((await profile.status()).state,'reverted');
 });
+test('replaying an active development profile does not rewrite configuration or ask for activation',async()=>{
+ const {g,profile}=await fixture();await profile.activate(await profile.prepare(),async()=>true);const file=path.join(g.configDirectory!,'plugins.txt'),before=await fs.stat(file);await profile.ensureActive(async()=>{throw Error('Already active must not prompt');});assert.equal((await fs.stat(file)).mtimeMs,before.mtimeMs);
+});
+test('replay recovers Launcher-restored baseline settings with explicit restore and activation confirmations',async()=>{
+ const {g,profile}=await fixture(),file=path.join(g.installation,'Data/Platform/Plugins/skymp5-client-settings.txt'),original=await fs.readFile(file);await profile.activate(await profile.prepare(),async()=>true);await fs.writeFile(file,original);const phases:string[]=[];
+ await profile.ensureActive(async(_digest,phase)=>{phases.push(phase);return true;});assert.deepEqual(phases,['restore','activate']);assert.equal((await profile.status()).active,true);assert.equal(JSON.parse(await fs.readFile(file,'utf8'))['server-port'],17777);
+ await profile.revert(async()=>true);assert.deepEqual(await fs.readFile(file),original);
+});
+test('replay preserves unrelated owner settings and respects declined recovery',async()=>{
+ const {g,profile}=await fixture(),file=path.join(g.installation,'Data/Platform/Plugins/skymp5-client-settings.txt'),original=await fs.readFile(file);await profile.activate(await profile.prepare(),async()=>true);await fs.writeFile(file,original);await assert.rejects(profile.ensureActive(async()=>false),/declined/);assert.deepEqual(await fs.readFile(file),original);
+ const edited=Buffer.from(JSON.stringify({'server-port':18888,note:'owner edit'}));await fs.writeFile(file,edited);await assert.rejects(profile.ensureActive(async()=>true),/conflict|changed/i);assert.deepEqual(await fs.readFile(file),edited);
+});

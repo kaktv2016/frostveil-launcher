@@ -57,6 +57,16 @@ export class NpcDevelopmentProfile {
   }finally{await unlock();}
  }
  async status(){const j=await this.current();if(!j||j.state!=='active')return {active:false,state:j?.state??'absent',trust:'LOCAL OWNED REFERENCE ONLY'};await this.checkFiles();await this.verifyWrites(j.plan,'after');const input=await readOrderInputs(this.grant.installation,this.grant.configDirectory!),activation=await planActivation(this.grant.installation,[],input);if(activation.status!=='ready'||activation.configWrites.length||!activation.active.includes('FrostveilNPCTest.esp'))throw Error('Development plugin is not verifiably active');return{active:true,state:j.state,profileHash:planDigest(this.policy),fullOrder:activation.order,trust:'LOCAL OWNED REFERENCE ONLY'};}
+ async ensureActive(confirm:(digest:string,phase:'restore'|'activate')=>Promise<boolean>){
+  let active=false;
+  try{active=(await this.status()).active;}catch(error){
+   if(!(error instanceof Error)||error.message!=='Profile configuration changed; conflict retained')throw error;
+   // Reuse exact before/after recovery. Arbitrary later edits remain conflicts.
+   await this.revert(digest=>confirm(digest,'restore'));
+  }
+  if(!active){const plan=await this.prepare();await this.activate(plan,digest=>confirm(digest,'activate'));}
+  const result=await this.status();if(!result.active)throw Error('Development profile activation not verified');return result;
+ }
  async revert(confirm:(digest:string)=>Promise<boolean>){
   const j=await this.current();if(!j||j.state==='reverted')return;if(await confirm(j.plan.digest)!==true)throw Error('Local revert declined');if(await this.running())throw Error('Game process active');
   const unlock=await this.store.lease();try{

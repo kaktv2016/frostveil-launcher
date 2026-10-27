@@ -1,6 +1,17 @@
 // Local isolated server readiness only. Never activates a client or starts Skyrim.
 import fs from'node:fs/promises';import path from'node:path';import{execFile}from'node:child_process';import{promisify}from'node:util';
 const exec=promisify(execFile);
+export async function readRunningServer({root,audit,profileHash,catalogHash}){
+ const read=async(file,max)=>{const st=await fs.lstat(file);if(!st.isFile()||st.isSymbolicLink()||st.nlink!==1||st.size>max)throw Error('Unsafe startup receipt');return JSON.parse(await fs.readFile(file,'utf8'));};
+ const health=await read(path.join(root,'g241d-status.json'),8192);
+ if(health.status!=='SAFE_WAITING'||health.profileHash!==profileHash||health.catalogHash!==catalogHash||!health.startupId||!Number.isSafeInteger(health.pid)||health.pid<=0||health.customAutoSpawns!==0)throw Error('Running development server identity does not match the sealed handoff');
+ const names=(await fs.readdir(audit)).filter(n=>/^readiness-\d+-\d+\.json$/.test(n)).sort((a,b)=>Number(b.split('-')[1])-Number(a.split('-')[1])).slice(0,200);
+ for(const name of names){const receipt=await read(path.join(audit,name),256*1024),expected=receipt.expected;if(receipt.last?.ok!==true||receipt.last?.stage!=='READY'||expected?.startupId!==health.startupId||expected.profileHash!==profileHash||expected.catalogHash!==catalogHash)continue;
+  if(!Number.isSafeInteger(expected.childPid)||expected.childPid<=0||Number(name.split('-')[2].slice(0,-5))!==expected.childPid)throw Error('Invalid verified startup receipt');
+  return{...expected,launchedAt:expected.launchedAt??receipt.startedAt};
+ }
+ throw Error('No verified startup receipt for this development server; stop only its console and use activate-and-play');
+}
 export async function startIsolatedPowerShell({root,startScript,startupId,logs}){
  const shell=path.join(process.env.SystemRoot??'C:/Windows','System32/WindowsPowerShell/v1.0/powershell.exe');
  const report={stage:'POWERSHELL_CREATE',at:new Date().toISOString(),root,startScript};await fs.mkdir(path.dirname(logs),{recursive:true});await fs.writeFile(logs,JSON.stringify(report,null,2));

@@ -1,6 +1,6 @@
 import{test}from'node:test';import assert from'node:assert/strict';
 import fs from'node:fs/promises';import path from'node:path';import os from'node:os';
-import{evaluateStartup,waitForStartup,startIsolatedPowerShell}from'../scripts/npc-startup.mjs';
+import{evaluateStartup,waitForStartup,startIsolatedPowerShell,readRunningServer}from'../scripts/npc-startup.mjs';
 const expected={childPid:10,startupId:'this-boot',profileHash:'p',catalogHash:'c'};
 const health={status:'SAFE_WAITING',startupId:'this-boot',pid:30,profileHash:'p',catalogHash:'c',customAutoSpawns:0};
 const snapshot={child:{pid:10,name:'powershell.exe',startMatches:true},process:{pid:30,parent:20,name:'node.exe',engineMatches:true},parent:{pid:20,parent:10,name:'node.exe',serveMatches:true},udp:[{pid:30,address:'127.0.0.1'}],tcp:[{pid:30,address:'127.0.0.1'}]};
@@ -36,4 +36,14 @@ test('real Windows owner launch executes the script in a separate PowerShell con
 });
 test('a PowerShell that exits before executing the script fails at process creation without waiting sixty seconds',async()=>{
  let saved;await assert.rejects(waitForStartup({expected,root:'root',startScript:'start',logs:'diagnostics',poll:async()=>{throw Error('ECONNREFUSED');},checkChild:async()=>null,save:async r=>{saved=r;}}),/PROCESS_CREATION/);assert.equal(saved.attempts,1);assert.equal(saved.last.observed.childPid,10);
+});
+test('rejoin selects only a successful receipt matching the private server boot identity',async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'g241d-rejoin-'));
+ try{const audit=path.join(root,'audit');await fs.mkdir(audit);await fs.writeFile(path.join(root,'g241d-status.json'),JSON.stringify(health));
+  await fs.writeFile(path.join(audit,'readiness-100-10.json'),JSON.stringify({expected,last:{ok:true,stage:'READY'},startedAt:new Date().toISOString()}));
+  await fs.writeFile(path.join(audit,'readiness-200-99.json'),JSON.stringify({expected:{...expected,childPid:99,startupId:'stale'},last:{ok:true,stage:'READY'}}));
+  const r=await readRunningServer({root,audit,profileHash:'p',catalogHash:'c'});assert.equal(r.childPid,10);assert.equal(r.startupId,health.startupId);
+  await fs.writeFile(path.join(audit,'readiness-100-10.json'),JSON.stringify({expected,last:{ok:false,stage:'HEALTH_HTTP'}}));await assert.rejects(readRunningServer({root,audit,profileHash:'p',catalogHash:'c'}),/verified startup receipt/);
+  await fs.writeFile(path.join(root,'g241d-status.json'),JSON.stringify({...health,profileHash:'foreign'}));await assert.rejects(readRunningServer({root,audit,profileHash:'p',catalogHash:'c'}),/identity/);
+ }finally{assert.equal(path.dirname(root),os.tmpdir());assert(path.basename(root).startsWith('g241d-rejoin-'));await fs.rm(root,{recursive:true});}
 });
