@@ -1,6 +1,6 @@
-import{waitForStartup}from'./npc-startup.mjs';
+import{waitForStartup,startIsolatedPowerShell}from'./npc-startup.mjs';
 // Dedicated local owner CLI, not a public updater/unsigned remote package route.
-import fs from 'node:fs/promises';import path from 'node:path';import os from 'node:os';import{createHash,randomUUID}from'node:crypto';import{createInterface}from'node:readline/promises';import{execFileSync,spawn}from'node:child_process';import{build}from'esbuild';
+import fs from 'node:fs/promises';import path from 'node:path';import os from 'node:os';import{createHash,randomUUID}from'node:crypto';import{createInterface}from'node:readline/promises';import{execFileSync}from'node:child_process';import{build}from'esbuild';
 const launcher=path.resolve(import.meta.dirname,'..'),repo=path.resolve(launcher,'../skymp'),home=path.join(launcher,'.local/npc-development');
 const command=process.argv[2]??'prepare';if(process.argv.length>3||!['prepare','status','revert','activate','activate-and-play','grant'].includes(command))throw Error('Usage: node scripts/npc-development.mjs prepare|status|activate|activate-and-play|grant|revert');
 for(const dir of [launcher,path.join(launcher,'.local'),home]){try{if((await fs.lstat(dir)).isSymbolicLink())throw Error('Redirected local development directory');}catch(e){if(e.code!=='ENOENT')throw e;}}
@@ -46,8 +46,8 @@ else{
   const powershell=path.join(process.env.SystemRoot??'C:/Windows','System32/WindowsPowerShell/v1.0/powershell.exe');
   const occupied=execFileSync(powershell,['-NoProfile','-NonInteractive','-Command',"[bool]((Get-NetUDPEndpoint -LocalPort 17777 -ErrorAction SilentlyContinue) -or (Get-NetTCPConnection -LocalPort 17778 -State Listen -ErrorAction SilentlyContinue)) | ConvertTo-Json -Compress"],{encoding:'utf8',windowsHide:true}).trim();if(occupied!=='false')throw Error('Development ports occupied; refusing to restart or replace any process');
   const startupId=randomUUID();
-  child=spawn(powershell,['-NoProfile','-NoExit','-ExecutionPolicy','Bypass','-File',handoff.startScript],{cwd:root,windowsHide:false,detached:true,stdio:'ignore',env:{...process.env,FROSTVEIL_G241D_STARTUP_ID:startupId}});await new Promise((resolve,reject)=>{child.once('spawn',resolve);child.once('error',reject);});child.unref();
-  await waitForStartup({expected:{childPid:child.pid,startupId,profileHash:core.planDigest(policy),catalogHash:policy.catalogHash},root,startScript:handoff.startScript,serveScript:handoff.serveScript,logs:path.join(repo,'build/rp-audit/g241d','readiness-'+Date.now()+'-'+child.pid+'.json')});
+  child=await startIsolatedPowerShell({root,startScript:handoff.startScript,startupId,logs:path.join(repo,'build/rp-audit/g241d','powershell-launch-'+Date.now()+'.json')});
+  await waitForStartup({expected:{childPid:child.pid,startupId,launchedAt:child.launchedAt,profileHash:core.planDigest(policy),catalogHash:policy.catalogHash},root,startScript:handoff.startScript,serveScript:handoff.serveScript,logs:path.join(repo,'build/rp-audit/g241d','readiness-'+Date.now()+'-'+child.pid+'.json')});
   const player=new core.GameLauncher(core.gameRunning,core.startSkse);await player.play(async()=>{if(!(await profile.status()).active)throw Error('Development profile no longer active before launch');for(const f of policy.runtime){const actual=await core.hashFile(await core.safeFile(game,f.path),64*1024*1024);if(actual.sha256!==f.sha256)throw Error('Runtime changed before launch');}return{directory:game,ready:true,runtime:'1.6.1170.0',skseLoader:'2.2.6',skseRuntime:'2.2.6',nativeLauncherAvailable:true,files:[],errors:[],scannedAt:new Date().toISOString()};});console.log('Started verified isolated server and SKSE. Obtain local dev admin then /npc identity; fixtures remain blocked until proof and mapper arm.');
   }catch(error){
    const powershell=path.join(process.env.SystemRoot??'C:/Windows','System32/WindowsPowerShell/v1.0/powershell.exe');

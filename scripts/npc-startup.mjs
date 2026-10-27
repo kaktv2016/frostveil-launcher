@@ -1,6 +1,21 @@
 // Local isolated server readiness only. Never activates a client or starts Skyrim.
 import fs from'node:fs/promises';import path from'node:path';import{execFile}from'node:child_process';import{promisify}from'node:util';
 const exec=promisify(execFile);
+export async function startIsolatedPowerShell({root,startScript,startupId,logs}){
+ const shell=path.join(process.env.SystemRoot??'C:/Windows','System32/WindowsPowerShell/v1.0/powershell.exe');
+ const report={stage:'POWERSHELL_CREATE',at:new Date().toISOString(),root,startScript};await fs.mkdir(path.dirname(logs),{recursive:true});await fs.writeFile(logs,JSON.stringify(report,null,2));
+ // Node's detached CREATE_NEW_CONSOLE path can exit PowerShell 5.1 before -File
+ // executes. Use the same Windows Start-Process mechanism as local deployments.
+ const command=`$ErrorActionPreference='Stop'; $p=Start-Process -FilePath $env:FV_NPC_SHELL -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"'+$env:FV_NPC_START_SCRIPT+'"')) -WorkingDirectory $env:FV_NPC_ROOT -WindowStyle Normal -PassThru; @{pid=[int]$p.Id} | ConvertTo-Json -Compress`;
+ try{const{stdout,stderr}=await exec(shell,['-NoProfile','-NonInteractive','-Command',command],{env:{...process.env,FV_NPC_SHELL:shell,FV_NPC_START_SCRIPT:startScript,FV_NPC_ROOT:root,FROSTVEIL_G241D_STARTUP_ID:startupId},windowsHide:true,timeout:15000,maxBuffer:65536});
+  await fs.writeFile(logs+'.stdout.log',stdout);await fs.writeFile(logs+'.stderr.log',stderr);const child=JSON.parse(stdout.trim());if(!Number.isSafeInteger(child.pid)||child.pid<=0)throw Error('Start-Process did not return a valid PID');
+  await fs.writeFile(logs,JSON.stringify({...report,stage:'POWERSHELL_CREATED',pid:child.pid},null,2));return {...child,launchedAt:report.at};
+ }catch(error){await fs.writeFile(logs+'.stdout.log',error.stdout??'');await fs.writeFile(logs+'.stderr.log',error.stderr??error.stack??String(error));await fs.writeFile(logs,JSON.stringify({...report,stage:'PROCESS_CREATION_FAILED',code:error.code??error.name},null,2));throw Error(`Isolated startup failed at PROCESS_CREATION. Diagnostics: ${logs}`,{cause:error});}
+}
+async function inspectChild({expected,startScript,signal}){
+ const shell=path.join(process.env.SystemRoot??'C:/Windows','System32/WindowsPowerShell/v1.0/powershell.exe');
+ const{stdout}=await exec(shell,['-NoProfile','-NonInteractive','-Command',"$ErrorActionPreference='Stop';$p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$env:FV_NPC_CHILD_PID);if($p){@{pid=[int]$p.ProcessId;name=$p.Name;startMatches=$p.CommandLine.Contains($env:FV_NPC_START_SCRIPT)}|ConvertTo-Json -Compress}else{'null'}"],{env:{...process.env,FV_NPC_CHILD_PID:String(expected.childPid),FV_NPC_START_SCRIPT:startScript},windowsHide:true,timeout:5000,signal,maxBuffer:65536});return JSON.parse(stdout.trim());
+}
 export function evaluateStartup({health,httpStatus,snapshot,expected}){
  const fail=(stage,wanted,observed)=>({ok:false,stage,expected:wanted,observed});
  if(httpStatus!==200||!health||health.status!=='SAFE_WAITING'||!expected.startupId||health.startupId!==expected.startupId||health.catalogHash!==expected.catalogHash||health.profileHash!==expected.profileHash||!Number.isSafeInteger(health.pid)||health.pid<=0||health.customAutoSpawns!==0)return fail('HEALTH_CONTRACT','HTTP 200; SAFE_WAITING; matching startup/profile/catalog; live PID; zero auto-spawns',{httpStatus,status:health?.status,pid:health?.pid,catalogHash:health?.catalogHash,profileHash:health?.profileHash,customAutoSpawns:health?.customAutoSpawns,startupId:health?.startupId});
@@ -21,7 +36,7 @@ async function serverFailure(logs,since){
   for(const name of names){const folder=path.join(directory,name),file=path.join(folder,'stages.jsonl');if((await fs.stat(file)).size>65536)continue;const lines=(await fs.readFile(file,'utf8')).trim().split('\n'),last=JSON.parse(lines.at(-1));if(!['FAILED','EXIT_FAILED'].includes(last.state))continue;let exit;try{exit=JSON.parse(await fs.readFile(path.join(folder,'exit.json'),'utf8'));}catch{}return{ok:false,stage:exit?.lastStage?.stage??last.stage,expected:'sealed isolated runtime remains running and becomes ready',observed:{state:last.state,pid:last.pid,exitCode:exit?.code,diagnosticDirectory:folder}};}
  }catch{}return null;
 }
-export async function waitForStartup({expected,root,startScript,serveScript,logs,timeoutMs=60000,now=()=>performance.now(),sleep=n=>new Promise(r=>setTimeout(r,n)),poll,save,failure}){
+export async function waitForStartup({expected,root,startScript,serveScript,logs,timeoutMs=60000,now=()=>performance.now(),sleep=n=>new Promise(r=>setTimeout(r,n)),poll,save,failure,checkChild}){
  const started=now(),report={startedAt:new Date().toISOString(),expected:{...expected,udp:17777,tcp:17778},logs,attempts:0,history:[]};
  const persist=save??(async value=>{await fs.mkdir(path.dirname(logs),{recursive:true});await fs.writeFile(logs,JSON.stringify(value,null,2));});
  while(now()-started<timeoutMs){
@@ -37,7 +52,8 @@ export async function waitForStartup({expected,root,startScript,serveScript,logs
    }
    report.last=evaluateStartup({...observed,expected});
   }catch(error){report.last={ok:false,stage:'HEALTH_HTTP',expected:'readable bounded JSON health response and process inventory',observed:{code:error.code??error.cause?.code??error.name}};}
-  const fatal=report.last.ok?null:await(failure?failure():serverFailure(logs,Date.parse(report.startedAt)));if(fatal)report.last=fatal;
+  let fatal=report.last.ok?null:await(failure?failure():serverFailure(logs,Date.parse(expected.launchedAt??report.startedAt)));if(fatal)report.last=fatal;
+  if(!fatal&&!report.last.ok&&(!poll||checkChild)){try{const child=await(checkChild?checkChild():inspectChild({expected,startScript,signal:AbortSignal.timeout(Math.max(1,Math.floor(timeoutMs-(now()-started))))}));if(!child||child.pid!==expected.childPid||child.name?.toLowerCase()!=='powershell.exe'||!child.startMatches){fatal=report.last={ok:false,stage:'PROCESS_CREATION',expected:'owned PowerShell remains alive and executes the sealed startup script',observed:{childPid:expected.childPid,process:child??null}};}}catch(error){report.last={ok:false,stage:'PROCESS_INVENTORY',expected:'readable startup process inventory',observed:{code:error.code??error.name}};}}
   report.elapsedMs=Math.round(now()-started);report.history.push({atMs:report.elapsedMs,...report.last});await persist(report);
   if(report.last.ok&&now()-started<=timeoutMs)return report;
   if(fatal)break;

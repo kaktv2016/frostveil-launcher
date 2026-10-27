@@ -1,6 +1,6 @@
 import{test}from'node:test';import assert from'node:assert/strict';
 import fs from'node:fs/promises';import path from'node:path';import os from'node:os';
-import{evaluateStartup,waitForStartup}from'../scripts/npc-startup.mjs';
+import{evaluateStartup,waitForStartup,startIsolatedPowerShell}from'../scripts/npc-startup.mjs';
 const expected={childPid:10,startupId:'this-boot',profileHash:'p',catalogHash:'c'};
 const health={status:'SAFE_WAITING',startupId:'this-boot',pid:30,profileHash:'p',catalogHash:'c',customAutoSpawns:0};
 const snapshot={child:{pid:10,name:'powershell.exe',startMatches:true},process:{pid:30,parent:20,name:'node.exe',engineMatches:true},parent:{pid:20,parent:10,name:'node.exe',serveMatches:true},udp:[{pid:30,address:'127.0.0.1'}],tcp:[{pid:30,address:'127.0.0.1'}]};
@@ -25,4 +25,15 @@ test('real retained supervisor files identify the last native startup stage',asy
  const root=await fs.mkdtemp(path.join(os.tmpdir(),'g241d-readiness-'));let saved;
  try{await assert.rejects(waitForStartup({expected,root:'root',logs:path.join(root,'readiness.json'),poll:async()=>{const folder=path.join(root,'startup-'+Date.now()+'-20');await fs.mkdir(folder);await fs.writeFile(path.join(folder,'stages.jsonl'),JSON.stringify({stage:'ENGINE_PROCESS',state:'EXIT_FAILED',pid:20})+'\n');await fs.writeFile(path.join(folder,'exit.json'),JSON.stringify({code:1,lastStage:{stage:'RESOURCE_CATALOG',state:'FAILED'}}));throw Error('refused');},save:async r=>{saved=r;}}),/RESOURCE_CATALOG/);assert.equal(saved.attempts,1);assert.equal(saved.last.observed.exitCode,1);
  }finally{assert.equal(path.dirname(root),os.tmpdir());assert(path.basename(root).startsWith('g241d-readiness-'));await fs.rm(root,{recursive:true});}
+});
+test('real Windows owner launch executes the script in a separate PowerShell console without detached Node spawn',async()=>{
+ const root=await fs.mkdtemp(path.join(os.tmpdir(),'g241d-outer-launch-'));
+ try{const marker=path.join(root,'executed.txt'),script=path.join(root,'script with spaces.ps1');await fs.writeFile(script,`[IO.File]::WriteAllText('${marker.replaceAll("'","''")}',$env:FROSTVEIL_G241D_STARTUP_ID)\nexit 7\n`);
+  const child=await startIsolatedPowerShell({root,startScript:script,startupId:'sentinel-test',logs:path.join(root,'launch.json')});assert(Number.isSafeInteger(child.pid)&&child.pid>0);
+  const deadline=Date.now()+6000;while(Date.now()<deadline){try{if(await fs.readFile(marker,'utf8')==='sentinel-test')break;}catch{}await new Promise(r=>setTimeout(r,50));}
+  assert.equal(await fs.readFile(marker,'utf8'),'sentinel-test');const log=JSON.parse(await fs.readFile(path.join(root,'launch.json'),'utf8'));assert.equal(log.stage,'POWERSHELL_CREATED');assert.equal(log.pid,child.pid);
+ }finally{assert.equal(path.dirname(root),os.tmpdir());assert(path.basename(root).startsWith('g241d-outer-launch-'));await fs.rm(root,{recursive:true,maxRetries:5,retryDelay:100});}
+});
+test('a PowerShell that exits before executing the script fails at process creation without waiting sixty seconds',async()=>{
+ let saved;await assert.rejects(waitForStartup({expected,root:'root',startScript:'start',logs:'diagnostics',poll:async()=>{throw Error('ECONNREFUSED');},checkChild:async()=>null,save:async r=>{saved=r;}}),/PROCESS_CREATION/);assert.equal(saved.attempts,1);assert.equal(saved.last.observed.childPid,10);
 });
