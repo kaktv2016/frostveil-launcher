@@ -64,7 +64,12 @@ export async function waitForStartup({expected,root,startScript,serveScript,logs
    report.last=evaluateStartup({...observed,expected});
   }catch(error){report.last={ok:false,stage:'HEALTH_HTTP',expected:'readable bounded JSON health response and process inventory',observed:{code:error.code??error.cause?.code??error.name}};}
   let fatal=report.last.ok?null:await(failure?failure():serverFailure(logs,Date.parse(expected.launchedAt??report.startedAt)));if(fatal)report.last=fatal;
-  if(!fatal&&!report.last.ok&&(!poll||checkChild)){try{const child=await(checkChild?checkChild():inspectChild({expected,startScript,signal:AbortSignal.timeout(Math.max(1,Math.floor(timeoutMs-(now()-started))))}));if(!child||child.pid!==expected.childPid||child.name?.toLowerCase()!=='powershell.exe'||!child.startMatches){fatal=report.last={ok:false,stage:'PROCESS_CREATION',expected:'owned PowerShell remains alive and executes the sealed startup script',observed:{childPid:expected.childPid,process:child??null}};}}catch(error){report.last={ok:false,stage:'PROCESS_INVENTORY',expected:'readable startup process inventory',observed:{code:error.code??error.name}};}}
+  if(!fatal&&!report.last.ok&&(!poll||checkChild)){try{const child=await(checkChild?checkChild():inspectChild({expected,startScript,signal:AbortSignal.timeout(Math.max(1,Math.floor(timeoutMs-(now()-started))))}));if(!child||child.pid!==expected.childPid||child.name?.toLowerCase()!=='powershell.exe'||!child.startMatches){
+   // The engine/supervisor can write its terminal record while CIM is reading
+   // the outer process. Re-read it before labelling an actual native exit as
+   // failure to create PowerShell. All successful readiness gates are unchanged.
+   fatal=report.last=await(failure?failure():serverFailure(logs,Date.parse(expected.launchedAt??report.startedAt)))??{ok:false,stage:'PROCESS_CREATION',expected:'owned PowerShell remains alive and executes the sealed startup script',observed:{childPid:expected.childPid,process:child??null}};
+  }}catch(error){report.last={ok:false,stage:'PROCESS_INVENTORY',expected:'readable startup process inventory',observed:{code:error.code??error.name}};}}
   report.elapsedMs=Math.round(now()-started);report.history.push({atMs:report.elapsedMs,...report.last});await persist(report);
   if(report.last.ok&&now()-started<=timeoutMs)return report;
   if(fatal)break;
