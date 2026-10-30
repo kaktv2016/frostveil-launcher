@@ -5,7 +5,7 @@ import {checkManagedRoots}from'../installer/managed-target';
 import type {SandboxGrant}from'../installer/sandbox';
 import {planDigest,freezePlan}from'./authorization';
 import {planActivation}from'./activation';import {readOrderInputs,readPluginHeader}from'../modpack/plugins';
-export interface NpcReferencePolicy {version:1;catalogHash:string;assets:{path:string;size:number;sha256:string}[];runtime:{path:string;size:number;sha256:string}[];}
+export interface NpcReferencePolicy {version:1|2;catalogHash:string;assets:{path:string;size:number;sha256:string}[];runtime:{path:string;size:number;sha256:string}[];plugins?:string[];}
 interface Write {slot:'plugins'|'settings';before:string;after:string;}
 interface LocalPlan {source:'LOCAL OWNED REFERENCE ONLY';schemaVersion:1;installationId:string;policyHash:string;expiresAt:number;writes:Write[];digest:string;}
 interface Journal {state:'prepared'|'applying'|'active'|'reverting'|'reverted'|'recovery-required';plan:LocalPlan;}
@@ -19,23 +19,31 @@ export class NpcDevelopmentProfile {
  static async open(grant:SandboxGrant,raw:NpcReferencePolicy,running:()=>Promise<boolean>){
   await checkManagedRoots(grant);const policy=freezePlan(raw) as NpcReferencePolicy;
   const expected=['Data/FrostveilNPCTest.esp',...['00005901','00005906'].flatMap(n=>['Data/meshes/actors/character/FaceGenData/FaceGeom/FrostveilNPCTest.esp/'+n+'.nif','Data/textures/actors/character/FaceGenData/FaceTint/FrostveilNPCTest.esp/'+n+'.dds'])].sort();
-  if(policy.version!==1||!/^[a-f0-9]{64}$/.test(policy.catalogHash)||policy.assets.length!==5||JSON.stringify(policy.assets.map(a=>a.path).sort())!==JSON.stringify(expected)||grant.targetClass==='real-skyrim'&&policy.runtime.length!==9)throw Error('Unapproved local reference policy');
+  if(![1,2].includes(policy.version)||!/^[a-f0-9]{64}$/.test(policy.catalogHash)||grant.targetClass==='real-skyrim'&&policy.runtime.length!==9)throw Error('Unapproved local reference policy');
+  if(policy.version===1&&(policy.assets.length!==5||JSON.stringify(policy.assets.map(a=>a.path).sort())!==JSON.stringify(expected)))throw Error('Unapproved local reference policy');
+  if(policy.version===2){
+   if(!Array.isArray(policy.plugins)||!policy.plugins.length||policy.plugins.length>8||policy.assets.length>128||!expected.every(p=>policy.assets.some(a=>a.path===p))||new Set(policy.plugins.map(p=>p.toLowerCase())).size!==policy.plugins.length||new Set(policy.assets.map(a=>a.path.toLowerCase())).size!==policy.assets.length)throw Error('Invalid reviewed onboarding profile');
+   for(const name of policy.plugins)if(!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,90}\.esp$/.test(name)||name.includes('..')||!policy.assets.some(a=>a.path==='Data/'+name))throw Error('Unapproved onboarding plugin');
+   for(const file of policy.assets)if(file.path.split('/').some(p=>!p||p==='.'||p==='..')||!/^Data\/(?:[A-Za-z0-9 _.-]+\.esp|(?:meshes|textures)\/[A-Za-z0-9_ .\/-]+\.(?:nif|dds))$/i.test(file.path)||/^Data\/[^/]+\.esp$/i.test(file.path)&&!policy.plugins.includes(file.path.slice(5)))throw Error('Unsupported onboarding asset path');
+   if(policy.assets.reduce((n,f)=>n+f.size,0)>128*1024*1024)throw Error('Onboarding asset capacity');
+  }
   for(const f of [...policy.assets,...policy.runtime])if(!/^[a-f0-9]{64}$/.test(f.sha256)||!Number.isSafeInteger(f.size)||f.size<1)throw Error('Invalid local asset pin');
   return new NpcDevelopmentProfile(grant,policy,await MetadataStore.create(grant),running);
  }
  private async target(slot:Write['slot']){return slot==='plugins'?await safeFile(this.grant.configDirectory!,'plugins.txt'):await safeFile(this.grant.installation,'Data/Platform/Plugins/skymp5-client-settings.txt');}
- private async checkFiles(){await checkManagedRoots(this.grant);for(const f of [...this.policy.assets,...this.policy.runtime]){const got=await hashFile(await safeFile(this.grant.installation,f.path),64*1024*1024);if(got.sha256!==f.sha256||got.size!==f.size)throw Error('Local asset/runtime changed: '+f.path);}const h=await readPluginHeader(await safeFile(this.grant.installation,'Data/FrostveilNPCTest.esp'));if(h.light||h.master)throw Error('Ordinary full test ESP required');}
+ private plugins(){return this.policy.version===1?['FrostveilNPCTest.esp']:this.policy.plugins!;}
+ private async checkFiles(){await checkManagedRoots(this.grant);for(const f of [...this.policy.assets,...this.policy.runtime]){const got=await hashFile(await safeFile(this.grant.installation,f.path),64*1024*1024);if(got.sha256!==f.sha256||got.size!==f.size)throw Error('Local asset/runtime changed: '+f.path);}for(const name of this.plugins()){const h=await readPluginHeader(await safeFile(this.grant.installation,'Data/'+name));if(h.light||h.master)throw Error('Ordinary full test ESP required');}}
  private async current(){try{return await this.store.read(journalPath) as Journal;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return null;throw e;}}
  private async verifyWrites(plan:LocalPlan,which:'before'|'after'){for(const w of plan.writes){const f=await this.target(w.slot),st=await fs.lstat(f);if(st.nlink!==1||st.size>1024*1024||!(await fs.readFile(f)).equals(Buffer.from(w[which],'base64')))throw Error('Profile configuration changed; conflict retained');}}
  async prepare():Promise<LocalPlan>{
   await this.checkFiles();if(await this.running())throw Error('Close Skyrim/SKSE before profile preparation');const unlock=await this.store.lease();
   try{
-   const existing=await this.current();if(existing?.state==='active'){await this.verifyWrites(existing.plan,'after');return existing.plan;}if(existing&&!['prepared','reverted'].includes(existing.state))throw Error('Local profile recovery required');
+   const existing=await this.current();if(existing?.state==='active'){if(existing.plan.policyHash!==planDigest(this.policy))throw Error('Revert the previous active development profile before preparing another reviewed policy');await this.verifyWrites(existing.plan,'after');return existing.plan;}if(existing&&!['prepared','reverted'].includes(existing.state))throw Error('Local profile recovery required');
    const input=await readOrderInputs(this.grant.installation,this.grant.configDirectory!);
    const baseline=await planActivation(this.grant.installation,[],input);
-   const testHeader=await readPluginHeader(await safeFile(this.grant.installation,'Data/FrostveilNPCTest.esp'));
-   const activation=await planActivation(this.grant.installation,[{filename:'FrostveilNPCTest.esp',required:true,role:'client-only',order:253,masters:testHeader.masters,sha256:this.policy.assets.find(a=>a.path==='Data/FrostveilNPCTest.esp')!.sha256}],input);
-   if(baseline.status!=='ready'||baseline.configWrites.length||activation.status!=='ready'||activation.configWrites.some(w=>w.path!=='@config/plugins.txt')||JSON.stringify(baseline.active.filter(n=>n.toLowerCase()!=='frostveilnpctest.esp'))!==JSON.stringify(activation.active.filter(n=>n.toLowerCase()!=='frostveilnpctest.esp')))throw Error('Activation would disturb existing approved plugins');
+   const selected=this.plugins(),entries=await Promise.all(selected.map(async(filename,i)=>({filename,required:true,role:'client-only' as const,order:245+i,masters:(await readPluginHeader(await safeFile(this.grant.installation,'Data/'+filename))).masters,sha256:this.policy.assets.find(a=>a.path==='Data/'+filename)!.sha256})));
+   const activation=await planActivation(this.grant.installation,entries,input),selectedSet=new Set(selected.map(n=>n.toLowerCase()));
+   if(baseline.status!=='ready'||baseline.configWrites.length||activation.status!=='ready'||activation.configWrites.some(w=>w.path!=='@config/plugins.txt')||JSON.stringify(baseline.active.filter(n=>!selectedSet.has(n.toLowerCase())))!==JSON.stringify(activation.active.filter(n=>!selectedSet.has(n.toLowerCase()))))throw Error('Activation would disturb existing approved plugins');
    const plugins=await fs.readFile(await this.target('plugins')),settings=await fs.readFile(await this.target('settings'));
    if(settings.length>65536)throw Error('Oversized client configuration');const config=JSON.parse(settings.toString('utf8'));
    if(config.master||config['server-master-key'])throw Error('A different authenticated profile is selected; refuse to overwrite credentials');
@@ -56,7 +64,7 @@ export class NpcDevelopmentProfile {
    catch(error){await this.store.write(journalPath,{state:'recovery-required',plan});if(!await this.running()){try{await this.restore(plan);}catch(recovery){await this.store.write(journalPath,{state:'recovery-required',plan});throw new Error('Local activation failed; exact configuration recovery remains required',{cause:recovery});}}throw error;}
   }finally{await unlock();}
  }
- async status(){const j=await this.current();if(!j||j.state!=='active')return {active:false,state:j?.state??'absent',trust:'LOCAL OWNED REFERENCE ONLY'};await this.checkFiles();await this.verifyWrites(j.plan,'after');const input=await readOrderInputs(this.grant.installation,this.grant.configDirectory!),activation=await planActivation(this.grant.installation,[],input);if(activation.status!=='ready'||activation.configWrites.length||!activation.active.includes('FrostveilNPCTest.esp'))throw Error('Development plugin is not verifiably active');return{active:true,state:j.state,profileHash:planDigest(this.policy),fullOrder:activation.order,trust:'LOCAL OWNED REFERENCE ONLY'};}
+ async status(){const j=await this.current();if(!j||j.state!=='active')return {active:false,state:j?.state??'absent',trust:'LOCAL OWNED REFERENCE ONLY'};if(j.plan.policyHash!==planDigest(this.policy))throw Error('Active development policy differs; explicit owner transition required');await this.checkFiles();await this.verifyWrites(j.plan,'after');const input=await readOrderInputs(this.grant.installation,this.grant.configDirectory!),activation=await planActivation(this.grant.installation,[],input);if(activation.status!=='ready'||activation.configWrites.length||!this.plugins().every(p=>activation.active.includes(p)))throw Error('Development plugin is not verifiably active');return{active:true,state:j.state,profileHash:planDigest(this.policy),fullOrder:activation.order,trust:'LOCAL OWNED REFERENCE ONLY'};}
  async ensureActive(confirm:(digest:string,phase:'restore'|'activate')=>Promise<boolean>){
   let active=false;
   try{active=(await this.status()).active;}catch(error){

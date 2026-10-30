@@ -3,18 +3,32 @@ import{validateRuntimeSeal}from'./npc-runtime-seal.mjs';
 // Dedicated local owner CLI, not a public updater/unsigned remote package route.
 import fs from 'node:fs/promises';import path from 'node:path';import os from 'node:os';import{createHash,randomUUID}from'node:crypto';import{createInterface}from'node:readline/promises';import{execFileSync}from'node:child_process';import{build}from'esbuild';
 const launcher=path.resolve(import.meta.dirname,'..'),repo=path.resolve(launcher,'../skymp'),home=path.join(launcher,'.local/npc-development');
-const command=process.argv[2]??'prepare';if(process.argv.length>3||!['prepare','status','revert','activate','activate-and-play','play','grant'].includes(command))throw Error('Usage: node scripts/npc-development.mjs prepare|status|activate|activate-and-play|play|grant|revert');
+const command=process.argv[2]??'prepare';if(process.argv.length>3||!['prepare','status','revert','activate','activate-and-play','play','grant','runtime-activate','runtime-recover'].includes(command))throw Error('Usage: node scripts/npc-development.mjs prepare|status|activate|activate-and-play|play|grant|runtime-activate|runtime-recover|revert');
 for(const dir of [launcher,path.join(launcher,'.local'),home]){try{if((await fs.lstat(dir)).isSymbolicLink())throw Error('Redirected local development directory');}catch(e){if(e.code!=='ENOENT')throw e;}}
 await fs.mkdir(home,{recursive:true});const file=path.join(home,'core.cjs');
 const exports=[['NpcDevelopmentProfile','management/npc-development.ts'],['npcDevelopmentPolicy','management/npc-development-policy.ts'],['registerRealTarget','installer/managed-target.ts'],['fileVersion,gameRunning,startSkse','windows.ts'],['planDigest','management/authorization.ts'],['GameLauncher','launch.ts'],['hashFile,safeFile,noLinks,safeDirectory','files.ts']];
 await build({stdin:{contents:exports.map(([names,f])=>`export {${names}} from ${JSON.stringify(path.join(launcher,'src/main',f))};`).join('\n'),resolveDir:launcher},outfile:file,bundle:true,platform:'node',format:'cjs',packages:'external',logLevel:'silent'});
-const {createRequire}=await import('node:module'),core=createRequire(import.meta.url)(file),policy=core.npcDevelopmentPolicy;
+const {createRequire}=await import('node:module'),core=createRequire(import.meta.url)(file);
+let policy=core.npcDevelopmentPolicy;
 const game='C:/Program Files (x86)/Steam/steamapps/common/Skyrim Special Edition',config=path.join(process.env.LOCALAPPDATA??path.join(os.homedir(),'AppData/Local'),'Skyrim Special Edition');
+// The extended policy is accepted only from the exact isolated handoff. Its
+// installed profile still requires the authenticated owner activation below.
+if(!['revert','runtime-recover'].includes(command)){
+const earlyHandoff=JSON.parse(await fs.readFile(path.join(repo,'build/rp-audit/g241d/owner-handoff.json'),'utf8'));
+const earlyRoot=await fs.realpath(earlyHandoff.isolatedRoot);
+if(path.dirname(earlyRoot)!==path.join(repo,'build/rp-audit/g241')||!/^dev-[A-Za-z0-9]+$/.test(path.basename(earlyRoot)))throw Error('Unapproved development root');await core.noLinks(earlyRoot);
+const earlyConfig=JSON.parse(await fs.readFile(path.join(earlyRoot,'g241d-config.json'),'utf8'));
+if(earlyConfig.policy?.version===2){
+ if(createHash('sha256').update(JSON.stringify({...earlyConfig,metadataRoot:null})).digest('hex')!==earlyHandoff.serverConfigDigest||earlyConfig.profileHash!==core.planDigest(earlyConfig.policy)||earlyHandoff.profileHash!==earlyConfig.profileHash||JSON.stringify(earlyConfig.policy.runtime)!==JSON.stringify(policy.runtime))throw Error('Unverified extended development profile');
+ for(const pin of policy.assets){const got=earlyConfig.policy.assets.find(a=>a.path===pin.path);if(!got||got.sha256!==pin.sha256||got.size!==pin.size)throw Error('Existing approved template asset changed');}policy=earlyConfig.policy;
+}
+}
 for(const f of policy.runtime){const actual=await core.hashFile(await core.safeFile(game,f.path),64*1024*1024);if(actual.sha256!==f.sha256||actual.size!==f.size)throw Error('Pinned development runtime differs: '+f.path);}
 if(await core.fileVersion(path.join(game,'SkyrimSE.exe'))!=='1.6.1170.0')throw Error('This development profile requires the verified 1.6.1170 runtime');
 await core.safeDirectory(path.join(home,'storage'));const grant=await core.registerRealTarget(game,config,path.join(home,'storage'),{ready:true,runtime:'1.6.1170.0'}),profile=await core.NpcDevelopmentProfile.open(grant,policy,core.gameRunning);
 // Recovery of these two configuration files must not depend on server artifacts
 // still existing or on the five authoring assets remaining unchanged.
+if(command==='runtime-recover'){const {recoverRuntime}=await import('./npc-runtime-onboarding.mjs');await recoverRuntime({core,repo,grant});process.exit(0);}
 if(command==='revert'){await profile.revert(confirm);console.log('Development profile reverted; owned source assets preserved.');process.exit(0);}
 const handoff=JSON.parse(await fs.readFile(path.join(repo,'build/rp-audit/g241d/owner-handoff.json'),'utf8'));
 if(handoff.profileHash!==core.planDigest(policy)||handoff.catalogHash!==policy.catalogHash)throw Error('Stale server/Launcher development policy');
@@ -23,8 +37,9 @@ const serverConfigFile=path.join(root,'g241d-config.json'),serverConfig=JSON.par
 if(serverConfig.profileHash!==core.planDigest(policy)||serverConfig.game!==game||serverConfig.clientConfig.toLowerCase()!==config.toLowerCase())throw Error('Development handoff selects a different installation');
 const sealHash=bytes=>createHash('sha256').update(bytes).digest('hex');
 if(sealHash(Buffer.from(JSON.stringify({...serverConfig,metadataRoot:null})))!==handoff.serverConfigDigest)throw Error('Server development configuration changed');
-validateRuntimeSeal(handoff.artifacts);
+validateRuntimeSeal(handoff.artifacts,handoff.runtimeSealVersion??1);
 for(const artifact of handoff.artifacts){if(!/^[A-Za-z0-9/._-]+$/.test(artifact.path)||artifact.path.split('/').includes('..')||sealHash(await fs.readFile(path.join(root,artifact.path)))!==artifact.sha256)throw Error('Sealed server artifact changed');}
+if(command==='runtime-activate'){const {activateRuntime}=await import('./npc-runtime-onboarding.mjs');await activateRuntime({core,grant,profile,handoff,serverConfig,repo,game});process.exit(0);}
 if(serverConfig.metadataRoot!==grant.metadata){serverConfig.metadataRoot=grant.metadata;await fs.writeFile(serverConfigFile,JSON.stringify(serverConfig,null,2));}
 async function confirm(digest,phase=command==='revert'?'restore':'activate'){if(!process.stdin.isTTY||!process.stdout.isTTY)throw Error('Deliberate owner terminal confirmation required; no --yes or noninteractive override');const rl=createInterface({input:process.stdin,output:process.stdout});try{console.log((phase==='restore'?'LOCAL DEVELOPMENT RECOVERY: restore only the two unchanged configuration targets from the authenticated backup. A separate confirmation is required to activate the test profile again.':'LOCAL DEVELOPMENT ONLY: references five pinned owned files; activates FrostveilNPCTest.esp and selects localhost:17777. Startup failures roll back these configuration changes while the game is closed. No public release or asset copy.')+'\nPlan SHA256: '+digest);return(await rl.question('Type CONFIRM to proceed: ')).trim()==='CONFIRM';}finally{rl.close();}}
 async function playVerifiedClient(revalidateServer=async()=>{}){const player=new core.GameLauncher(core.gameRunning,core.startSkse);await player.play(async()=>{await revalidateServer();if(!(await profile.status()).active)throw Error('Development profile no longer active before launch');for(const f of policy.runtime){const actual=await core.hashFile(await core.safeFile(game,f.path),64*1024*1024);if(actual.sha256!==f.sha256)throw Error('Runtime changed before launch');}return{directory:game,ready:true,runtime:'1.6.1170.0',skseLoader:'2.2.6',skseRuntime:'2.2.6',nativeLauncherAvailable:true,files:[],errors:[],scannedAt:new Date().toISOString()};});}
