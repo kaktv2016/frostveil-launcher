@@ -47,7 +47,7 @@ async function serverFailure(logs,since){
   for(const name of names){const folder=path.join(directory,name),file=path.join(folder,'stages.jsonl');if((await fs.stat(file)).size>65536)continue;const lines=(await fs.readFile(file,'utf8')).trim().split('\n'),last=JSON.parse(lines.at(-1));if(!['FAILED','EXIT_FAILED'].includes(last.state))continue;let exit;try{exit=JSON.parse(await fs.readFile(path.join(folder,'exit.json'),'utf8'));}catch{}return{ok:false,stage:exit?.lastStage?.stage??last.stage,expected:'sealed isolated runtime remains running and becomes ready',observed:{state:last.state,pid:last.pid,exitCode:exit?.code,diagnosticDirectory:folder}};}
  }catch{}return null;
 }
-export async function waitForStartup({expected,root,startScript,serveScript,logs,timeoutMs=60000,now=()=>performance.now(),sleep=n=>new Promise(r=>setTimeout(r,n)),poll,save,failure,checkChild}){
+export async function waitForStartup({expected,root,startScript,serveScript,logs,rejoin=false,timeoutMs=60000,now=()=>performance.now(),sleep=n=>new Promise(r=>setTimeout(r,n)),poll,save,failure,checkChild}){
  const started=now(),report={startedAt:new Date().toISOString(),expected:{...expected,udp:17777,tcp:17778},logs,attempts:0,history:[]};
  const persist=save??(async value=>{await fs.mkdir(path.dirname(logs),{recursive:true});await fs.writeFile(logs,JSON.stringify(value,null,2));});
  while(now()-started<timeoutMs){
@@ -68,7 +68,7 @@ export async function waitForStartup({expected,root,startScript,serveScript,logs
    // The engine/supervisor can write its terminal record while CIM is reading
    // the outer process. Re-read it before labelling an actual native exit as
    // failure to create PowerShell. All successful readiness gates are unchanged.
-   fatal=report.last=await(failure?failure():serverFailure(logs,Date.parse(expected.launchedAt??report.startedAt)))??{ok:false,stage:'PROCESS_CREATION',expected:'owned PowerShell remains alive and executes the sealed startup script',observed:{childPid:expected.childPid,process:child??null}};
+   fatal=report.last=await(failure?failure():serverFailure(logs,Date.parse(expected.launchedAt??report.startedAt)))??{ok:false,stage:rejoin?'SERVER_NOT_RUNNING':'PROCESS_CREATION',expected:rejoin?'previously verified isolated console is still running; start the isolated server before play':'owned PowerShell remains alive and executes the sealed startup script',observed:{childPid:expected.childPid,process:child??null}};
   }}catch(error){report.last={ok:false,stage:'PROCESS_INVENTORY',expected:'readable startup process inventory',observed:{code:error.code??error.name}};}}
   report.elapsedMs=Math.round(now()-started);report.history.push({atMs:report.elapsedMs,...report.last});await persist(report);
   if(report.last.ok&&now()-started<=timeoutMs)return report;

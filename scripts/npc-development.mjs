@@ -48,7 +48,7 @@ else if(command==='status')console.log(JSON.stringify(await profile.status()));
 else if(command==='play'){
  if(await core.gameRunning())throw Error('Close Skyrim/SKSE before reconnecting');
  const audit=path.join(repo,'build/rp-audit/g241d'),expected=await readRunningServer({root,audit,profileHash:core.planDigest(policy),catalogHash:policy.catalogHash});
- const check=()=>waitForStartup({expected,root,startScript:handoff.startScript,serveScript:handoff.serveScript,logs:path.join(audit,'rejoin-readiness-'+Date.now()+'.json')});
+ const check=()=>waitForStartup({expected,root,startScript:handoff.startScript,serveScript:handoff.serveScript,rejoin:true,logs:path.join(audit,'rejoin-readiness-'+Date.now()+'.json')});
  await check();await profile.ensureActive(confirm);await playVerifiedClient(check);
  console.log('SKSE started for the existing isolated server on 17777. Test-world characters and inventories are separate from the primary server; in-game reconnection remains owner verification.');
 }

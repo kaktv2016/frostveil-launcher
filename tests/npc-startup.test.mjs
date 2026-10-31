@@ -48,3 +48,11 @@ test('rejoin selects only a successful receipt matching the private server boot 
   await fs.writeFile(path.join(root,'g241d-status.json'),JSON.stringify({...health,profileHash:'foreign'}));await assert.rejects(readRunningServer({root,audit,profileHash:'p',catalogHash:'c'}),/identity/);
  }finally{assert.equal(path.dirname(root),os.tmpdir());assert(path.basename(root).startsWith('g241d-rejoin-'));await fs.rm(root,{recursive:true});}
 });
+
+test('rejoin with a dead recorded console reports server not running without claiming a new creation failure',async()=>{
+ let saved;await assert.rejects(waitForStartup({expected,root:'root',startScript:'start',logs:'diagnostics',rejoin:true,poll:async()=>{throw Error('refused');},checkChild:async()=>null,save:async r=>{saved=r;}}),/SERVER_NOT_RUNNING/);assert.equal(saved.attempts,1);assert.equal(saved.last.observed.childPid,10);
+});
+test('rejoin still rejects foreign process ownership and accepts only the full live health contract',async()=>{
+ let saved;await assert.rejects(waitForStartup({expected,root:'root',logs:'diagnostics',rejoin:true,poll:async()=>({health,httpStatus:200,snapshot:{...snapshot,parent:{...snapshot.parent,serveMatches:false}}}),checkChild:async()=>null,save:async r=>{saved=r;}}),/SERVER_NOT_RUNNING/);assert.equal(saved.last.ok,false);
+ const r=await waitForStartup({expected,root:'root',logs:'diagnostics',rejoin:true,poll:async()=>({health,httpStatus:200,snapshot}),save:async()=>{}});assert.equal(r.last.stage,'READY');
+});
