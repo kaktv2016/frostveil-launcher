@@ -52,9 +52,9 @@ Primary references: [SteamRE 3.4.0 Program.cs](https://github.com/SteamRE/DepotD
 
 ## Release / recovery
 
-Launcher version: `0.1.27`; development branch `dev/steam-runtime-normalization` in the authorized owner Launcher repository. Not published yet.
+Launcher version: `0.1.27`; development branch `dev/steam-runtime-normalization` in the authorized owner Launcher repository. Not published yet. Feature source commit `bed4c04` is pushed to the authorized development branch.
 
-Evidence is retained privately under `.local/runtime-normalization/`: acquisition receipts, bootstrap/transaction results and pointers, signed candidate, gate logs. Fixture roots are marked and must only be removed after verifying their resolved paths and markers. Keep known-good 0.1.26 artifacts and the existing modpack available for rollback. Production game data is outside these fixtures. The existing Windows Authenticode status is `NotSigned`; the unchanged owner-approved updater trust is the production Ed25519 release manifest, not a newly introduced certificate bypass.
+Evidence is retained privately under `.local/runtime-normalization/`: acquisition receipts, bootstrap/transaction results and pointers, signed candidate, gate logs. Fixture roots are marked and must only be removed after verifying their resolved paths and markers. Keep known-good 0.1.26 artifacts and the existing modpack available for rollback. Production game data is outside these fixtures. Installer SHA-256 `1cef130ffdfb19c42bc0b032673546715584a086b619b109ff801f13645b89bc`. Final publication review found no remaining blocker after adding identity-guarded R2 rollback and promoting latest only after anonymous verification. The existing Windows Authenticode status is `NotSigned`; the unchanged owner-approved updater trust is the production Ed25519 release manifest, not a newly introduced certificate bypass.
 
 The runtime cohort uses the existing production publisher identity and a maximum seven-day validity. Its mutable R2 metadata endpoint must be renewed through the signed publisher workflow before expiry; neither signature nor expiry checks may be disabled. Existing signed modpack 1.0.9 has its own independent expiry.
 
