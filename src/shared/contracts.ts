@@ -1,4 +1,9 @@
 export type Channel='stable'|'beta';
+export interface Dashboard {runtimePreparation?:import('./runtime-contracts').RuntimePreparationState;}
+export interface LauncherApi {
+ inspectRuntime():Promise<Dashboard>;prepareRuntime():Promise<Dashboard>;restoreRuntime():Promise<Dashboard>;cancelRuntime():Promise<Dashboard>;
+ onRuntimePreparation(listener:(state:import('./runtime-contracts').RuntimePreparationState)=>void):()=>void;
+}
 export type FileStatus='LOCAL BASELINE MATCH'|'MISSING'|'DIFFERENT'|'UNVERIFIED';
 export interface BaselineFile {path:string;size:number;sha256:string;component:'game'|'skse'|'client'|'configuration';}
 export interface Profile {id:string;runtime:string;skseVersion:string;skseDll:string;evidence:string;files:BaselineFile[];backupFiles:string[];}

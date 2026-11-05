@@ -1,4 +1,5 @@
 import {canonicalTemporaryRoot} from '../temporary-root';
+import {isSteamSelection,assertSteamIdle,type SteamSelection} from '../runtime/steam';
 import fs from 'node:fs/promises';import path from 'node:path';import os from 'node:os';import {createHash,randomUUID} from 'node:crypto';
 import {contained,noLinks,safeDirectory} from '../files';import {gameRunning,fileVersion} from '../windows';import {managedContentTarget} from '../management/content-policy';import {planDigest,PlanAuthorizer} from '../management/authorization';import type {SandboxGrant} from './sandbox';import type {ManagedPlan} from '../../shared/management-contracts';
 const managed=new WeakSet<object>(),writes=new WeakMap<object,{digest:string;until:number}>(),processChecks=new WeakMap<object,()=>Promise<boolean>>();
@@ -13,4 +14,23 @@ export async function registerRealTarget(game:string,config:string,storage:strin
 export async function createManagedFixture(options:{processActive?:()=>Promise<boolean>}={}):Promise<SandboxGrant>{const temp=await fs.realpath(os.tmpdir());await noLinks(temp);const directory=await fs.mkdtemp(path.join(temp,'frostveil-l4c-'));const g:SandboxGrant={targetClass:'managed-fixture',directory,installation:path.join(directory,'installation'),configDirectory:path.join(directory,'profile'),metadata:path.join(directory,'metadata'),payloads:path.join(directory,'packages'),id:randomUUID(),roots:{}};for(const p of [g.installation,g.configDirectory!,g.metadata,g.payloads])await safeDirectory(p);await fs.mkdir(path.join(g.installation,'Data'));await roots(g);processChecks.set(g,options.processActive??(async()=>false));return g;}
 export async function adoptManagedFixture(directory:string,g:SandboxGrant){const actual=await fs.realpath(directory),temp=await canonicalTemporaryRoot();if(g.targetClass!=='managed-fixture'||!contained(temp,actual)||!/^frostveil-l4c-[a-z0-9]+$/i.test(path.basename(actual))||g.directory!==actual||g.installation!==path.join(actual,'installation')||g.configDirectory!==path.join(actual,'profile')||g.metadata!==path.join(actual,'metadata')||g.payloads!==path.join(actual,'packages'))throw Error('Invalid managed fixture recovery target');managed.add(g);processChecks.set(g,async()=>false);await checkManagedRoots(g);Object.freeze(g.roots);Object.freeze(g);return g;}
 export async function adoptRealTarget(directory:string,g:SandboxGrant,selectedGame:string,selectedConfig:string,runtime:{ready:boolean;runtime:string},versionReader=fileVersion){if(g.targetClass!=='real-skyrim'||!runtime.ready||!['1.6.1170.0','1.6.640.0'].includes(runtime.runtime)||g.metadata!==path.join(directory,'metadata')||g.payloads!==path.join(directory,'packages')||g.directory!==await fs.realpath(directory)||g.installation!==await fs.realpath(selectedGame)||g.configDirectory!==await fs.realpath(selectedConfig)||await versionReader(path.join(selectedGame,'SkyrimSE.exe'))!==runtime.runtime)throw Error('Trusted current L1 selection required for real recovery');managed.add(g);processChecks.set(g,gameRunning);await checkManagedRoots(g);return g;}
+
+/** Bootstrap only: a verified Steam installation can need repair before L1 is ready.
+ * Generic content authorization remains unchanged. RuntimeTransaction owns the
+ * narrowly scoped executable/CCC writer and never exposes this grant to IPC. */
+export async function registerRuntimePreparationTarget(selection:SteamSelection,config:string,storage:string):Promise<SandboxGrant>{
+ if(!isSteamSelection(selection))throw Error('Verified Steam capability required');await assertSteamIdle(selection);
+ const game=selection.game;config=await fs.realpath(config);storage=await fs.realpath(storage);await noLinks(config);await noLinks(storage);
+ if([config,storage].some(r=>contained(game,r)||contained(r,game))||contained(config,storage)||contained(storage,config))throw Error('Independent runtime metadata/profile roots required');
+ const key=createHash('sha256').update(game.toLowerCase()+'\n'+config.toLowerCase()).digest('hex'),directory=path.join(storage,'managed-installations',key);await safeDirectory(directory);
+ try{
+  await fs.stat(path.join(directory,'metadata/sandbox.json'));const {MetadataStore}=await import('./metadata');
+  const store=await MetadataStore.recover(directory,async(actual,g)=>{
+   if(g.targetClass!=='real-skyrim'||actual!==directory||g.directory!==directory||g.installation!==game||g.configDirectory!==config||g.metadata!==path.join(directory,'metadata')||g.payloads!==path.join(directory,'packages'))throw Error('Runtime installation recovery identity mismatch');
+   managed.add(g);processChecks.set(g,gameRunning);await checkManagedRoots(g);Object.freeze(g.roots);Object.freeze(g);return g;
+  });return store.grant;
+ }catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
+ const g:SandboxGrant={targetClass:'real-skyrim',directory,installation:game,configDirectory:config,metadata:path.join(directory,'metadata'),payloads:path.join(directory,'packages'),id:randomUUID(),roots:{}};
+ await safeDirectory(g.metadata);await safeDirectory(g.payloads);await roots(g);processChecks.set(g,gameRunning);return g;
+}
 
