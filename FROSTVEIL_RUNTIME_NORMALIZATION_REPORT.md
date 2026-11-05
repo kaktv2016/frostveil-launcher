@@ -1,6 +1,6 @@
 # Frostveil — Steam runtime normalization and Anniversary Edition isolation
 
-Status: implementation, real isolated transaction, UI, packaged artifact and release gates passed. Publication pending final delivery.
+Status: **published and anonymously verified** — [Launcher 0.1.27](https://github.com/kaktv2016/frostveil-launcher/releases/tag/v0.1.27). Owner Skyrim / real paid-AE acceptance remains pending.
 
 ## Design and implementation
 
@@ -52,11 +52,15 @@ Primary references: [SteamRE 3.4.0 Program.cs](https://github.com/SteamRE/DepotD
 
 ## Release / recovery
 
-Launcher version: `0.1.27`; development branch `dev/steam-runtime-normalization` in the authorized owner Launcher repository. Not published yet. Feature source commit `bed4c04` is pushed to the authorized development branch.
+Launcher version: `0.1.27`; development branch `dev/steam-runtime-normalization` in the authorized owner Launcher repository. Published from `dde000bc90eac4caadfda580bc585e38e6fd0ca9`; feature commit `bed4c04`. Both are pushed to the authorized development branch. Release plan SHA-256 `1d29adebe4837ce72a584b5b7f40323b75e184a86b08c68acac4c5128af8ef85`.
 
 Evidence is retained privately under `.local/runtime-normalization/`: acquisition receipts, bootstrap/transaction results and pointers, signed candidate, gate logs. Fixture roots are marked and must only be removed after verifying their resolved paths and markers. Keep known-good 0.1.26 artifacts and the existing modpack available for rollback. Production game data is outside these fixtures. Installer SHA-256 `1cef130ffdfb19c42bc0b032673546715584a086b619b109ff801f13645b89bc`. Final publication review found no remaining blocker after adding identity-guarded R2 rollback and promoting latest only after anonymous verification. The existing Windows Authenticode status is `NotSigned`; the unchanged owner-approved updater trust is the production Ed25519 release manifest, not a newly introduced certificate bypass.
 
-The runtime cohort uses the existing production publisher identity and a maximum seven-day validity. Its mutable R2 metadata endpoint must be renewed through the signed publisher workflow before expiry; neither signature nor expiry checks may be disabled. Existing signed modpack 1.0.9 has its own independent expiry.
+All six real release assets were downloaded anonymously and verified by size/hash; updater envelope was authenticated using the production Ed25519 key and real installer asset ID. Public R2 metadata `https://pub-276cbfc24fc84b30bbef7eaa4f57067c.r2.dev/runtime/steam-1170.json` SHA-256 `5502d66e51bf41504a3c9083c31bcbe2e141ecc2a582619394355d682abe35a2`, 1,551,910 bytes. Source ZIP SHA-256 `4092e35b5b25f6d0f3f441b0e2f8d3974cf7f2d8594ee8a23078fe32964a92a6`. GitHub latest promotion happened only after anonymous artifact checks. Server deployment/restart was unnecessary and not performed.
+
+Cleanup note: automatic approval review rejected the attempted recursive deletion of our two marked disposable game fixtures; it supplied only “blocked by policy”, without a detailed reason. The deletion command never ran. Retained roots: `C:\Users\basba\AppData\Local\Temp\frostveil-l4c-H8I4sy` and `D:\FrostveilRuntimeBootstrap-6I7PR1`; owned Steam acquisition staging `D:\FrostveilRuntimeAcquisition-20261106` is also retained. Receipts/markers distinguish them from the installed game. Do not confuse these development fixtures with player runtime backups.
+
+The runtime cohort uses the existing production publisher identity and a maximum seven-day validity. Current runtime metadata expires **13 November 2026, 01:24:55 Bangkok**. Its mutable R2 metadata endpoint must be renewed through the signed publisher workflow before expiry; neither signature nor expiry checks may be disabled. Existing signed modpack 1.0.9 independently expires **12 November 2026, 14:55:41 Bangkok**. These are publisher maintenance obligations; clients must continue rejecting expired metadata.
 
 ## Owner acceptance (pending)
 
