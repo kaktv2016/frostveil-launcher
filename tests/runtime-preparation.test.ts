@@ -110,6 +110,23 @@ test('foreign root DLLs and custom archive configuration cannot silently affect 
  await fs.writeFile(path.join(f.grant.configDirectory!,'SkyrimCustom.ini'),'[Archive]\nsResourceArchiveList=foreign.bsa\n');
  await assert.rejects(planCreationIsolation(f.grant,[],['SkyrimSE.exe']),/archive|unreviewed/i);
 }finally{await f.clean();}});
+test('Steam first-run INI may reference the absent vanilla Skyrim - Patch.bsa',async()=>{const f=await fixture();try{
+ const ini=path.join(f.grant.configDirectory!,'Skyrim.ini');
+ const stock=['Skyrim - Voices_en0.bsa',...Array.from({length:9},(_,i)=>`Skyrim - Textures${i}.bsa`)];
+ const approved=['SkyrimSE.exe',...stock.map(name=>'Data/'+name)];
+ const write=(key:string,archives:string[])=>fs.writeFile(ini,`[Archive]\r\n${key}=${archives.join(', ')}\r\n`);
+ const inspect=()=>planCreationIsolation(f.grant,[],approved);
+ const archive='Skyrim - Patch.bsa';
+ await write('sResourceArchiveList2',[...stock,archive]);
+ assert.deepEqual(await inspect(),{quarantine:[],writes:[]});
+ await write('sResourceArchiveList2',[...stock,archive,'Unreviewed.bsa']);
+ await assert.rejects(inspect(),/Unreviewed archive or asset override/);
+ await write('sResourceArchiveList',[archive]);
+ await assert.rejects(inspect(),/Unreviewed archive or asset override/);
+ await write('sResourceArchiveList2',[...stock,archive]);
+ await fs.writeFile(path.join(f.grant.installation,'Data',archive),'unreviewed');
+ await assert.rejects(inspect(),/Unreviewed archive or asset override|Unreviewed installation assets/);
+}finally{await f.clean();}});
 test('root ASI, shader/config inputs and newer indexing files are handled explicitly',async()=>{const f=await fixture();try{
  for(const name of ['SkyrimSE.asi','dxgi.ini']){await fs.writeFile(path.join(f.grant.installation,name),'unreviewed');await assert.rejects(planCreationIsolation(f.grant,[],['SkyrimSE.exe']),/unreviewed/i);await fs.unlink(path.join(f.grant.installation,name));}
  await fs.writeFile(path.join(f.grant.installation,'SkyrimReservedAddOnIndexes.txt'),'new-runtime-index');

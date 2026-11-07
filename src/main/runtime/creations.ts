@@ -36,8 +36,18 @@ export async function planCreationIsolation(g:SandboxGrant,baseline:readonly str
  for(const directory of iniDirectories)for(const name of ['Skyrim.ini','SkyrimPrefs.ini','SkyrimCustom.ini']){
   let text:string;try{const f=await safeFile(directory,name);if((await fs.stat(f)).size>1024*1024)throw Error('INI exceeds review bound');text=await fs.readFile(f,'utf8');}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')continue;throw e;}
   for(const line of text.split(/\r?\n/)){
-   const match=line.match(/^\s*(sResourceArchiveList\d*|sResourceArchiveList2|sResourceStartUpArchiveList|sArchiveToLoadInMemoryList|sTestFile\d+|sResourceDataDirsFinal|sLocalMasterPath)\s*=\s*(.*?)\s*$/i);if(!match||!match[2])continue;
-   for(const value of match[2].split(',').map(n=>n.trim()).filter(Boolean))if(!allowed.has(('Data/'+value).toLowerCase()))throw Error('Unreviewed archive or asset override in '+name+': '+match[1]);
+   const [,key,values]=line.match(/^\s*(sResourceArchiveList\d*|sResourceStartUpArchiveList|sArchiveToLoadInMemoryList|sTestFile\d+|sResourceDataDirsFinal|sLocalMasterPath)\s*=\s*(.*?)\s*$/i)??[];
+   if(!key||!values)continue;
+   for(const value of values.split(',').map(n=>n.trim()).filter(Boolean)){
+    if(allowed.has(('Data/'+value).toLowerCase()))continue;
+    // Steam's stock Skyrim_Default.ini lists this legacy archive even though
+    // the verified runtime does not ship it. A present file still needs approval.
+    if(name==='Skyrim.ini'&&key.toLowerCase()==='sresourcearchivelist2'&&value.toLowerCase()==='skyrim - patch.bsa'){
+     try{await safeFile(g.installation,'Data/Skyrim - Patch.bsa');}
+     catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')continue;throw error;}
+    }
+    throw Error('Unreviewed archive or asset override in '+name+': '+key+' ('+value+')');
+   }
   }
  }
  if(unknown.length)throw Error('Unreviewed installation assets: '+unknown.slice(0,12).join(', '));
