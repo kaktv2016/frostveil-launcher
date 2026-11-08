@@ -10,6 +10,44 @@ const execute=promisify(execFile);
 const powershell=path.join(process.env.SystemRoot??'C:\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe');
 export const helperPin=Object.freeze({version:'3.4.0',archiveSize:33474005,archiveSha256:'41c9e9f0df54b3ad02e67a11726756e5c73283bd7c2e1b04acfa5ae4c2ed3767',size:78840739,sha256:'6281279efce8f1e20db9532a58e42382f81afb9e3827a8b965ffcb43fbe4531f',url:'https://github.com/SteamRE/DepotDownloader/releases/download/DepotDownloader_3.4.0/DepotDownloader-windows-x64.zip'});
 
+export async function downloadSteamHelperArchive(signal:AbortSignal,fetcher:typeof fetch=fetch){
+ const sources=[
+  {label:'GitHub API',url:'https://api.github.com/repos/SteamRE/DepotDownloader/releases/assets/253287195'},
+  {label:'GitHub release',url:helperPin.url},
+ ];
+ const failures:string[]=[];
+ for(const source of sources){
+  let url=new URL(source.url);
+  for(let redirects=0;;redirects++){
+   signal.throwIfAborted();
+   let response:Response;
+   try{
+    response=await fetcher(url,{signal,redirect:'manual',credentials:'omit',headers:{
+     Accept:'application/octet-stream','X-GitHub-Api-Version':'2022-11-28','User-Agent':'Frostveil-Launcher','Accept-Encoding':'identity',
+    }});
+   }catch{
+    signal.throwIfAborted();failures.push(source.label+' connection failed');break;
+   }
+   if([301,302,303,307,308].includes(response.status)){
+    const location=response.headers.get('location');await response.body?.cancel();
+    if(!location||redirects>=2)throw Error('Steam helper redirect limit exceeded');
+    const target=new URL(location,url);
+    // Both routes must stay on the official DepotDownloader release CDN.
+    if(target.protocol!=='https:'||target.port||target.username||target.password||target.hash||
+      !['release-assets.githubusercontent.com','objects.githubusercontent.com'].includes(target.hostname)||
+      !/^\/github-production-release-asset\/11851957\/[0-9a-f-]{36}$/.test(target.pathname))throw Error('Unapproved Steam helper redirect');
+    url=target;continue;
+   }
+   const metadata=/json/i.test(response.headers.get('content-type')??'');
+   if(response.status===200&&response.body&&!metadata)return response;
+   await response.body?.cancel();
+   failures.push(source.label+(metadata&&response.status===200?' returned metadata':' HTTP '+response.status));
+   break;
+  }
+ }
+ throw Error('Steam helper download unavailable ('+failures.join(', ')+')');
+}
+
 /** Only QR block glyphs reach UI. Account names, refresh tokens and arbitrary
  * helper output are never forwarded to diagnostics, renderer or filesystem. */
 export class DepotOutput {
@@ -41,8 +79,8 @@ export async function ensureDepotHelper(storage:string,policy:Readonly<RuntimeCo
  const archive=path.join(root,'helper.zip');
  let valid=false;try{const h=await hashFile(await safeFile(root,'helper.zip'),helperPin.archiveSize);valid=h.sha256===helperPin.archiveSha256&&h.size===helperPin.archiveSize;}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
  if(!valid){
-  const res=await fetch(helperPin.url,{signal:AbortSignal.any([signal,AbortSignal.timeout(15*60*1000)]),redirect:'follow'}),u=new URL(res.url);
-  if(!res.ok||!res.body||u.protocol!=='https:'||!['github.com','release-assets.githubusercontent.com'].includes(u.hostname))throw Error('Steam helper download unavailable');
+  const res=await downloadSteamHelperArchive(AbortSignal.any([signal,AbortSignal.timeout(15*60*1000)]));
+  if(!res.body)throw Error('Steam helper response missing archive');
   const temp=archive+'.'+randomUUID(),h=await fs.open(temp,'wx');let size=0;const sha=createHash('sha256');
   try{for await(const bytes of res.body){size+=bytes.length;if(size>helperPin.archiveSize)throw Error('Steam helper size exceeded');sha.update(bytes);await h.write(bytes);}await h.sync();}catch(e){await h.close();await fs.unlink(temp);throw e;}
   await h.close();if(size!==helperPin.archiveSize||sha.digest('hex')!==helperPin.archiveSha256){await fs.unlink(temp);throw Error('Steam helper download integrity failure');}

@@ -8,7 +8,7 @@ import {authenticateRuntimeCohort,type RuntimeCohort} from '../src/main/runtime/
 import {RuntimeTransaction} from '../src/main/runtime/transaction';
 import {planCreationIsolation} from '../src/main/runtime/creations';
 import {assertSteamIdle,verifySteamSelection} from '../src/main/runtime/steam';
-import {DepotOutput,depotRequestArguments} from '../src/main/runtime/depot';
+import {DepotOutput,depotRequestArguments,downloadSteamHelperArchive} from '../src/main/runtime/depot';
 
 const sha=(s:string)=>createHash('sha256').update(s).digest('hex');
 const keys=generateKeyPairSync('ed25519');
@@ -84,6 +84,37 @@ test('redirected Windows QR fallback retains its module pattern without exposing
  output.push('Use the Steam Mobile App to sign in with this QR code:\n'+('    ??????    ??????    ??????    ??????    \n').repeat(25)+'\n');
  assert.ok(events.some(qr=>qr?.includes('█')));assert.ok(events.filter(Boolean).every(qr=>!qr?.includes('?')));
  output.clear();const count=events.length;output.push(('????????????????????????????????\n').repeat(25)+'\n');assert.equal(events.length,count,'ASCII fallback requires a QR prompt context');
+});
+test('Steam helper downloads use the exact GitHub asset API and a bounded CDN redirect',async()=>{
+ const api='https://api.github.com/repos/SteamRE/DepotDownloader/releases/assets/253287195';
+ const cdn='https://release-assets.githubusercontent.com/github-production-release-asset/11851957/00000000-0000-0000-0000-000000000000';
+ const requested:string[]=[];
+ const fetcher:typeof fetch=async(input,init)=>{
+  requested.push(String(input));
+  assert.equal(init?.redirect,'manual');
+  assert.equal(init?.credentials,'omit');
+  assert.equal(new Headers(init?.headers).get('accept'),'application/octet-stream');
+  return requested.length===1?new Response(null,{status:302,headers:{location:cdn}}):new Response('archive');
+ };
+ const response=await downloadSteamHelperArchive(new AbortController().signal,fetcher);
+ assert.deepEqual(requested,[api,cdn]);
+ assert.equal(await response.text(),'archive');
+});
+test('Steam helper falls back on HTTP errors but refuses an unapproved redirect',async()=>{
+ const requested:string[]=[];
+ const fetcher:typeof fetch=async input=>{
+  requested.push(String(input));
+  return requested.length===1?new Response('Gateway timeout',{status:504}):new Response('archive');
+ };
+ assert.equal(await (await downloadSteamHelperArchive(new AbortController().signal,fetcher)).text(),'archive');
+ assert.equal(requested.length,2);
+ assert.equal(requested[1],'https://github.com/SteamRE/DepotDownloader/releases/download/DepotDownloader_3.4.0/DepotDownloader-windows-x64.zip');
+ let calls=0;
+ await assert.rejects(downloadSteamHelperArchive(new AbortController().signal,async()=>{
+  calls++;
+  return new Response(null,{status:302,headers:{location:'https://example.com/tool.zip'}});
+ }),/unapproved.*redirect/i);
+ assert.equal(calls,1);
 });
 test('cancel before staging leaves no active journal or game modifications',async()=>{const f=await fixture();try{
  const tx=await RuntimeTransaction.open(f.grant,policy(),async()=>false),controller=new AbortController();controller.abort();await assert.rejects(tx.apply(f.source,controller.signal));
