@@ -1,14 +1,26 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {safeFile,noLinks,relativePath} from '../files';
+import {hashFile,safeFile,noLinks,relativePath} from '../files';
 import type {SandboxGrant} from '../installer/sandbox';
 import {readOrderInputs} from '../modpack/plugins';
+import creationKitFiles from './creation-kit-files.json';
 
 export interface Isolation {quarantine:string[];writes:{path:string;bytes:Buffer}[];}
 /** Known outputs from the installed Community Shaders mechanisms (ShaderCache
  * GetDiskPath/Info.ini and Utils/FileSystem PathHelpers), not mod source code.
  * Leave user settings/logs/caches intact; never treat arbitrary DLL/INI as output. */
 function runtimeOutput(p:string){return /\.log$/i.test(p)||/^Data\/ShaderCache\/(?:[A-Za-z0-9 _-]+\/)*[A-Za-z0-9 _-]+\.(?:pso|vso|cso)$/i.test(p)||/^Data\/ShaderCache\/Info\.ini$/i.test(p)||/^Data\/SKSE\/Plugins\/CommunityShaders_ImGui\.ini$/i.test(p)||/^Data\/SKSE\/Plugins\/CommunityShaders\/(?:SettingsUser|SettingsTest|SettingsTheme|AppliedOverrides)\.json$/i.test(p)||/^Data\/SKSE\/Plugins\/CommunityShaders\/UnifiedWaterCache\/[A-Za-z0-9_-]+\.wpc$/i.test(p);}
+
+// Steam Creation Kit app 1946180 shares Skyrim's install directory. The
+// immutable tool hashes are from installed files checked against depots
+// 1946182/1842452583058562650 and 1946183/1955244794634339242.
+const editorTools=new Map(Object.entries(creationKitFiles));
+function editorData(rel:string){
+ // The editor writes these INIs, dictionaries and graph views. Papyrus
+ // source is inert here. Compiled .pex and all runtime plugin paths still
+ // require approval from the signed game/modpack cohort.
+ return /^(?:creationkit(?:prefs)?\.ini|lex\/user\/(?:correct|userdic)\.tlx|data\/dialogueviews\/[a-f0-9]{8}\.xml|data\/source\/scripts\/(?:[a-z0-9_. -]+\.psc|tesv_papyrus_flags\.flg))$/.test(rel);
+}
 /** Read-only planner. No paid content is deleted; removals become journaled backups. */
 export async function planCreationIsolation(g:SandboxGrant,baseline:readonly string[],approved:readonly string[],iniDirectories:readonly string[]=[g.configDirectory!]):Promise<Isolation>{
  const inputs=await readOrderInputs(g.installation,g.configDirectory!);if(inputs.managed)throw Error('Unverified mod manager/profile; preparation blocked');
@@ -18,7 +30,7 @@ export async function planCreationIsolation(g:SandboxGrant,baseline:readonly str
   if(++count>30000)throw Error('Installation inventory exceeds bound');const rel=prefix+e.name;
   if(e.isSymbolicLink())throw Error('Redirected installation asset');
   if(e.isDirectory()){await walk(path.join(folder,e.name),rel+'/');continue;}
-  const f=await safeFile(g.installation,rel);if((await fs.stat(f)).nlink!==1)throw Error('Hard-linked installation asset');
+  const f=await safeFile(g.installation,rel),stat=await fs.stat(f);if(stat.nlink!==1)throw Error('Hard-linked installation asset');
   if(rel==='Skyrim.ccc'||rel==='installscript.vdf'||runtimeOutput(rel))continue;
   // This newer-runtime index file is absent from the acquired 1170 cohort.
   // Preserve its exact preimage instead of leaving alternate plugin indexing
@@ -28,7 +40,11 @@ export async function planCreationIsolation(g:SandboxGrant,baseline:readonly str
    const stem=e.name.replace(/(?: - [A-Za-z0-9 _-]+)?\.(?:esm|esp|esl|bsa)$/i,'').toLowerCase();
    if(![...base].some(n=>n.replace(/\.(?:esm|esl)$/i,'')===stem)){quarantine.push(rel);continue;}
   }
-  if(!allowed.has(rel.toLowerCase()))unknown.push(rel);
+  const key=rel.toLowerCase();
+  if(allowed.has(key)||editorData(key))continue;
+  const tool=editorTools.get(key);
+  if(tool&&stat.size===tool[0]&&(await hashFile(f,stat.size)).sha256===tool[1])continue;
+  unknown.push(rel);
  }}
  // Include root .asi/proxy configuration and non-Data shader/loader folders.
  // Checking only DLL/EXE files would leave other native loading inputs active.

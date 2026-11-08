@@ -133,6 +133,19 @@ test('root ASI, shader/config inputs and newer indexing files are handled explic
  const tx=await RuntimeTransaction.open(f.grant,policy(),async()=>false);await tx.apply(f.source);await assert.rejects(fs.stat(path.join(f.grant.installation,'SkyrimReservedAddOnIndexes.txt')));
  await tx.restore();assert.equal(await fs.readFile(path.join(f.grant.installation,'SkyrimReservedAddOnIndexes.txt'),'utf8'),'new-runtime-index');
 }finally{await f.clean();}});
+test('Creation Kit source and editor data can coexist without admitting game overrides',async()=>{const f=await fixture();try{
+ const add=async(rel:string)=>{const file=path.join(f.grant.installation,rel);await fs.mkdir(path.dirname(file),{recursive:true});await fs.writeFile(file,'test content');return file;};
+ const inspect=()=>planCreationIsolation(f.grant,[],['SkyrimSE.exe']);
+ const editorFiles=['CreationKit.ini','CreationKitPrefs.ini','Data/DialogueViews/0000081B.xml','Data/Source/Scripts/TestScript.psc','Data/Source/Scripts/TESV_Papyrus_Flags.flg','lex/User/userdic.tlx'];
+ for(const rel of editorFiles)await add(rel);
+ assert.deepEqual(await inspect(),{quarantine:[],writes:[]});
+ for(const rel of ['CreationKit.exe','flowchartx64.dll','Tools/Archive/Archive.exe','Tools/injected.dll','Data/Source/Scripts/Injected.pex','Data/Scripts/Injected.pex','Data/DialogueViews/Injected.esp','Data/CreationKit.bsa']){
+  const file=await add(rel);
+  await assert.rejects(inspect(),error=>error instanceof Error&&error.message.includes(rel));
+  await fs.unlink(file);
+ }
+ for(const rel of editorFiles)assert.equal(await fs.readFile(path.join(f.grant.installation,rel),'utf8'),'test content');
+}finally{await f.clean();}});
 test('whole Play records modpack preimages, restores added files and preserves original plugin bytes',async()=>{const f=await fixture();try{
  const p=authenticateRuntimeCohort(cohort({managedFiles:[{path:'Data/example.esp',size:7,sha256:sha('modpack')}],pluginOrder:['example.esp']}),trust,{fixture:true});
  await fs.writeFile(path.join(f.grant.configDirectory!,'plugins.txt'),'# original\r\n');
