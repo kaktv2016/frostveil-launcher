@@ -7,6 +7,7 @@ import {createManagedFixture} from '../src/main/installer/managed-target';
 import {MetadataStore} from '../src/main/installer/metadata';
 import {authenticateRuntimeCohort,type RuntimeCohort} from '../src/main/runtime/policy';
 import {RuntimeTransaction} from '../src/main/runtime/transaction';
+import {RuntimePreparation} from '../src/main/runtime/service';
 import {planCreationIsolation} from '../src/main/runtime/creations';
 import {assertSteamIdle,verifySteamSelection} from '../src/main/runtime/steam';
 import {DepotOutput,depotRequestArguments,downloadSteamHelperArchive} from '../src/main/runtime/depot';
@@ -21,6 +22,131 @@ function cohort(overrides:Partial<RuntimeCohort>={}){
 }
 const policy=()=>authenticateRuntimeCohort(cohort(),trust,{fixture:true});
 async function fixture(){const grant=await createManagedFixture();await fs.writeFile(path.join(grant.installation,'SkyrimSE.exe'),'before');const source=path.join(grant.payloads,'source');await fs.mkdir(source);await fs.writeFile(path.join(source,'SkyrimSE.exe'),'target');return{grant,source,clean:()=>fs.rm(grant.directory,{recursive:true,force:true})};}
+
+const preparationFiles=[
+ {depot:'489831',manifest:'8442952117333549665',path:'Data/Skyrim.esm',before:'original master',target:'fixture master'},
+ {depot:'489832',manifest:'8042843504692938467',path:'SkyrimSELauncher.exe',before:'original launcher',target:'fixture launcher'},
+ {depot:'489833',manifest:'1914580699073641964',path:'SkyrimSE.exe',before:'original runtime',target:'fixture runtime'}
+];
+async function preparationFixture(t:TestContext,mode:'success'|'version-failure'|'corrupt'){
+ const grant=await createManagedFixture();
+ t.after(()=>fs.rm(grant.directory,{recursive:true,force:true}));
+ const game=grant.installation,config=grant.configDirectory!;
+ const depots=preparationFiles.map(f=>({id:f.depot,manifest:f.manifest}));
+ const files=preparationFiles.map(f=>({path:f.path,depot:f.depot,size:Buffer.byteLength(f.target),sha256:sha(f.target)}));
+ const envelope=cohort({depots,files});
+ const cache=path.join(grant.payloads,'steam-depots',sha(JSON.stringify({depots,files})));
+ const source=path.join(cache,'cohort');
+ const store=await MetadataStore.create(grant);
+ const journalPath='runtime-preparation/journal.json';
+ const readJournal=async()=>await store.read(journalPath) as {state:string;installationId:string;files:{path:string;before:{size:number;sha256:string};after:{size:number;sha256:string}}[]};
+ const rawIdentities=()=>Promise.all(preparationFiles.map(async f=>{
+  const file=path.join(source,f.path);
+  try{
+   const stat=await fs.stat(file,{bigint:true});
+   return {depot:f.depot,file,identity:{dev:stat.dev,ino:stat.ino,size:Number(stat.size),sha256:sha(await fs.readFile(file))}};
+  }catch(e){
+   if((e as NodeJS.ErrnoException).code==='ENOENT')return {depot:f.depot,file,identity:null};
+   throw e;
+  }
+ }));
+ let rawBeforeApply:Awaited<ReturnType<typeof rawIdentities>>|undefined;
+ let acquisitions=0,version=mode==='version-failure'?'1.6.640.0':'1.6.1170.0';
+ class FixturePreparation extends RuntimePreparation {
+  protected override async runtimeTarget(selectedGame:string,selectedConfig:string){
+   assert.equal(selectedGame,game);assert.equal(selectedConfig,config);
+   return {grant,guard:async()=>false,steamStamp:sha('synthetic Steam depot stamp')};
+  }
+  protected override async loadPolicy(){return authenticateRuntimeCohort(envelope,trust,{fixture:true});}
+  protected override async acquire(policy:Readonly<RuntimeCohort>,destination:string,signal:AbortSignal,requested:readonly string[]){
+   signal.throwIfAborted();acquisitions++;
+   assert.equal(destination,cache);
+   assert.deepEqual(policy.depots,depots);
+   assert.deepEqual(requested,preparationFiles.map(f=>f.path));
+   for(const [index,f] of preparationFiles.entries()){
+    const file=path.join(source,f.path);
+    await fs.mkdir(path.dirname(file),{recursive:true});
+    await fs.writeFile(file,mode==='corrupt'&&index===0?'X'+f.target.slice(1):f.target,{flag:'wx'});
+   }
+   rawBeforeApply=await rawIdentities();
+   return source;
+  }
+  protected override async runtimeVersion(file:string){
+   assert.equal(file,path.join(game,'SkyrimSE.exe'));
+   assert.equal(await fs.readFile(file,'utf8'),'fixture runtime');
+   return version;
+  }
+ }
+ for(const f of preparationFiles)await fs.writeFile(path.join(game,f.path),f.before);
+ const service=new FixturePreparation(grant.directory,path.join(grant.directory,'unused-bundled-policy.json'));
+ const states:ReturnType<RuntimePreparation['snapshot']>[]=[];
+ t.after(service.subscribe(state=>states.push(state)));
+ const prepare=()=>service.prepare(game,config);
+ return {
+  service,prepare,readJournal,restore:()=>service.restore(game,config),
+  setTargetVersion:()=>{version='1.6.1170.0';},
+  assertTargets:async(image:'before'|'target')=>{
+   for(const f of preparationFiles)assert.deepEqual(await fs.readFile(path.join(game,f.path)),Buffer.from(f[image]));
+  },
+  assertRawRetained:async()=>{
+   assert.equal(acquisitions,1);
+   assert.deepEqual(rawBeforeApply?.map(f=>[f.depot,f.identity?.size,f.identity?.sha256]),files.map(f=>[f.depot,f.size,f.sha256]));
+   assert.deepEqual(await rawIdentities(),rawBeforeApply);
+  },
+  assertPrepareWithoutAcquisition:async()=>{
+   const before=acquisitions,from=states.length;
+   await prepare();
+   assert.equal(service.snapshot().phase,'ready');
+   assert.equal(acquisitions,before);
+   assert.ok(states.slice(from).every(s=>!s.authQr&&s.phase!=='authentication'&&s.phase!=='downloading'));
+  },
+  assertPreimages:async()=>{
+   const journal=await readJournal();
+   assert.equal(journal.state,'active');
+   assert.equal(journal.installationId,grant.id);
+   assert.deepEqual(journal.files,preparationFiles.map(f=>({
+    path:f.path,before:{size:Buffer.byteLength(f.before),sha256:sha(f.before)},
+    after:{size:Buffer.byteLength(f.target),sha256:sha(f.target)}
+   })));
+   for(const f of preparationFiles)assert.deepEqual(await fs.readFile(path.join(grant.payloads,'runtime-backups',sha(f.before))),Buffer.from(f.before));
+  }
+ };
+}
+
+test('service keeps all three raw depot copies after Ready and skips acquisition when warm',async t=>{
+ const f=await preparationFixture(t,'success');
+ await f.prepare();
+ assert.equal(f.service.snapshot().phase,'ready');
+ assert.equal(f.service.snapshot().changedFiles,0);
+ await f.assertTargets('target');
+ await f.assertRawRetained();
+ await f.assertPrepareWithoutAcquisition();
+ await f.assertRawRetained();
+});
+test('service keeps all three raw depot copies after post-Apply verification fails, restores originals and reuses staged bytes',async t=>{
+ const f=await preparationFixture(t,'version-failure');
+ await assert.rejects(f.prepare(),/Final runtime version verification failed/);
+ assert.equal(f.service.snapshot().phase,'blocked');
+ await f.assertTargets('target');
+ await f.assertPreimages();
+ await f.assertRawRetained();
+ await f.restore();
+ assert.equal(f.service.snapshot().phase,'idle');
+ assert.equal((await f.readJournal()).state,'restored');
+ await f.assertTargets('before');
+ await f.assertRawRetained();
+ f.setTargetVersion();
+ await f.assertPrepareWithoutAcquisition();
+ await f.assertTargets('target');
+ await f.assertRawRetained();
+});
+test('service refuses corrupt acquired bytes before changing originals or writing the runtime journal',async t=>{
+ const f=await preparationFixture(t,'corrupt');
+ await assert.rejects(f.prepare(),/Runtime payload hash mismatch/);
+ assert.equal(f.service.snapshot().phase,'blocked');
+ await f.assertTargets('before');
+ await assert.rejects(f.readJournal(),e=>(e as NodeJS.ErrnoException).code==='ENOENT');
+});
 
 async function committedRestoreFixture(t:TestContext){
  const f=await fixture();t.after(f.clean);

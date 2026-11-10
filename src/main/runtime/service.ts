@@ -21,18 +21,22 @@ export class RuntimePreparation {
  subscribe(fn:(s:RuntimePreparationState)=>void){this.listeners.add(fn);return()=>{this.listeners.delete(fn);};}
  private update(patch:Partial<RuntimePreparationState>){this.state={...this.state,...patch};for(const fn of this.listeners){try{fn(this.snapshot());}catch{/* UI listeners cannot interrupt authenticated recovery. */}}}
  cancel(){this.prepared=undefined;this.operation?.abort(Error('Runtime preparation cancelled'));}
- private async context(game:string,config:string){
+ protected async runtimeTarget(game:string,config:string){
   const selection=await verifySteamSelection(game,await steamRoots());await safeDirectory(config);await safeDirectory(this.storage);
   const grant=await registerRuntimePreparationTarget(selection,config,this.storage);
   const steamStamp=await assertSteamIdle(selection);
   const guard=async()=>{if(await assertSteamIdle(selection)!==steamStamp)throw Error('Steam installation changed during preparation; retry after Steam finishes');return gameRunning();};
-  const store=await MetadataStore.create(grant);
+  return{grant,guard,steamStamp};
+ }
+ private async context(game:string,config:string){
+  const target=await this.runtimeTarget(game,config);
+  const store=await MetadataStore.create(target.grant);
   // Do not mix the independently authorized 17777 profile with normal play.
   try{const j=await store.read('npc-development/journal.json') as {state?:string};if(j.state!=='reverted')throw Error('Revert the NPC development profile before normal-server runtime preparation');}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
   try{const settings=await safeFile(game,'Data/Platform/Plugins/skymp5-client-settings.txt'),s=await fs.stat(settings);if(s.size>1024*1024||s.nlink!==1)throw Error('Client settings exceed bound or use a hard link');const text=await fs.readFile(settings,'utf8');if(/17777/.test(text))throw Error('NPC development endpoint 17777 is active; revert the development profile first');}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
-  return{selection,grant,guard,store,steamStamp};
+  return{...target,store};
  }
- private async loadPolicy(signal:AbortSignal):Promise<Readonly<RuntimeCohort>>{
+ protected async loadPolicy(signal:AbortSignal):Promise<Readonly<RuntimeCohort>>{
   // No unsigned local compatibility-profile or renderer-supplied source is used.
   const response=await fetch(policyUrl,{redirect:'error',signal:AbortSignal.any([signal,AbortSignal.timeout(30000)])});let bytes:Buffer;
   if(response.ok&&response.body){const parts:Buffer[]=[];let size=0;for await(const part of response.body){size+=part.length;if(size>4*1024*1024)throw Error('Runtime metadata exceeds bound');parts.push(Buffer.from(part));}bytes=Buffer.concat(parts);}
@@ -40,6 +44,11 @@ export class RuntimePreparation {
   else throw Error('Signed runtime metadata unavailable (HTTP '+response.status+'); game unchanged');
   return authenticateRuntimeCohort(JSON.parse(bytes.toString('utf8')));
  }
+ protected async acquire(policy:Readonly<RuntimeCohort>,cache:string,signal:AbortSignal,needed:readonly string[]){
+  const helper=await ensureDepotHelper(this.storage,policy,signal);
+  return acquireDepots(policy,helper,cache,signal,(phase,message,authQr)=>this.update({phase,message,authQr}),needed);
+ }
+ protected runtimeVersion(file:string){return fileVersion(file);}
  private async ledger(store:MetadataStore,policy:Readonly<RuntimeCohort>){
   const createdAt=Date.parse(policy.createdAt),sha256=createHash('sha256').update(JSON.stringify(policy)).digest('hex');
   try{const previous=await store.read('runtime-preparation/policy-ledger.json') as {createdAt:number;sha256:string};if(createdAt<previous.createdAt||createdAt===previous.createdAt&&sha256!==previous.sha256)throw Error('Stale/conflicting runtime metadata');if(createdAt===previous.createdAt)return;}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
@@ -62,10 +71,10 @@ export class RuntimePreparation {
    for(const root of [c.grant.installation,c.grant.payloads,this.storage,c.grant.configDirectory!]){const stat=await fs.statfs(root);if(Number(stat.bavail)*Number(stat.bsize)<required)throw Error('Insufficient disk space for download, staging and original-file backups');}
    const needed=await tx.neededPayloads();
    const digest=createHash('sha256').update(JSON.stringify({depots:p.depots,files:p.files})).digest('hex'),cache=path.join(c.grant.payloads,'steam-depots',digest);await safeDirectory(cache);
-   let source=cache;if(needed.length){const helper=await ensureDepotHelper(this.storage,p,signal);source=await acquireDepots(p,helper,cache,signal,(phase,message,authQr)=>this.update({phase,message,authQr}),needed);}
-   this.update({phase:'applying',message:'ตรวจครบแล้ว กำลังเตรียม runtime และพักส่วนเสริมที่ไม่ใช้',authQr:undefined});await tx.apply(source,signal);if(needed.length)await tx.clearAcquiredCopies(source,needed);
+   const source=needed.length?await this.acquire(p,cache,signal,needed):cache;
+   this.update({phase:'applying',message:'ตรวจครบแล้ว กำลังเตรียม runtime และพักส่วนเสริมที่ไม่ใช้',authQr:undefined});await tx.apply(source,signal);
   }
-  if(await fileVersion(await safeFile(game,'SkyrimSE.exe'))!=='1.6.1170.0')throw Error('Final runtime version verification failed; restore is available');
+  if(await this.runtimeVersion(await safeFile(game,'SkyrimSE.exe'))!=='1.6.1170.0')throw Error('Final runtime version verification failed; restore is available');
   const final=await tx.inspect();if(final.changedFiles!==0)throw Error('Runtime cohort verification failed after preparation');
   this.update({...final,phase:'ready',message:'Skyrim 1.6.1170.0 และชุดส่วนเสริมผ่านตรวจแล้ว — ติดตั้ง modpack ต่อได้',authQr:undefined});
   signal.throwIfAborted();this.prepared={game,config,tx};
