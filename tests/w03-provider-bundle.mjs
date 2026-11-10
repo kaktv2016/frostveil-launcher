@@ -12,13 +12,24 @@ export const w03ProviderBoundaries = {
     const depot = path.resolve('src/main/runtime/depot.ts');
     const fixture = path.resolve('tests/w03-provider-boundaries.ts');
 
+    const expected = new Set([
+      JSON.stringify([service, '../windows']),
+      JSON.stringify([target, '../windows']),
+      JSON.stringify([policy, '../distribution/policy']),
+      JSON.stringify([service, './depot']),
+      JSON.stringify([depot, 'node:child_process']),
+    ]);
+    const matched = new Set();
     builder.onResolve({filter: /^(\.\.\/windows|\.\.\/distribution\/policy|\.\/depot|node:child_process)$/}, args => {
-      if ((args.path === '../windows' && [service, target].includes(args.importer)) ||
-          (args.path === '../distribution/policy' && args.importer === policy) ||
-          (args.path === './depot' && args.importer === service) ||
-          (args.path === 'node:child_process' && args.importer === depot)) {
+      const boundary = JSON.stringify([args.importer, args.path]);
+      if (expected.has(boundary)) {
+        matched.add(boundary);
         return {path: fixture};
       }
     });
+    builder.onEnd(() => ({
+      errors: [...expected].filter(boundary => !matched.has(boundary))
+        .map(boundary => ({text: 'W03 isolation boundary was not substituted: ' + boundary})),
+    }));
   }
 };
