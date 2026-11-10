@@ -35,10 +35,14 @@ export class RuntimeTransaction {
   const tx=new RuntimeTransaction(grant,policy,await MetadataStore.create(grant),running,options);for(const f of policy?.managedFiles??[])tx.managedPaths.add(f.path);return tx;
  }
  private async guard(){await checkManagedRoots(this.grant);if(await this.running())throw Error('Skyrim/SKSE or Steam update active; runtime writes refused');}
+ private destination(raw:string){
+  const config=raw==='@config/plugins.txt'||raw==='@config/loadorder.txt';
+  return {config,root:config?this.grant.configDirectory!:this.grant.installation};
+ }
  private target(raw:string){
-  const config=raw==='@config/plugins.txt'||raw==='@config/loadorder.txt',rel=config?raw.slice(8):relativePath(raw);
+  const {config,root}=this.destination(raw),rel=config?raw.slice(8):relativePath(raw);
   if(!config&&rel!=='Skyrim.ccc'&&rel!=='SkyrimReservedAddOnIndexes.txt'&&!this.managedPaths.has(rel)&&!/^Data\/cc[A-Za-z0-9_-]+(?: - [A-Za-z0-9 _-]+)?\.(?:esm|esp|esl|bsa)$/i.test(rel))runtimePath(rel);
-  const file=path.join(config?this.grant.configDirectory!:this.grant.installation,...rel.split('/'));checkExistingAncestors(file);return file;
+  const file=path.join(root,...rel.split('/'));checkExistingAncestors(file);return file;
  }
  private async image(raw:string):Promise<Image|null>{
   const file=this.target(raw);
@@ -162,7 +166,32 @@ export class RuntimeTransaction {
   for(const f of j.files)if(!same(await this.image(f.path),f.after))throw Error('Modpack incomplete/integrity failure: '+f.path);
   if(j.state!=='active'){j.state='active';await this.store.write(journal,j);}
  }finally{await release();}}
+ private async checkRestoreSpace(files:Change[]){
+  // Replacements use one temporary sibling at a time. Use current free bytes
+  // without assuming any space will be freed by a later deletion or rename.
+  const requiredByRoot=new Map<string,number>();
+  for(const f of files){
+   if(!f.before||same(await this.image(f.path),f.before))continue;
+   const {root}=this.destination(f.path);
+   requiredByRoot.set(root,Math.max(requiredByRoot.get(root)??0,f.before.size));
+  }
+  for(const [root,required] of requiredByRoot){
+   const destination=root===this.grant.installation?'installation':'configuration';
+   const unavailable='Unable to determine free disk space for runtime restore at '+destination+' root';
+   let free:number;
+   try{
+    if(this.options.freeBytes)free=await this.options.freeBytes(root);
+    else{
+     const stat=await fs.statfs(root);
+     free=Number(stat.bavail)*Number(stat.bsize);
+    }
+   }catch(error){throw Error(unavailable,{cause:error});}
+   if(!Number.isSafeInteger(free)||free<0)throw Error(unavailable);
+   if(free<required)throw Error('Insufficient disk space for runtime restore at '+destination+' root');
+  }
+ }
  private async finish(j:Journal,restore:boolean,signal?:AbortSignal){
+  if(restore)await this.checkRestoreSpace(j.files);
   j.state=restore?'restoring':'applying';await this.store.write(journal,j);
   for(const f of restore?[...j.files].reverse():j.files){signal?.throwIfAborted();await this.guard();let expected=restore?f.after:f.before;const want=restore?f.before:f.after,got=await this.image(f.path);if(same(got,want))continue;if(restore&&f.intermediate!==undefined&&same(got,f.intermediate))expected=f.intermediate;if(!same(got,expected))throw Error('Runtime recovery conflict: '+f.path);await this.replace(f,want,expected,restore?'runtime-backups':'runtime-staging');await this.options.checkpoint?.('file-applied');}
   j.state=restore?'restored':'active';await this.store.write(journal,j);

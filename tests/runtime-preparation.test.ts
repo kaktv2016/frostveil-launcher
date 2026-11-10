@@ -1,16 +1,17 @@
-import test from 'node:test';
+import test,{type TestContext} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {createHash,generateKeyPairSync,sign} from 'node:crypto';
 import {createManagedFixture} from '../src/main/installer/managed-target';
+import {MetadataStore} from '../src/main/installer/metadata';
 import {authenticateRuntimeCohort,type RuntimeCohort} from '../src/main/runtime/policy';
 import {RuntimeTransaction} from '../src/main/runtime/transaction';
 import {planCreationIsolation} from '../src/main/runtime/creations';
 import {assertSteamIdle,verifySteamSelection} from '../src/main/runtime/steam';
 import {DepotOutput,depotRequestArguments,downloadSteamHelperArchive} from '../src/main/runtime/depot';
 
-const sha=(s:string)=>createHash('sha256').update(s).digest('hex');
+const sha=(bytes:string|Buffer)=>createHash('sha256').update(bytes).digest('hex');
 const keys=generateKeyPairSync('ed25519');
 const trust={test:{publicKey:keys.publicKey.export({format:'pem',type:'spki'}).toString(),environment:'test' as const,revoked:false}};
 function cohort(overrides:Partial<RuntimeCohort>={}){
@@ -20,6 +21,36 @@ function cohort(overrides:Partial<RuntimeCohort>={}){
 }
 const policy=()=>authenticateRuntimeCohort(cohort(),trust,{fixture:true});
 async function fixture(){const grant=await createManagedFixture();await fs.writeFile(path.join(grant.installation,'SkyrimSE.exe'),'before');const source=path.join(grant.payloads,'source');await fs.mkdir(source);await fs.writeFile(path.join(source,'SkyrimSE.exe'),'target');return{grant,source,clean:()=>fs.rm(grant.directory,{recursive:true,force:true})};}
+
+async function committedRestoreFixture(t:TestContext){
+ const f=await fixture();t.after(f.clean);
+ const {grant}=f,config=grant.configDirectory!;
+ const added='Data/example.esp',modpack='modpack'.repeat(16);
+ const originals=['before','# original plugins\r\n','# original order\r\n'] as const;
+ const targets=[path.join(grant.installation,'SkyrimSE.exe'),path.join(config,'plugins.txt'),path.join(config,'loadorder.txt'),path.join(grant.installation,added)] as const;
+ const p=authenticateRuntimeCohort(cohort({managedFiles:[{path:added,size:modpack.length,sha256:sha(modpack)}],pluginOrder:['example.esp']}),trust,{fixture:true});
+ const tx=await RuntimeTransaction.open(grant,p,async()=>false,{freeBytes:async()=>Number.MAX_SAFE_INTEGER});
+ await fs.writeFile(targets[1],originals[1]);await fs.writeFile(targets[2],originals[2]);
+ await tx.apply(f.source);await tx.beginModpack();await fs.writeFile(targets[3],modpack);await tx.completeModpack();
+ const journal='runtime-preparation/journal.json',journalFile=path.join(grant.metadata,journal);
+ const store=await MetadataStore.create(grant);
+ const state=async()=>(await store.read(journal) as {state:string}).state;
+ const readTargets=()=>Promise.all(targets.map(async file=>{
+  try{return await fs.readFile(file);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return null;throw e;}
+ }));
+ const snapshot=async()=>{
+  const backups=path.join(grant.payloads,'runtime-backups');
+  const names=(await fs.readdir(backups)).sort();
+  const stat=await fs.stat(journalFile,{bigint:true});
+  return {
+   targets:(await readTargets()).map(bytes=>bytes===null?null:sha(bytes)),
+   backups:await Promise.all(names.map(async name=>[name,sha(await fs.readFile(path.join(backups,name)))])),
+   journal:sha(await fs.readFile(journalFile)),
+   journalIdentity:[stat.ino,stat.mtimeNs]
+  };
+ };
+ return{grant,config,originals,readTargets,snapshot,state};
+}
 
 test('runtime metadata requires a signature, expiry, reviewed source and narrow targets',()=>{
  assert.equal(policy().runtime,'1.6.1170.0');
@@ -47,6 +78,100 @@ test('restore refuses subsequent external edits and keeps original backup',async
  assert.equal(await fs.readFile(path.join(f.grant.installation,'SkyrimSE.exe'),'utf8'),'external');
  assert.equal(await fs.readFile(path.join(f.grant.payloads,'runtime-backups',sha('before')),'utf8'),'before');
 }finally{await f.clean();}});
+for(const destination of ['installation','configuration'] as const){
+ test('Restore checks '+destination+' space before writing targets, backups or journal',async t=>{
+  const f=await committedRestoreFixture(t);
+  const shortRoot=destination==='installation'?f.grant.installation:f.config;
+  const required=destination==='installation'?Buffer.byteLength(f.originals[0]):Buffer.byteLength(f.originals[1]);
+  const probes:string[]=[];
+  const tx=await RuntimeTransaction.forRecovery(f.grant,async()=>false,{freeBytes:async root=>{
+   probes.push(root);return root===shortRoot?required-1:Number.MAX_SAFE_INTEGER;
+  }});
+  const before=await f.snapshot();
+  await assert.rejects(tx.restore(),new RegExp('Insufficient disk space for runtime restore.*'+destination,'i'));
+  assert.deepEqual(await f.snapshot(),before);
+  assert.equal(await f.state(),'active');
+  assert.equal(probes.filter(root=>root===shortRoot).length,1);
+  assert.ok(probes.every(root=>root===f.grant.installation||root===f.config));
+ });
+}
+test('Restore fails closed before writing when destination free space cannot be measured',async t=>{
+ const f=await committedRestoreFixture(t);
+ const before=await f.snapshot();
+ for(const invalid of ['unavailable',NaN,Infinity,-1,1.5,Number.MAX_SAFE_INTEGER+1] as const){
+  const tx=await RuntimeTransaction.forRecovery(f.grant,async()=>false,{freeBytes:async root=>{
+   if(root!==f.config)return Number.MAX_SAFE_INTEGER;
+   if(invalid==='unavailable')throw Error('synthetic probe failure');
+   return invalid;
+  }});
+  await assert.rejects(tx.restore(),/Unable to determine free disk space for runtime restore.*configuration/i);
+  assert.deepEqual(await f.snapshot(),before);
+ }
+});
+test('Restore uses the largest copy per destination and restores exact original bytes',async t=>{
+ const f=await committedRestoreFixture(t);
+ const probes:string[]=[];
+ const configBytes=Math.max(...f.originals.slice(1).map(original=>Buffer.byteLength(original)));
+ const tx=await RuntimeTransaction.forRecovery(f.grant,async()=>false,{freeBytes:async root=>{
+  probes.push(root);return root===f.config?configBytes:Buffer.byteLength(f.originals[0]);
+ }});
+ await tx.restore();
+ assert.deepEqual(probes.sort(),[f.grant.installation,f.config].sort());
+ assert.deepEqual(await f.readTargets(),[...f.originals.map(original=>Buffer.from(original)),null]);
+ assert.equal(await f.state(),'restored');
+});
+test('Restore probes installation for a zero-byte original and skips configuration',async t=>{
+ const f=await fixture();t.after(f.clean);
+ const exe=path.join(f.grant.installation,'SkyrimSE.exe');
+ await fs.writeFile(exe,'');
+ const setup=await RuntimeTransaction.open(f.grant,policy(),async()=>false,{freeBytes:async()=>Number.MAX_SAFE_INTEGER});
+ await setup.apply(f.source);
+ const probes:string[]=[];
+ const tx=await RuntimeTransaction.forRecovery(f.grant,async()=>false,{freeBytes:async root=>{probes.push(root);return 0;}});
+ await tx.restore();
+ assert.deepEqual(probes,[f.grant.installation]);
+ assert.deepEqual(await fs.readFile(exe),Buffer.alloc(0));
+});
+test('Restore needs no capacity probe for deletion-only changes',async t=>{
+ const f=await fixture();t.after(f.clean);
+ const exe=path.join(f.grant.installation,'SkyrimSE.exe');
+ await fs.unlink(exe);
+ const setup=await RuntimeTransaction.open(f.grant,policy(),async()=>false,{freeBytes:async()=>Number.MAX_SAFE_INTEGER});
+ await setup.apply(f.source);
+ const tx=await RuntimeTransaction.forRecovery(f.grant,async()=>false,{freeBytes:async()=>{throw Error('unexpected capacity probe');}});
+ await tx.restore();
+ await assert.rejects(fs.stat(exe),{code:'ENOENT'});
+ assert.deepEqual(await tx.history(),{canRestore:false,recoveryRequired:false});
+});
+test('interrupted Restore checks pending space before recovery and skips already-restored files',async t=>{
+ const f=await committedRestoreFixture(t);
+ let replaced=0;
+ const tx=await RuntimeTransaction.forRecovery(f.grant,async()=>false,{
+  freeBytes:async()=>Number.MAX_SAFE_INTEGER,
+  checkpoint:async stage=>{if(stage==='file-applied'&&++replaced===2)throw Error('simulated Restore power loss');}
+ });
+ await assert.rejects(tx.restore(),/Restore power loss/);
+ assert.equal(await f.state(),'restoring');
+ const partial=await f.readTargets();
+ assert.deepEqual(partial.slice(0,3),['target',...f.originals.slice(1)].map(bytes=>Buffer.from(bytes)));
+ assert.notEqual(partial[3],null,'the pending deletion remains available to catch premature writes');
+ const before=await f.snapshot();
+ let available=Buffer.byteLength(f.originals[0])-1;
+ const probes:string[]=[];
+ const recovery=await RuntimeTransaction.forRecovery(f.grant,async()=>false,{freeBytes:async root=>{
+  probes.push(root);
+  if(root!==f.grant.installation)throw Error('unexpected capacity probe');
+  return available;
+ }});
+ await assert.rejects(recovery.recover(),/Insufficient disk space for runtime restore.*installation/i);
+ assert.deepEqual(probes,[f.grant.installation]);
+ assert.deepEqual(await f.snapshot(),before);
+ available++;
+ await recovery.recover();
+ assert.deepEqual(probes,[f.grant.installation,f.grant.installation]);
+ assert.deepEqual(await f.readTargets(),[...f.originals.map(original=>Buffer.from(original)),null]);
+ assert.equal(await f.state(),'restored');
+});
 test('interruption after write is recoverable with authenticated journal and no second write',async()=>{const f=await fixture();try{
  let once=true;const tx=await RuntimeTransaction.open(f.grant,policy(),async()=>false,{checkpoint:async(stage)=>{if(stage==='file-applied'&&once){once=false;throw Error('simulated power loss');}}});
  await assert.rejects(tx.apply(f.source),/power loss/);
