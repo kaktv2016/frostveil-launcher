@@ -2,10 +2,13 @@ import {build} from 'esbuild';
 import {spawnSync} from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import {w03ProviderBoundaries} from '../tests/w03-provider-bundle.mjs';
 const tests=(await fs.readdir('tests')).filter(f=>f.endsWith('.test.ts')).map(f=>'tests/'+f);
 const syntheticDelivery='tests/modpack-delivery.test.ts';
+const syntheticProvider='tests/w03-provider.test.ts';
 const options={outdir:'.test-build',outExtension:{'.js':'.cjs'},bundle:true,platform:'node',format:'cjs',packages:'external'};
-await build({...options,entryPoints:[...tests.filter(f=>f!==syntheticDelivery),'tests/installer-worker.ts']});
+await build({...options,entryPoints:[...tests.filter(f=>f!==syntheticDelivery&&f!==syntheticProvider),'tests/installer-worker.ts']});
+await build({...options,entryPoints:[syntheticProvider],plugins:[w03ProviderBoundaries]});
 // This entry uses inert Skyrim-shaped fixture directories. The owner's actual
 // Skyrim process must not block its synthetic transaction tests. Scope the
 // dependency replacement to this bundle; all process-guard security tests and
