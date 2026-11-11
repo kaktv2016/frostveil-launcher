@@ -9,7 +9,7 @@ import {createInstallerSandbox,checkRoots,PAYLOAD_LIMIT,type SandboxGrant} from 
 import {MetadataStore,durableWrite} from '../installer/metadata';
 import {GitHubDistributionProvider} from '../distribution/github';
 import {PackageDownloader} from '../distribution/download';
-import {productionSource,authenticateRelease,VersionLedger,type DistributionSource} from '../distribution/policy';
+import {productionSource,authenticateRelease,VersionLedger,type AuthenticatedRelease,type DistributionSource} from '../distribution/policy';
 import type {PackageReference} from '../../shared/modpack-contracts';
 import type {ProductionDownloadState} from '../../shared/management-contracts';
 import type {Profile} from '../../shared/contracts';
@@ -21,7 +21,8 @@ export class ProductionDownloads {
  private state:ProductionDownloadState={phase:'idle',message:'Download signed server files before choosing whether to install them.',signature:'UNVERIFIED',installed:false,files:[],externalRequirements:0,bytes:0,totalBytes:0};
  private grant?:SandboxGrant;
  private controller?:AbortController;
- private lastBundle?:ReturnType<typeof authenticateRelease>;
+ private lastBundle?:AuthenticatedRelease;
+ private bundleAdmission=Promise.resolve();
  private lastBundleAt=0;
  private isDefaultProvider=false;
  private listeners=new Set<(state:ProductionDownloadState)=>void>();
@@ -76,39 +77,78 @@ export class ProductionDownloads {
  }
  async download(unexpected?:unknown){
   if(unexpected!==undefined||this.disposed)throw Error('Unexpected or unavailable download operation');
-  return this.acquire();
+  if(this.preparing)throw Error('Another pack operation is in progress');
+  await this.acquire();
+  return this.snapshot();
  }
- private async acquire(needs?:(file:{path:string;size:number;sha256:string})=>Promise<boolean>){
+ private async acquire(needs?:(file:{path:string;size:number;sha256:string})=>Promise<boolean>,selected?:AuthenticatedRelease){
   if(this.disposed)throw Error('Download service disposed');
   if(this.controller)throw Error('A download is already running');
   const controller=new AbortController();this.controller=controller;
   this.update({phase:'checking',signature:'UNVERIFIED',message:'Verifying signed GitHub release.',files:[],bytes:0,totalBytes:0,installed:false});
   try{
-   const provider=this.providerFactory!(),release=await provider.resolve(this.source.channel,undefined,controller.signal);
-   const bundle=authenticateRelease(await provider.envelope(release,controller.signal),this.source,release);
-   this.lastBundle=bundle;this.lastBundleAt=Date.now();
+   const provider=this.providerFactory!();
+   const bundle=selected??await this.resolveBundle(provider,controller.signal);
    if(lt(this.version,bundle.manifest.minimumLauncherVersion))throw Error('Update Launcher before downloading this pack');
-   const grant=await this.cache();await new VersionLedger(path.join(this.storage,'production-download-history')).accept(bundle.manifest.packId,bundle.manifest.channel,bundle.manifest.packVersion,bundle.manifestHash);
+   controller.signal.throwIfAborted();
+   const grant=await this.cache();
+   await this.admitBundle(bundle,selected===undefined,controller.signal);
    const wanted=new Set<string>();
    for(const file of bundle.manifest.files)if(file.package&&(!needs||await needs(file)))wanted.add(file.package.sha256);
    const packages=bundle.packages.filter(p=>wanted.has(p.sha256));
    const totalBytes=packages.reduce((n,p)=>n+p.size,0);let completed=0;
-   this.update({phase:'downloading',signature:'AUTHENTICATED',packId:bundle.manifest.packId,version:bundle.manifest.packVersion,release:release.tag_name,totalBytes,externalRequirements:bundle.manifest.files.filter(f=>f.distribution!=='allowed').length,message:'Downloading verified files outside Skyrim. No game files are being changed.'});
+   this.update({phase:'downloading',signature:'AUTHENTICATED',packId:bundle.manifest.packId,version:bundle.manifest.packVersion,release:bundle.release.tag_name,totalBytes,externalRequirements:bundle.manifest.files.filter(f=>f.distribution!=='allowed').length,message:'Downloading verified files outside Skyrim. No game files are being changed.'});
    const downloader=new PackageDownloader(grant,provider.transport,{onProgress:p=>this.update({bytes:completed+p.bytes})});
    for(const ref of packages){await downloader.acquire(ref,controller.signal);completed+=ref.size;this.update({bytes:completed,files:[...this.state.files,{name:ref.assetName,size:ref.size,sha256:ref.sha256,verified:true}]});}
+   controller.signal.throwIfAborted();
    this.update({phase:'complete',message:'Files downloaded and verified. NOT INSTALLED — review installation separately.',bytes:totalBytes});
+   return{bundle,grant};
   }catch(e){this.update({phase:controller.signal.aborted?'cancelled':'error',message:controller.signal.aborted?'Download cancelled; verified cache retained.':e instanceof Error?e.message:'Download failed',installed:false});}
   finally{this.controller=undefined;}
-  return this.snapshot();
  }
  setInstalled(installed:boolean){if(this.state.installed!==installed)this.update({installed,...(installed&&this.state.phase==='idle'?{message:'Server files & mods (SkyUI) are installed and active.'}:{})});}
+ private async resolveBundle(provider:GitHubDistributionProvider,signal?:AbortSignal){
+  const release=await provider.resolve(this.source.channel,undefined,signal);
+  return authenticateRelease(await provider.envelope(release,signal),this.source,release);
+ }
+ private revalidateBundle(bundle:AuthenticatedRelease){
+  authenticateRelease(bundle.envelope,this.source,bundle.release);
+ }
+ private admitBundle(bundle:AuthenticatedRelease,remember:boolean,signal?:AbortSignal){
+  // Serialize ledger reads and writes with publication of the corresponding cache entry.
+  const admission=this.bundleAdmission.then(async()=>{
+   if(this.disposed)throw Error('Download service disposed');
+   signal?.throwIfAborted();
+   await safeDirectory(this.storage);
+   signal?.throwIfAborted();
+   this.revalidateBundle(bundle);
+   await new VersionLedger(path.join(this.storage,'production-download-history')).accept(
+    bundle.manifest.packId,bundle.manifest.channel,bundle.manifest.packVersion,bundle.manifestHash);
+   if(remember){
+    // A durable admission supersedes the prior cache even if this request was cancelled.
+    this.lastBundle=signal?.aborted?undefined:bundle;
+    this.lastBundleAt=Date.now();
+   }
+   signal?.throwIfAborted();
+  });
+  this.bundleAdmission=admission.catch(()=>{});
+  return admission;
+ }
  private async currentBundle(){
-  if(this.isDefaultProvider&&this.lastBundle&&Date.now()-this.lastBundleAt<15000)return this.lastBundle;
-  const provider=this.providerFactory!(),release=await provider.resolve(this.source.channel);
-  const bundle=authenticateRelease(await provider.envelope(release),this.source,release);
+  await this.bundleAdmission;
+  if(this.isDefaultProvider&&this.lastBundle){
+   const age=Date.now()-this.lastBundleAt;
+   if(age>=0&&age<15000){
+    try{
+     this.revalidateBundle(this.lastBundle);
+     return this.lastBundle;
+    }catch{/* Refresh metadata when the cached release no longer passes trust checks. */}
+   }
+   this.lastBundle=undefined;
+  }
+  const bundle=await this.resolveBundle(this.providerFactory!());
   if(lt(this.version,bundle.manifest.minimumLauncherVersion))throw Error('Update Launcher before playing this pack');
-  await safeDirectory(this.storage);await new VersionLedger(path.join(this.storage,'production-download-history')).accept(bundle.manifest.packId,bundle.manifest.channel,bundle.manifest.packVersion,bundle.manifestHash);
-  this.lastBundle=bundle;this.lastBundleAt=Date.now();
+  await this.admitBundle(bundle,true);
   return bundle;
  }
  private async matches(game:string,file:{path:string;size:number;sha256:string}){file=effectiveNativeRequirement(effectiveClientRequirement(file));
@@ -158,7 +198,10 @@ export class ProductionDownloads {
  }
  /** Read-only comparison against the current signed release, never just the presence of SkyUI. */
  async inspectInstallation(game:string,order:string){
-  const bundle=await this.currentBundle();await noLinks(game);
+  return this.inspectBundle(game,order,await this.currentBundle());
+ }
+ private async inspectBundle(game:string,order:string,bundle:AuthenticatedRelease){
+  await noLinks(game);
   const missing:string[]=[],external:string[]=[];
   const requiredFiles=bundle.manifest.files.filter(f=>f.required);
   const matchResults=await Promise.all(requiredFiles.map(async file=>({file,ok:await this.matches(game,file)})));
@@ -170,6 +213,7 @@ export class ProductionDownloads {
   const active=new Set(text.split(/\r?\n/).filter(l=>l.trim().startsWith('*')).map(l=>l.trim().slice(1).toLowerCase()));
   const inactive=plugins.filter(p=>!active.has(p.toLowerCase()));
   if(plugins.length)try{const activation=await this.activationForPlay(game,order,bundle);if(activation.status!=='ready')inactive.push('Plugin activation blocked: '+activation.blockers.join('; '));else if(activation.configWrites.length)inactive.push('Shared plugin order requires repair');}catch(e){inactive.push(e instanceof Error?e.message:'Plugin activation unavailable');}
+  this.revalidateBundle(bundle);
   const installed=!missing.length&&!external.length&&!inactive.length;
   this.update({installed,signature:'AUTHENTICATED',packId:bundle.manifest.packId,version:bundle.manifest.packVersion,release:bundle.manifest.distribution.release?.tag});
   return{installed,missing,external,inactive};
@@ -181,12 +225,14 @@ export class ProductionDownloads {
    if(this.disposed)throw Error('Download service disposed');
    if(await this.running())throw Error('Skyrim or SKSE is running; close it before verifying or repairing files');
    this.update({phase:'checking',installed:false,message:'Checking signed server pack and local file hashes before Play…'});
-   const before=await this.inspectInstallation(game,order);
+   this.checkCancellation(cancellation);
+   const bundle=await this.currentBundle();
+   this.checkCancellation(cancellation);
+   const before=await this.inspectBundle(game,order,bundle);
    this.checkCancellation(cancellation);
    if(before.external.length)throw Error('External dependency missing or different (cannot auto-download): '+before.external.join(', '));
    if(!before.installed){
-    await this.installAndActivate(game,order);
-    const after=await this.inspectInstallation(game,order);
+    const after=await this.installBundle(game,order,cancellation,bundle);
     this.checkCancellation(cancellation);
     if(!after.installed)throw Error('Pack verification incomplete: '+[...after.missing,...after.external,...after.inactive].join(', '));
    }
@@ -200,16 +246,24 @@ export class ProductionDownloads {
   try{return(await this.inspectInstallation(gameDirectory,orderDirectory)).installed;}catch{this.setInstalled(false);return false;}
  }
  async installAndActivate(gameDirectory:string,orderDirectory:string):Promise<ProductionDownloadState>{
-  const cancellation=this.cancellation;
+  if(this.preparing||this.controller)throw Error('Another pack operation is in progress');
+  this.preparing=true;
+  try{
+   await this.installBundle(gameDirectory,orderDirectory,this.cancellation);
+   return this.snapshot();
+  }finally{this.preparing=false;}
+ }
+ private async installBundle(gameDirectory:string,orderDirectory:string,cancellation:number,selected?:AuthenticatedRelease){
   if(this.disposed)throw Error('Download service disposed');
   if(!gameDirectory)throw Error('Skyrim game folder is required');
   if(await this.running())throw Error('Skyrim or SKSE is running; close it before installing files');
   await noLinks(gameDirectory);checkExistingAncestors(orderDirectory);
-  await this.acquire(async file=>!await this.matches(gameDirectory,file));
   this.checkCancellation(cancellation);
-  if(this.state.phase!=='complete')throw Error('Server files download could not be completed: '+this.state.message);
-  const bundle=this.lastBundle??await(async()=>{const provider=this.providerFactory!(),release=await provider.resolve(this.source.channel);return authenticateRelease(await provider.envelope(release),this.source,release);})();
-  const grant=await this.cache();
+  const acquired=await this.acquire(async file=>!await this.matches(gameDirectory,file),selected);
+  this.checkCancellation(cancellation);
+  if(!acquired)throw Error('Server files download could not be completed: '+this.state.message);
+  const {bundle,grant}=acquired;
+  this.revalidateBundle(bundle);
   this.update({phase:'downloading',message:'Installing verified server files & mods (SkyUI) to Skyrim…'});
   const allowedFiles=bundle.manifest.files.filter(f=>f.distribution==='allowed'&&f.package);
   for(const file of allowedFiles){
@@ -247,10 +301,10 @@ export class ProductionDownloads {
     try{await fs.writeFile(temporary,Buffer.from(write.bytesBase64,'base64'),{flag:'wx'});checkExistingAncestors(destination);if(await this.running())throw Error('Skyrim or SKSE started; activation stopped');this.checkCancellation(cancellation);await fs.rename(temporary,destination);}finally{await fs.unlink(temporary).catch(()=>{});}
    }
   }
-  const verification=await this.inspectInstallation(gameDirectory,orderDirectory);
+  const verification=await this.inspectBundle(gameDirectory,orderDirectory,bundle);
   this.checkCancellation(cancellation);
   this.update({phase:'complete',installed:verification.installed,message:verification.installed?'Signed server pack installed and verified. Ready to play.':'Server assets installed; unresolved requirements: '+[...verification.missing,...verification.external,...verification.inactive].join(', ')});
-  return this.snapshot();
+  return verification;
  }
  /** Trusted Main supplies an authenticated reference and an existing target capability. */
  async stage(target:SandboxGrant,ref:PackageReference,signal?:AbortSignal){
