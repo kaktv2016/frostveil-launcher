@@ -10,11 +10,97 @@ import {MetadataStore,durableWrite} from '../installer/metadata';
 import {GitHubDistributionProvider} from '../distribution/github';
 import {PackageDownloader} from '../distribution/download';
 import {productionSource,authenticateRelease,VersionLedger,type AuthenticatedRelease,type DistributionSource} from '../distribution/policy';
-import type {PackageReference} from '../../shared/modpack-contracts';
+import type {PackFile,PackageReference} from '../../shared/modpack-contracts';
 import type {ProductionDownloadState} from '../../shared/management-contracts';
 import type {Profile} from '../../shared/contracts';
 import {planActivation} from './activation';
-import {readOrderInputs,readPluginHeader} from '../modpack/plugins';
+import {readOrderInputs,readPluginHeader,type OrderInputs} from '../modpack/plugins';
+import {assertSharedPluginCompatibility,samePluginNames} from '../modpack/compatibility';
+
+interface FileImage {size:number;sha256:string;stamp:string;}
+interface PackProfile {inputs:OrderInputs;files:Map<string,FileImage|null>;}
+interface RepairTarget {file:PackFile;destination:string;before:FileImage|null;}
+interface StagedRepair extends RepairTarget {source:string;image:FileImage;}
+const profileLimit=1024*1024;
+const pluginPath=/^Data\/[^/]+\.(?:esp|esl|esm)$/i;
+const implicitOfficial=/^(?:Skyrim|Update|Dawnguard|HearthFires|Dragonborn)\.esm$/i;
+const sha256=(bytes:Buffer)=>createHash('sha256').update(bytes).digest('hex');
+const filePath=(root:string,relative:string)=>path.join(root,...relativePath(relative).split('/'));
+
+async function directoryIdentity(directory:string):Promise<string|null>{
+ try{
+  await noLinks(directory);
+  const stat=await fs.lstat(directory,{bigint:true});
+  if(!stat.isDirectory())throw Error('Unsafe pack directory: '+path.basename(directory));
+  return stat.dev+':'+stat.ino;
+ }catch(error){
+  if((error as NodeJS.ErrnoException).code==='ENOENT')return null;
+  throw error;
+ }
+}
+
+async function requireDirectories(expected:ReadonlyMap<string,string|null>){
+ for(const [directory,identity] of expected){
+  if(await directoryIdentity(directory)!==identity)throw Error('Pack directory changed: '+path.basename(directory));
+ }
+}
+
+async function fileStamp(file:string):Promise<string|null>{
+ try{
+  await noLinks(file);
+  const stat=await fs.lstat(file,{bigint:true});
+  if(!stat.isFile()||stat.nlink!==1n)throw Error('Unsafe or hard-linked pack file: '+path.basename(file));
+  return [stat.dev,stat.ino,stat.size,stat.mtimeNs,stat.ctimeNs].join(':');
+ }catch(error){
+  if((error as NodeJS.ErrnoException).code==='ENOENT')return null;
+  throw error;
+ }
+}
+
+async function requireStamp(file:string,expected:string|null){
+ if(await fileStamp(file)!==expected)throw Error('File changed during Play preparation: '+path.basename(file));
+}
+
+async function observeFile(file:string,limit:number):Promise<FileImage|null>{
+ const stamp=await fileStamp(file);
+ if(stamp===null)return null;
+ const image=await hashFile(file,limit);
+ await requireStamp(file,stamp);
+ return {...image,stamp};
+}
+
+function matchesImage(image:FileImage|null,expected:{size:number;sha256:string}):boolean{
+ return image?.size===expected.size&&image.sha256===expected.sha256;
+}
+
+async function observeProfile(game:string,order:string):Promise<PackProfile>{
+ const sources=[
+  ['pluginsText',path.join(order,'plugins.txt')],
+  ['loadorderText',path.join(order,'loadorder.txt')],
+  ['cccText',path.join(game,'Skyrim.ccc')],
+ ] as const;
+ const files=new Map<string,FileImage|null>();
+ for(const [,file] of sources)files.set(file,await observeFile(file,profileLimit));
+ const inputs=await readOrderInputs(game,order);
+ for(const [key,file] of sources){
+  const before=files.get(file)??null,text=inputs[key];
+  if((before?.sha256??null)!==(text===null?null:sha256(Buffer.from(text,'utf8'))))
+   throw Error('Plugin profile changed during Play preparation or has an unsupported encoding: '+path.basename(file));
+  await requireStamp(file,before?.stamp??null);
+ }
+ return {inputs,files};
+}
+
+async function requireProfile(game:string,order:string,expected:PackProfile){
+ const actual=await observeProfile(game,order);
+ if(actual.inputs.managed!==expected.inputs.managed)throw Error('Managed plugin profile changed during Play preparation');
+ for(const [file,before] of expected.files){
+  const now=actual.files.get(file);
+  if((now?.stamp??null)!==(before?.stamp??null)||(now?.sha256??null)!==(before?.sha256??null))
+   throw Error('Plugin profile changed during Play preparation: '+path.basename(file));
+ }
+ return actual;
+}
 
 /** Main owns target selection; only authenticated, redistribution-allowed payloads can be installed. */
 export class ProductionDownloads {
@@ -81,7 +167,7 @@ export class ProductionDownloads {
   await this.acquire();
   return this.snapshot();
  }
- private async acquire(needs?:(file:{path:string;size:number;sha256:string})=>Promise<boolean>,selected?:AuthenticatedRelease){
+ private async acquire(plan?:(bundle:AuthenticatedRelease)=>Promise<ReadonlySet<string>>,selected?:AuthenticatedRelease){
   if(this.disposed)throw Error('Download service disposed');
   if(this.controller)throw Error('A download is already running');
   const controller=new AbortController();this.controller=controller;
@@ -90,12 +176,13 @@ export class ProductionDownloads {
    const provider=this.providerFactory!();
    const bundle=selected??await this.resolveBundle(provider,controller.signal);
    if(lt(this.version,bundle.manifest.minimumLauncherVersion))throw Error('Update Launcher before downloading this pack');
+   if(selected)this.revalidateBundle(selected);
+   controller.signal.throwIfAborted();
+   const wanted=await plan?.(bundle);
    controller.signal.throwIfAborted();
    const grant=await this.cache();
    await this.admitBundle(bundle,selected===undefined,controller.signal);
-   const wanted=new Set<string>();
-   for(const file of bundle.manifest.files)if(file.package&&(!needs||await needs(file)))wanted.add(file.package.sha256);
-   const packages=bundle.packages.filter(p=>wanted.has(p.sha256));
+   const packages=wanted?bundle.packages.filter(p=>wanted.has(p.sha256)):bundle.packages;
    const totalBytes=packages.reduce((n,p)=>n+p.size,0);let completed=0;
    this.update({phase:'downloading',signature:'AUTHENTICATED',packId:bundle.manifest.packId,version:bundle.manifest.packVersion,release:bundle.release.tag_name,totalBytes,externalRequirements:bundle.manifest.files.filter(f=>f.distribution!=='allowed').length,message:'Downloading verified files outside Skyrim. No game files are being changed.'});
    const downloader=new PackageDownloader(grant,provider.transport,{onProgress:p=>this.update({bytes:completed+p.bytes})});
@@ -109,10 +196,14 @@ export class ProductionDownloads {
  setInstalled(installed:boolean){if(this.state.installed!==installed)this.update({installed,...(installed&&this.state.phase==='idle'?{message:'Server files & mods (SkyUI) are installed and active.'}:{})});}
  private async resolveBundle(provider:GitHubDistributionProvider,signal?:AbortSignal){
   const release=await provider.resolve(this.source.channel,undefined,signal);
-  return authenticateRelease(await provider.envelope(release,signal),this.source,release);
+   const bundle=authenticateRelease(await provider.envelope(release,signal),this.source,release);
+   assertSharedPluginCompatibility(bundle.manifest,bundle.server);
+   return bundle;
  }
  private revalidateBundle(bundle:AuthenticatedRelease){
-  authenticateRelease(bundle.envelope,this.source,bundle.release);
+   const verified=authenticateRelease(bundle.envelope,this.source,bundle.release);
+   if(verified.manifestHash!==bundle.manifestHash)throw Error('Signed release changed during Play preparation');
+   assertSharedPluginCompatibility(verified.manifest,verified.server);
  }
  private admitBundle(bundle:AuthenticatedRelease,remember:boolean,signal?:AbortSignal){
   // Serialize ledger reads and writes with publication of the corresponding cache entry.
@@ -151,73 +242,105 @@ export class ProductionDownloads {
   await this.admitBundle(bundle,true);
   return bundle;
  }
- private async matches(game:string,file:{path:string;size:number;sha256:string}){file=effectiveNativeRequirement(effectiveClientRequirement(file));
-  try{const target=await safeFile(game,file.path),st=await fs.lstat(target);if(st.nlink!==1)throw Error('Hard-linked game file is not allowed');const hash=await hashFile(target,Math.max(PAYLOAD_LIMIT,file.size));return hash.size===file.size&&hash.sha256===file.sha256;}
-  catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}
+ private requiredActivation(bundle:AuthenticatedRelease){
+  return bundle.manifest.files.filter(file=>file.required&&pluginPath.test(file.path)&&!implicitOfficial.test(path.basename(file.path)));
  }
- private requiredActivation(bundle:ReturnType<typeof authenticateRelease>){
-  const implicit=/^(?:Skyrim|Update|Dawnguard|HearthFires|Dragonborn)\.esm$/i;
-  return [...new Set([...bundle.manifest.requiredPlugins.filter(p=>p.required&&!implicit.test(p.filename)).map(p=>p.filename),...bundle.manifest.files.filter(f=>f.required&&/^Data\/[^/]+\.(?:esp|esl|esm)$/i.test(f.path)&&!implicit.test(path.basename(f.path))).map(f=>path.basename(f.path))])];
- }
- private async activationForPlay(game:string,order:string,bundle:ReturnType<typeof authenticateRelease>){
-  const requirements=[...bundle.manifest.requiredPlugins];let nextOrder=Math.max(-1,...requirements.map(p=>p.order))+1;
-  // Existing signed packs declare external SkyUI as a required file, not a shared server plugin.
-  for(const filename of this.requiredActivation(bundle))if(!requirements.some(p=>p.filename.toLowerCase()===filename.toLowerCase())){
-   const file=bundle.manifest.files.find(f=>f.path.toLowerCase()==='data/'+filename.toLowerCase());if(!file||!await this.matches(game,file))throw Error('Required plugin bytes unavailable: '+filename);
-   const header=await readPluginHeader(await safeFile(game,file.path));requirements.push({filename,required:true,role:'client-only',order:nextOrder++,masters:header.masters,sha256:file.sha256});
+
+ private async activationForPlay(game:string,bundle:AuthenticatedRelease,profile:PackProfile,watched:Map<string,string|null>,
+  local:Map<string,FileImage|null>,staged=new Map<string,StagedRepair>()){
+  const requirements=[...bundle.manifest.requiredPlugins];
+  const byName=new Map(requirements.map(plugin=>[plugin.filename.toLowerCase(),plugin]));
+  const signedFiles=new Map(bundle.manifest.files.filter(file=>pluginPath.test(file.path)).map(file=>[file.path.toLowerCase(),file]));
+  const headers=new Map<string,Awaited<ReturnType<typeof readPluginHeader>>>();
+  const readVerifiedHeader=async(filename:string)=>{
+   const name=filename.toLowerCase(),key='data/'+name;
+   const earlier=headers.get(name);if(earlier)return earlier;
+   const signed=signedFiles.get(key),replacement=staged.get(key);
+   const source=replacement?.source??filePath(game,signed?.path??'Data/'+filename);
+   const image=replacement?.image??(signed?(local.has(key)?local.get(key):await observeFile(source,Math.max(PAYLOAD_LIMIT,signed.size))):undefined);
+   const stamp=image?.stamp??(signed?null:await fileStamp(source));
+   watched.set(source,stamp);
+   if(stamp===null)throw Object.assign(Error('Plugin file unavailable: '+filename),{code:'ENOENT'});
+   if(signed&&!matchesImage(image??null,signed))throw Error('Signed plugin bytes differ: '+filename);
+   await requireStamp(source,stamp);
+   const header=await readPluginHeader(source);
+   await requireStamp(source,stamp);
+   const shared=byName.get(name);
+   if(shared?.role==='server-required'){
+    if(header.light||/\.esl$/i.test(filename))throw Error('Shared plugin must use a verified full slot: '+filename);
+    if(!samePluginNames(header.masters,shared.masters))throw Error('Shared plugin TES4 master sequence differs: '+filename);
+   }
+   headers.set(name,header);
+   return header;
+  };
+
+  // Some signed packs list a required client plugin as a file only.
+  const explicitFiles=this.requiredActivation(bundle);
+  let nextOrder=Math.max(-1,...requirements.map(plugin=>plugin.order))+1;
+  for(const file of explicitFiles){
+   const filename=path.basename(file.path);
+   if(byName.has(filename.toLowerCase()))continue;
+   const header=await readVerifiedHeader(filename);
+   requirements.push({filename,required:true,role:'client-only',order:nextOrder++,masters:header.masters,sha256:file.sha256});
   }
-  const inputs=await readOrderInputs(game,order);
-  const implicit=/^(?:Skyrim|Update|Dawnguard|HearthFires|Dragonborn)\.esm$/i;
-  const reqNames=new Set(bundle.manifest.requiredPlugins.map(p=>p.filename.toLowerCase()));
-  let extraFullMasters=0;
-  const seenExtra=new Set<string>();
-  const cccNames=(inputs.cccText??'').replace(/^\uFEFF/,'').split(/\r?\n/).map(l=>l.trim()).filter(l=>l&&!l.startsWith('#'));
-  const activeNames=(inputs.pluginsText??'').replace(/^\uFEFF/,'').split(/\r?\n/).map(l=>l.trim()).filter(l=>l.startsWith('*')).map(l=>l.slice(1).trim());
-  for(const [name,fromCcc] of [...cccNames.map(n=>[n,true] as const),...activeNames.map(n=>[n,false] as const)]){
-   const lower=name.toLowerCase();
-   if(implicit.test(name)||reqNames.has(lower)||seenExtra.has(lower))continue;
-   try{
-    const h=await readPluginHeader(await safeFile(game,'Data/'+name));
-    const isLight=h.light||/\.esl$/i.test(name);
-    const isMaster=fromCcc||h.master||/\.(esm|esl)$/i.test(name);
-    if(!isLight&&isMaster){extraFullMasters++;seenExtra.add(lower);}
-   }catch{/* ignore missing files */}
-  }
-  const adjustedReqs=requirements.map(p=>({...p,order:!implicit.test(p.filename)&&p.role==='server-required'?p.order+extraFullMasters:p.order}));
-  const plan=await planActivation(game,adjustedReqs,inputs);
-  if(plan.status!=='ready')return plan;
-  // SSE uses plugins.txt; keep its existing diagnostic loadorder mirror consistent too.
-  const active=new Set(plan.active.map(p=>p.toLowerCase())),raw=inputs.loadorderText??'',bom=raw.startsWith('\uFEFF')?'\uFEFF':'',newline=raw.includes('\r\n')?'\r\n':'\n';
-  const lines=raw.slice(bom.length).split(/\r?\n/),observed=lines.map(l=>l.trim().replace(/^\*/,'' )).filter(l=>active.has(l.toLowerCase()));
-  if(observed.map(p=>p.toLowerCase()).join('|')!==plan.active.map(p=>p.toLowerCase()).join('|')){
-   const retained=lines.filter(l=>!active.has(l.trim().replace(/^\*/,'').toLowerCase()));
-   const text=bom+plan.active.join(newline)+newline+retained.join(newline),bytes=Buffer.from(text,'utf8'),digest=(b:Buffer)=>createHash('sha256').update(b).digest('hex');
-   plan.configWrites.push({path:'@config/loadorder.txt',bytesBase64:bytes.toString('base64'),sha256:digest(bytes),originalHash:inputs.loadorderText===null?null:digest(Buffer.from(raw,'utf8'))});
+
+  const inputs=profile.inputs,plan=await planActivation(game,requirements,inputs,{readVerifiedHeader});
+  if(plan.status!=='ready'||!explicitFiles.length)return plan;
+
+  // Maintain the existing diagnostic mirror when editable pack plugins are required.
+  const active=new Set(plan.active.map(p=>p.toLowerCase())),raw=inputs.loadorderText??'';
+  const bom=raw.startsWith('\uFEFF')?'\uFEFF':'',newline=raw.includes('\r\n')?'\r\n':'\n';
+  const lines=raw.slice(bom.length).split(/\r?\n/);
+  const nameOf=(line:string)=>line.trim().replace(/^\*/,'').toLowerCase();
+  const observed=lines.filter(line=>active.has(nameOf(line))).map(nameOf);
+  if(!samePluginNames(observed,plan.active)){
+   const retained=lines.filter(line=>!active.has(nameOf(line)));
+   const bytes=Buffer.from(bom+plan.active.join(newline)+newline+retained.join(newline),'utf8');
+   plan.configWrites.push({path:'@config/loadorder.txt',bytesBase64:bytes.toString('base64'),sha256:sha256(bytes),
+    originalHash:inputs.loadorderText===null?null:sha256(Buffer.from(raw,'utf8'))});
   }
   return plan;
  }
+
  /** Read-only comparison against the current signed release, never just the presence of SkyUI. */
  async inspectInstallation(game:string,order:string){
-  return this.inspectBundle(game,order,await this.currentBundle());
+  try{return await this.inspectBundle(game,order,await this.currentBundle());}
+  catch(error){this.setInstalled(false);throw error;}
  }
- private async inspectBundle(game:string,order:string,bundle:AuthenticatedRelease){
+
+ private async inspectBundle(game:string,order:string,bundle:AuthenticatedRelease,expectedProfile?:PackProfile){
   await noLinks(game);
-  const missing:string[]=[],external:string[]=[];
-  const requiredFiles=bundle.manifest.files.filter(f=>f.required);
-  const matchResults=await Promise.all(requiredFiles.map(async file=>({file,ok:await this.matches(game,file)})));
-  for(const {file,ok} of matchResults)if(!ok){
-   (file.distribution==='allowed'&&file.package?missing:external).push(file.path);
+  const missing:string[]=[],external:string[]=[],inactive:string[]=[];
+  const local=new Map<string,FileImage|null>(),watched=new Map<string,string|null>();
+  const requiredFiles=bundle.manifest.files.filter(file=>file.required);
+  const observations=await Promise.all(requiredFiles.map(async file=>{
+   const destination=filePath(game,file.path);
+   const image=await observeFile(destination,Math.max(PAYLOAD_LIMIT,file.size));
+   return {file,destination,image};
+  }));
+  for(const {file,destination,image} of observations){
+   local.set(file.path.toLowerCase(),image);
+   watched.set(destination,image?.stamp??null);
+   if(!matchesImage(image,effectiveNativeRequirement(effectiveClientRequirement(file)))){
+    (file.distribution==='allowed'&&file.package?missing:external).push(file.path);
+   }
   }
-  const plugins=this.requiredActivation(bundle);
-  let text='';try{text=await fs.readFile(await safeFile(order,'plugins.txt'),'utf8');}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
-  const active=new Set(text.split(/\r?\n/).filter(l=>l.trim().startsWith('*')).map(l=>l.trim().slice(1).toLowerCase()));
-  const inactive=plugins.filter(p=>!active.has(p.toLowerCase()));
-  if(plugins.length)try{const activation=await this.activationForPlay(game,order,bundle);if(activation.status!=='ready')inactive.push('Plugin activation blocked: '+activation.blockers.join('; '));else if(activation.configWrites.length)inactive.push('Shared plugin order requires repair');}catch(e){inactive.push(e instanceof Error?e.message:'Plugin activation unavailable');}
+  if(!missing.length&&!external.length)try{
+   const profile=expectedProfile?await requireProfile(game,order,expectedProfile):await observeProfile(game,order);
+   const activation=await this.activationForPlay(game,bundle,profile,watched,local);
+   if(activation.status!=='ready')inactive.push('Plugin activation blocked: '+[...activation.blockers,...activation.manual].join('; '));
+   else if(activation.configWrites.length)inactive.push('Shared plugin order requires repair');
+   else{
+    await requireProfile(game,order,profile);
+    for(const [file,stamp] of watched)await requireStamp(file,stamp);
+   }
+  }catch(error){inactive.push(error instanceof Error?error.message:'Plugin activation unavailable');}
   this.revalidateBundle(bundle);
   const installed=!missing.length&&!external.length&&!inactive.length;
   this.update({installed,signature:'AUTHENTICATED',packId:bundle.manifest.packId,version:bundle.manifest.packVersion,release:bundle.manifest.distribution.release?.tag});
-  return{installed,missing,external,inactive};
+  return {installed,missing,external,inactive};
  }
+
  async prepareForPlay(game:string,order:string){
   if(this.preparing||this.controller)throw Error('Another pack operation is in progress');this.preparing=true;
   const cancellation=this.cancellation;
@@ -232,9 +355,8 @@ export class ProductionDownloads {
    this.checkCancellation(cancellation);
    if(before.external.length)throw Error('External dependency missing or different (cannot auto-download): '+before.external.join(', '));
    if(!before.installed){
-    const after=await this.installBundle(game,order,cancellation,bundle);
+    await this.installBundle(game,order,cancellation,bundle);
     this.checkCancellation(cancellation);
-    if(!after.installed)throw Error('Pack verification incomplete: '+[...after.missing,...after.external,...after.inactive].join(', '));
    }
    this.update({phase:'complete',installed:true,message:'Signed server pack verified. Starting Skyrim…'});
    return this.snapshot();
@@ -248,63 +370,150 @@ export class ProductionDownloads {
  async installAndActivate(gameDirectory:string,orderDirectory:string):Promise<ProductionDownloadState>{
   if(this.preparing||this.controller)throw Error('Another pack operation is in progress');
   this.preparing=true;
+  const cancellation=this.cancellation;
   try{
-   await this.installBundle(gameDirectory,orderDirectory,this.cancellation);
+   await this.installBundle(gameDirectory,orderDirectory,cancellation);
    return this.snapshot();
+  }catch(error){
+   this.update({phase:this.cancellation!==cancellation?'cancelled':'error',installed:false,
+    message:error instanceof Error?error.message:'Pack installation failed'});
+   throw error;
   }finally{this.preparing=false;}
  }
- private async installBundle(gameDirectory:string,orderDirectory:string,cancellation:number,selected?:AuthenticatedRelease){
-  if(this.disposed)throw Error('Download service disposed');
-  if(!gameDirectory)throw Error('Skyrim game folder is required');
-  if(await this.running())throw Error('Skyrim or SKSE is running; close it before installing files');
-  await noLinks(gameDirectory);checkExistingAncestors(orderDirectory);
+
+ private async backupPackFile(source:string,relative:string,expected:FileImage,limit:number){
+  const backup=filePath(path.join(this.storage,'auto-repair-backups',randomUUID()),relative);
+  await requireStamp(source,expected.stamp);
+  await safeDirectory(path.dirname(backup));
+  await fs.copyFile(source,backup,fs.constants.COPYFILE_EXCL);
+  await requireStamp(source,expected.stamp);
+  if(!matchesImage(await observeFile(backup,limit),expected))throw Error('Pack backup verification failed: '+relative);
+ }
+
+ private async requireIdle(cancellation:number){
   this.checkCancellation(cancellation);
-  const acquired=await this.acquire(async file=>!await this.matches(gameDirectory,file),selected);
+  if(await this.running())throw Error('Skyrim or SKSE is running; close it before installing files');
+  this.checkCancellation(cancellation);
+ }
+
+ private async installBundle(game:string,order:string,cancellation:number,selected?:AuthenticatedRelease){
+  if(!game)throw Error('Skyrim game folder is required');
+  await this.requireIdle(cancellation);
+  const gameIdentity=await directoryIdentity(game);
+  if(!gameIdentity)throw Error('Skyrim game folder is unavailable');
+  const directories=new Map<string,string|null>([[game,gameIdentity],[order,await directoryIdentity(order)]]);
+  const data=path.join(game,'Data'),dataIdentity=await directoryIdentity(data);
+  if(dataIdentity)directories.set(data,dataIdentity);
+  const profile=await observeProfile(game,order);
+  const local=new Map<string,FileImage|null>(),watched=new Map<string,string|null>();
+  const repairs:RepairTarget[]=[];
+  const acquired=await this.acquire(async bundle=>{
+   const wanted=new Set<string>();
+   for(const file of bundle.manifest.files){
+    this.checkCancellation(cancellation);
+    if(!file.required&&!file.package)continue;
+    const destination=filePath(game,file.path);
+    const before=await observeFile(destination,Math.max(PAYLOAD_LIMIT,file.size));
+    local.set(file.path.toLowerCase(),before);
+    watched.set(destination,before?.stamp??null);
+    if(matchesImage(before,effectiveNativeRequirement(effectiveClientRequirement(file))))continue;
+    if(file.distribution==='allowed'&&file.package){
+     repairs.push({file,destination,before});
+     wanted.add(file.package.sha256);
+    }else if(file.required)throw Error('External dependency missing or different (cannot auto-download): '+file.path);
+   }
+   return wanted;
+  },selected);
   this.checkCancellation(cancellation);
   if(!acquired)throw Error('Server files download could not be completed: '+this.state.message);
+
   const {bundle,grant}=acquired;
-  this.revalidateBundle(bundle);
-  this.update({phase:'downloading',message:'Installing verified server files & mods (SkyUI) to Skyrim…'});
-  const allowedFiles=bundle.manifest.files.filter(f=>f.distribution==='allowed'&&f.package);
-  for(const file of allowedFiles){
+  await checkRoots(grant);
+  const staged=new Map<string,StagedRepair>();
+  for(const repair of repairs){
    this.checkCancellation(cancellation);
-   if(await this.matches(gameDirectory,file))continue;
-   const payloadPath=path.join(grant.payloads,file.package!.sha256+'.bin');
-   await noLinks(payloadPath);
-   const st=await fs.stat(payloadPath);
-   if(st.size!==file.package!.size)throw Error(`Payload size mismatch for ${file.path}`);
-   const h=await hashFile(payloadPath,PAYLOAD_LIMIT);
-   if(h.sha256!==file.package!.sha256)throw Error(`Payload hash mismatch for ${file.path}`);
-   if(await this.running())throw Error('Skyrim or SKSE started during installation; close it and retry Play');
-   const destPath=path.join(gameDirectory,...relativePath(file.path).split('/'));
-   await safeDirectory(path.dirname(destPath));checkExistingAncestors(destPath);
-   try{const old=await safeFile(gameDirectory,file.path);if((await fs.lstat(old)).nlink!==1)throw Error('Hard-linked destination refused');const backup=path.join(this.storage,'auto-repair-backups',randomUUID(),...file.path.split('/'));await safeDirectory(path.dirname(backup));await fs.copyFile(old,backup,fs.constants.COPYFILE_EXCL);}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
-   const temporary=destPath+'.frostveil-'+randomUUID();
-   try{await fs.copyFile(payloadPath,temporary,fs.constants.COPYFILE_EXCL);const copy=await hashFile(temporary,PAYLOAD_LIMIT);if(copy.sha256!==file.sha256||copy.size!==file.size)throw Error('Staged file changed');if(await this.running())throw Error('Skyrim or SKSE started; installation stopped');await noLinks(gameDirectory);checkExistingAncestors(destPath);this.checkCancellation(cancellation);await fs.rename(temporary,destPath);}finally{await fs.unlink(temporary).catch(()=>{});}
-   const destHash=await hashFile(destPath,PAYLOAD_LIMIT);
-   if(destHash.sha256!==file.package!.sha256||destHash.size!==file.package!.size)throw Error(`Failed to verify installed file: ${file.path}`);
+   const {file}=repair;
+   const source=path.join(grant.payloads,file.package!.sha256+'.bin');
+   const image=await observeFile(source,PAYLOAD_LIMIT);
+   if(!image||!matchesImage(image,file))throw Error('Staged payload hash or size differs: '+file.path);
+   staged.set(file.path.toLowerCase(),{...repair,source,image});
+   watched.set(source,image.stamp);
   }
-  const pluginsToActivate=this.requiredActivation(bundle);
-  if(pluginsToActivate.length>0){
-   if(await this.running())throw Error('Skyrim or SKSE is running; plugin activation stopped');
-   const activation=await this.activationForPlay(gameDirectory,orderDirectory,bundle);
-   if(activation.status!=='ready')throw Error('Plugin activation blocked: '+activation.blockers.join('; '));
-   await safeDirectory(orderDirectory);
-   for(const write of activation.configWrites){
-    const filename=write.path==='@config/plugins.txt'?'plugins.txt':'loadorder.txt';
-    const destination=path.join(orderDirectory,filename);checkExistingAncestors(destination);
-    let observed:string|null=null;
-    try{await noLinks(destination);if((await fs.lstat(destination)).nlink!==1)throw Error('Hard-linked plugin configuration refused');observed=(await hashFile(destination,1024*1024)).sha256;}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
-    if(observed!==write.originalHash)throw Error('Plugin configuration changed during Play preparation');
-    if(observed!==null){const backup=path.join(this.storage,'auto-repair-backups',randomUUID(),filename);await safeDirectory(path.dirname(backup));await fs.copyFile(destination,backup,fs.constants.COPYFILE_EXCL);}
-    const temporary=destination+'.frostveil-'+randomUUID();
-    try{await fs.writeFile(temporary,Buffer.from(write.bytesBase64,'base64'),{flag:'wx'});checkExistingAncestors(destination);if(await this.running())throw Error('Skyrim or SKSE started; activation stopped');this.checkCancellation(cancellation);await fs.rename(temporary,destination);}finally{await fs.unlink(temporary).catch(()=>{});}
+  const activation=await this.activationForPlay(game,bundle,profile,watched,local,staged);
+  if(activation.status!=='ready')
+   throw Error('Plugin activation blocked: '+[...activation.blockers,...activation.manual].join('; '));
+
+  let writesStarted=false;
+  const beforeWrite=async()=>{
+   await this.requireIdle(cancellation);
+   if(!writesStarted){
+    // All staged inputs and the signed projection must survive the final
+    // progress and idle callbacks before the first pack target or backup write.
+    await checkRoots(grant);
+    await requireProfile(game,order,profile);
+    for(const [file,stamp] of watched)await requireStamp(file,stamp);
+    this.revalidateBundle(bundle);
+    writesStarted=true;
    }
+   await requireDirectories(directories);
+   this.checkCancellation(cancellation);
+  };
+  this.update({phase:'downloading',message:'Installing verified server files & mods (SkyUI) to Skyrim…'});
+  for(const {file,destination,before,source,image} of staged.values()){
+   await beforeWrite();
+   await requireStamp(destination,before?.stamp??null);
+   await requireStamp(source,image.stamp);
+   if(before)await this.backupPackFile(destination,file.path,before,Math.max(PAYLOAD_LIMIT,before.size));
+   await safeDirectory(path.dirname(destination));
+   const temporary=destination+'.frostveil-'+randomUUID();
+   try{
+    await fs.copyFile(source,temporary,fs.constants.COPYFILE_EXCL);
+    if(!matchesImage(await observeFile(temporary,PAYLOAD_LIMIT),file))throw Error('Staged file changed: '+file.path);
+    await requireStamp(source,image.stamp);
+    await this.requireIdle(cancellation);
+    await requireDirectories(directories);
+    await requireStamp(destination,before?.stamp??null);
+    this.checkCancellation(cancellation);
+    await fs.rename(temporary,destination);
+   }finally{await fs.unlink(temporary).catch(()=>{});}
+   const installed=await observeFile(destination,PAYLOAD_LIMIT);
+   if(!installed||!matchesImage(installed,file))throw Error('Failed to verify installed file: '+file.path);
+   watched.set(destination,installed.stamp);
   }
-  const verification=await this.inspectBundle(gameDirectory,orderDirectory,bundle);
+
+  await requireProfile(game,order,profile);
+  for(const write of activation.configWrites){
+   await beforeWrite();
+   const filename=write.path==='@config/plugins.txt'?'plugins.txt':'loadorder.txt';
+   const destination=path.join(order,filename),before=profile.files.get(destination)??null;
+   if((before?.sha256??null)!==write.originalHash)throw Error('Plugin configuration plan does not match its preimage');
+   await requireStamp(destination,before?.stamp??null);
+   if(before)await this.backupPackFile(destination,filename,before,profileLimit);
+   await safeDirectory(order);
+   if(directories.get(order)===null)directories.set(order,await directoryIdentity(order));
+   const temporary=destination+'.frostveil-'+randomUUID();
+   const bytes=Buffer.from(write.bytesBase64,'base64');
+   try{
+    await fs.writeFile(temporary,bytes,{flag:'wx'});
+    await this.requireIdle(cancellation);
+    await requireDirectories(directories);
+    await requireStamp(destination,before?.stamp??null);
+    this.checkCancellation(cancellation);
+    await fs.rename(temporary,destination);
+   }finally{await fs.unlink(temporary).catch(()=>{});}
+   const installed=await observeFile(destination,profileLimit);
+   if(!installed||!matchesImage(installed,{size:bytes.length,sha256:write.sha256}))
+    throw Error('Failed to verify plugin configuration: '+filename);
+   profile.files.set(destination,installed);
+  }
+
+  await requireDirectories(directories);
+  for(const [file,stamp] of watched)await requireStamp(file,stamp);
+  const verification=await this.inspectBundle(game,order,bundle,profile);
   this.checkCancellation(cancellation);
-  this.update({phase:'complete',installed:verification.installed,message:verification.installed?'Signed server pack installed and verified. Ready to play.':'Server assets installed; unresolved requirements: '+[...verification.missing,...verification.external,...verification.inactive].join(', ')});
-  return verification;
+  if(!verification.installed)
+   throw Error('Pack verification incomplete: '+[...verification.missing,...verification.external,...verification.inactive].join(', '));
+  this.update({phase:'complete',installed:true,message:'Signed server pack installed and verified. Ready to play.'});
  }
  /** Trusted Main supplies an authenticated reference and an existing target capability. */
  async stage(target:SandboxGrant,ref:PackageReference,signal?:AbortSignal){

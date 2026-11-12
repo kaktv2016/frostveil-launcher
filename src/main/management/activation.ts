@@ -47,7 +47,7 @@ function checkedHeader(raw:unknown):ActivationHeader{
  const seen=new Set<string>();for(const m of h.masters){pluginName(m);if(seen.has(key(m)))throw Error('Duplicate plugin master');seen.add(key(m));}
  return{master:h.master,light:h.light,masters:[...h.masters]};
 }
-export async function planActivation(game:string,requirements:PluginRequirement[],inputs:OrderInputs,options:{pendingHeaders?:Record<string,unknown>;deactivate?:string[]}={}):Promise<ActivationPlan>{
+export async function planActivation(game:string,requirements:PluginRequirement[],inputs:OrderInputs,options:{pendingHeaders?:Record<string,unknown>;deactivate?:string[];readVerifiedHeader?:(filename:string)=>Promise<ActivationHeader>}={}):Promise<ActivationPlan>{
  const plan:ActivationPlan={status:'ready',blockers:[],manual:[],active:[],order:[],configWrites:[]};
  if(inputs.managed){plan.status='manual';plan.manual.push('MO2/Vortex, virtualization, deployment or the effective profile cannot be established. Use the mod manager to apply and verify this plan.');return plan;}
  try{
@@ -68,6 +68,12 @@ export async function planActivation(game:string,requirements:PluginRequirement[
   const headers=new Map<string,ActivationHeader>(),names=new Map<string,string>(),implicit:string[]=[];
   const pending=new Map(Object.entries(options.pendingHeaders??{}).map(([n,h])=>[key(n),h]));
   async function header(name:string,allowPending:boolean){
+   // The normal pack phase supplies the verified projected bytes for every
+   // inspected slot, including implicit and already enabled optional plugins.
+   if(options.readVerifiedHeader){
+    const previous=headers.get(key(name));if(previous)return previous;
+    const h=checkedHeader(await options.readVerifiedHeader(name));headers.set(key(name),h);names.set(key(name),name);return h;
+   }
    if(allowPending&&pending.has(key(name))){const h=checkedHeader(pending.get(key(name)));headers.set(key(name),h);names.set(key(name),name);return h;}
    if(headers.has(key(name)))return headers.get(key(name))!;
    let h:ActivationHeader;
@@ -127,6 +133,7 @@ export async function planActivation(game:string,requirements:PluginRequirement[
   for(const line of kept){if(line.name)for(const insertion of inserts.get(key(line.name))??[])text+=insertion.raw+insertion.end;text+=line.raw+line.end;}
   if(tail.length){if(text&&!text.endsWith('\n')&&text!==activation.bom)text+=activation.newline;for(const line of tail)text+=line.raw+line.end;}
   const bytes=Buffer.from(text,'utf8');
+  if(options.readVerifiedHeader&&text===(inputs.pluginsText??''))throw Error('Projected plugin order cannot be represented by the current activation profile');
   if(text!==(inputs.pluginsText??''))plan.configWrites.push({path:'@config/plugins.txt',bytesBase64:bytes.toString('base64'),sha256:digest(bytes),originalHash:inputs.pluginsText===null?null:digest(Buffer.from(inputs.pluginsText,'utf8'))});
  }catch(error){plan.status='blocked';plan.blockers.push(error instanceof Error?error.message:'Plugin activation could not be verified');plan.configWrites=[];}
  return plan;
