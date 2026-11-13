@@ -1,25 +1,66 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {randomUUID,createHash} from 'node:crypto';
+import type {BigIntStats} from 'node:fs';
 import {checkManagedRoots,isManagedTarget} from '../installer/managed-target';
 import {MetadataStore} from '../installer/metadata';
-import {relativePath,safeDirectory,safeFile,hashFile,checkExistingAncestors,contained} from '../files';
-import type {SandboxGrant} from '../installer/sandbox';
+import {relativePath,safeDirectory,safeFile,hashFile,checkExistingAncestors,contained,noLinks} from '../files';
+import {checkRoots,type SandboxGrant} from '../installer/sandbox';
 import {assertRuntimeCohort,runtimePath,managedRuntimePath,type RuntimeCohort} from './policy';
 import {planCreationIsolation,type Isolation} from './creations';
 
 interface Image {size:number;sha256:string;}
-interface Change {path:string;before:Image|null;after:Image|null;kind?:'modpack';intermediate?:Image|null;}
-interface Journal {schemaVersion:1;installationId:string;policyHash:string;steamStamp?:string;state:'prepared'|'applying'|'active'|'modpack'|'restoring'|'restored';files:Change[];}
-interface Options {freeBytes?:(root:string)=>Promise<number>;checkpoint?:(stage:string)=>Promise<void>;iniDirectories?:readonly string[];steamStamp?:string;}
+interface ObservedImage extends Image {stamp:string;}
+interface Change {
+ path:string;before:Image|null;after:Image|null;kind?:'modpack';intermediate?:Image|null;writer?:string;
+}
+interface DirectoryRecord {path:string;identity:string|null;owned:boolean;}
+interface TransientCopy {path:string;name:string;direction:'apply'|'restore';identity:string|null;}
+interface WholePlayRecord {cohortId:string;directories:DirectoryRecord[];transient?:TransientCopy;}
+interface Journal {
+ schemaVersion:1|2;installationId:string;policyHash:string;steamStamp?:string;
+ state:'prepared'|'applying'|'active'|'modpack'|'restoring'|'restored';files:Change[];wholePlay?:WholePlayRecord;
+}
+export interface WholePlayWrite extends Image {
+ path:string;source:string;sourceGrant?:SandboxGrant;writer?:string;
+}
+export interface WholePlayPlanning {
+ policy:Readonly<RuntimeCohort>;signal:AbortSignal;
+ projectedFile:(relative:string)=>Promise<string|null>;isRuntimeRemoval?:(relative:string)=>boolean;
+}
+export interface WholePlayPlan {
+ cohortId:string;writes:readonly WholePlayWrite[];
+ revalidate:()=>Promise<void>;verifyInstalled:()=>Promise<void>;
+}
+export type WholePlayPlanner=(planning:WholePlayPlanning)=>Promise<WholePlayPlan>;
+export type WholePlayCheckpoint='before-preimages-commit'|'after-preimages-commit'|'before-target-write'|'after-target-temp-staged'|'after-target-write'|'before-ready';
+interface Options {
+ freeBytes?:(root:string)=>Promise<number>;checkpoint?:(stage:string)=>Promise<void>;
+ iniDirectories?:readonly string[];steamStamp?:string;wholePlayStorage?:string;
+ wholePlayCheckpoint?:(stage:WholePlayCheckpoint,path?:string,writer?:string)=>Promise<void>;
+}
+interface Intent {
+ path:string;after:Image|null;writer:string;source?:string;sourceGrant?:SandboxGrant;managed?:boolean;
+}
 const journal='runtime-preparation/journal.json',limit=8*1024**3;
 const digest=(bytes:Buffer)=>createHash('sha256').update(bytes).digest('hex');
 const same=(a:Image|null,b:Image|null)=>a===null?b===null:b!==null&&a.size===b.size&&a.sha256===b.sha256;
 const hash=/^[a-f0-9]{64}$/;
+const writerName=/^[a-z][a-z0-9-]{0,31}$/;
+const transientName=/^\.frostveil-runtime-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
+const filesystemIdentity=/^[0-9]+:[0-9]+$/;
+const onlyImage=(image:Image|null):Image|null=>image&&{size:image.size,sha256:image.sha256};
+const validImage=(image:Image|null)=>image!==null&&!!image&&typeof image.sha256==='string'&&hash.test(image.sha256)&&Number.isSafeInteger(image.size)&&image.size>=0&&image.size<=limit;
+const fileStamp=(stat:{dev:bigint;ino:bigint;size:bigint;mtimeNs:bigint;ctimeNs:bigint})=>
+ [stat.dev,stat.ino,stat.size,stat.mtimeNs,stat.ctimeNs].join(':');
 // Cache only cryptographic observations tied to filesystem identity + both
 // nanosecond timestamps. Every access still checks roots/links/file metadata;
 // replacements and same-size edits invalidate it. No extra disk ledger writes.
 const observations=new Map<string,{stamp:string;image:Image}>();
+function cacheObservation(key:string,stamp:string,image:Image){
+ if(observations.size>=30000)observations.delete(observations.keys().next().value!);
+ observations.set(key,{stamp,image});
+}
 
 /** Separate capability from mod-content writes. No executable path comes from IPC. */
 export class RuntimeTransaction {
@@ -44,18 +85,128 @@ export class RuntimeTransaction {
   if(!config&&rel!=='Skyrim.ccc'&&rel!=='SkyrimReservedAddOnIndexes.txt'&&!this.managedPaths.has(rel)&&!/^Data\/cc[A-Za-z0-9_-]+(?: - [A-Za-z0-9 _-]+)?\.(?:esm|esp|esl|bsa)$/i.test(rel))runtimePath(rel);
   const file=path.join(root,...rel.split('/'));checkExistingAncestors(file);return file;
  }
- private async image(raw:string):Promise<Image|null>{
-  const file=this.target(raw);
-  try{const before=await fs.lstat(file,{bigint:true});if(!before.isFile()||before.nlink!==1n)throw Error('Unsafe runtime target');
-   const key=this.grant.id+':'+raw,stamp=[before.dev,before.ino,before.size,before.mtimeNs,before.ctimeNs].join(':');const cached=observations.get(key);if(cached?.stamp===stamp)return cached.image;
-   const h=await hashFile(file,limit);const after=await fs.lstat(file,{bigint:true});
-   if(before.ino!==after.ino||before.dev!==after.dev||before.mtimeNs!==after.mtimeNs||before.ctimeNs!==after.ctimeNs)throw Error('Runtime file changed during inspection');if(observations.size>=30000)observations.delete(observations.keys().next().value!);observations.set(key,{stamp,image:h});return h;
-  }catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return null;throw e;}
+ private directoryPath(relative:string){
+  const directory=path.join(this.grant.installation,...relativePath(relative).split('/'));
+  checkExistingAncestors(directory);
+  return directory;
  }
+ private directoryAncestors(relative:string){
+  if(relative.startsWith('@config/'))return [];
+  const parts=relativePath(relative).split('/').slice(0,-1);
+  return parts.map((_,index)=>parts.slice(0,index+1).join('/')).filter(folder=>folder.toLowerCase()!=='data');
+ }
+ private async directoryIdentity(relative:string){
+  const directory=this.directoryPath(relative);
+  try{
+   const stat=await fs.lstat(directory,{bigint:true});
+   if(!stat.isDirectory()||stat.isSymbolicLink())throw Error('Unsafe whole-Play directory: '+relative);
+   return stat.dev+':'+stat.ino;
+  }catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error;}
+ }
+ private async planDirectories(files:readonly Change[],previous:readonly DirectoryRecord[]){
+  const records=new Map(previous.map(dir=>[dir.path.toLowerCase(),{...dir}]));
+  for(const change of files){
+   for(const relative of this.directoryAncestors(change.path)){
+    const key=relative.toLowerCase();
+    if(records.has(key))continue;
+    const identity=await this.directoryIdentity(relative);
+    records.set(key,{path:relative,identity,owned:identity===null});
+   }
+  }
+  return [...records.values()].sort((a,b)=>a.path.split('/').length-b.path.split('/').length);
+ }
+ private async checkDirectory(dir:DirectoryRecord){
+  if(await this.directoryIdentity(dir.path)!==dir.identity)throw Error('Whole-Play directory identity conflict: '+dir.path);
+ }
+ private async ensureDirectories(j:Journal){
+  for(const dir of j.wholePlay!.directories){
+   await this.guard();
+   await this.checkDirectory(dir);
+   if(dir.identity!==null)continue;
+   const directory=this.directoryPath(dir.path);
+   await noLinks(path.dirname(directory));
+   await fs.mkdir(directory);
+   dir.identity=await this.directoryIdentity(dir.path);
+   if(dir.identity===null)throw Error('Whole-Play directory disappeared after creation: '+dir.path);
+   await this.store.write(journal,j);
+  }
+ }
+ private async guardParents(directories:ReadonlyMap<string,DirectoryRecord>,relative:string){
+  for(const parent of this.directoryAncestors(relative)){
+   const dir=directories.get(parent.toLowerCase());
+   if(!dir)throw Error('Unrecorded whole-Play directory: '+parent);
+   await this.checkDirectory(dir);
+  }
+  await noLinks(path.dirname(this.target(relative)));
+ }
+ private async removeOwnedDirectories(j:Journal){
+  for(const dir of [...(j.wholePlay?.directories??[])].reverse()){
+   if(!dir.owned||dir.identity===null)continue;
+   await this.guard();
+   if(await this.directoryIdentity(dir.path)!==dir.identity)continue;
+   try{await fs.rmdir(this.directoryPath(dir.path));}
+   catch(error){if(!['ENOENT','ENOTEMPTY','EEXIST'].includes((error as NodeJS.ErrnoException).code??''))throw error;}
+  }
+ }
+ private async snapshot(raw:string):Promise<ObservedImage|null>{
+  const file=this.target(raw);
+  try{
+   const before=await fs.lstat(file,{bigint:true});
+   if(!before.isFile()||before.nlink!==1n)throw Error('Unsafe runtime target: '+raw);
+   const key=this.grant.id+':'+raw.toLowerCase(),stamp=fileStamp(before),cached=observations.get(key);
+   if(cached?.stamp===stamp)return {...cached.image,stamp};
+   const image=await hashFile(file,limit),after=await fs.lstat(file,{bigint:true});
+   if(after.nlink!==1n||fileStamp(after)!==stamp)throw Error('Runtime file changed during inspection: '+raw);
+   cacheObservation(key,stamp,image);
+   return {...image,stamp};
+  }catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error;}
+ }
+ private async image(raw:string):Promise<Image|null>{return onlyImage(await this.snapshot(raw));}
  private async current():Promise<Journal|null>{
   let j:Journal;try{j=await this.store.read(journal) as Journal;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return null;throw e;}
-  if(j.schemaVersion!==1||j.installationId!==this.grant.id||!hash.test(j.policyHash)||j.steamStamp!==undefined&&!hash.test(j.steamStamp)||!['prepared','applying','active','modpack','restoring','restored'].includes(j.state)||!Array.isArray(j.files)||j.files.length>26000)throw Error('Invalid runtime recovery journal');
-  const names=new Set<string>();for(const f of j.files){if(f.kind==='modpack'&&!f.path.startsWith('@config/'))this.managedPaths.add(managedRuntimePath(f.path));this.target(f.path);if(names.has(f.path.toLowerCase()))throw Error('Duplicate runtime journal target');names.add(f.path.toLowerCase());for(const v of [f.before,f.after,...(f.intermediate===undefined?[]:[f.intermediate])])if(v!==null&&(!v||!hash.test(v.sha256)||!Number.isSafeInteger(v.size)||v.size<0||v.size>limit))throw Error('Invalid runtime journal image');}
+  if(![1,2].includes(j.schemaVersion)||j.installationId!==this.grant.id||!hash.test(j.policyHash)||
+     j.steamStamp!==undefined&&!hash.test(j.steamStamp)||!['prepared','applying','active','modpack','restoring','restored'].includes(j.state)||
+     !Array.isArray(j.files)||j.files.length>26000)throw Error('Invalid runtime recovery journal');
+  if(j.schemaVersion===2){
+   if(!j.wholePlay||!hash.test(j.wholePlay.cohortId)||!Array.isArray(j.wholePlay.directories)||j.wholePlay.directories.length>26000||
+      j.state==='modpack')throw Error('Invalid whole-Play recovery journal');
+   const directories=new Set<string>();
+   for(const dir of j.wholePlay.directories){
+    if(!dir||this.directoryPath(dir.path)===this.grant.installation||typeof dir.owned!=='boolean'||
+       (dir.identity===null?!dir.owned:!filesystemIdentity.test(dir.identity))||
+       directories.has(dir.path.toLowerCase()))throw Error('Invalid whole-Play recovery directory');
+    directories.add(dir.path.toLowerCase());
+   }
+  }else if(j.wholePlay!==undefined)throw Error('Invalid legacy runtime recovery journal');
+  const names=new Set<string>();
+  for(const f of j.files){
+   if(!f||typeof f.path!=='string'||j.schemaVersion===2&&
+      (typeof f.writer!=='string'||!writerName.test(f.writer)||f.kind!==undefined&&f.kind!=='modpack')){
+    throw Error('Invalid runtime journal target');
+   }
+   if(f.kind==='modpack'&&!f.path.startsWith('@config/'))this.managedPaths.add(managedRuntimePath(f.path));
+   this.target(f.path);
+   if(names.has(f.path.toLowerCase()))throw Error('Duplicate runtime journal target');
+   names.add(f.path.toLowerCase());
+   for(const image of [f.before,f.after,...(f.intermediate===undefined?[]:[f.intermediate])]){
+    if(image!==null&&!validImage(image))throw Error('Invalid runtime journal image');
+   }
+  }
+  if(j.wholePlay){
+   const used=new Set<string>();
+   for(const f of j.files){
+    for(const parent of this.directoryAncestors(f.path))used.add(parent.toLowerCase());
+   }
+   if(j.wholePlay.directories.some(dir=>!used.has(dir.path.toLowerCase())))throw Error('Unrelated whole-Play recovery directory');
+   const transient=j.wholePlay.transient;
+   if(transient!==undefined){
+    if(!transient||typeof transient.path!=='string'||typeof transient.name!=='string'||!transientName.test(transient.name)||
+       transient.identity!==null&&(typeof transient.identity!=='string'||!filesystemIdentity.test(transient.identity))||
+       (j.state!=='applying'&&j.state!=='restoring')||
+       transient.direction!==(j.state==='restoring'?'restore':'apply'))throw Error('Invalid whole-Play transient copy');
+    this.transientTarget(j,transient);
+   }
+  }
   return j;
  }
  private blob(kind:'runtime-backups'|'runtime-staging',sha256:string){if(!hash.test(sha256))throw Error('Invalid blob identity');return path.join(this.grant.payloads,kind,sha256);}
@@ -65,19 +216,159 @@ export class RuntimeTransaction {
   const temp=file+'.'+randomUUID();await fs.copyFile(source,temp,fs.constants.COPYFILE_EXCL);
   try{if(!same(await hashFile(temp,limit),want))throw Error('Runtime payload hash mismatch');const handle=await fs.open(temp,'r+');try{await handle.sync();}finally{await handle.close();}await this.guard();await fs.rename(temp,file);}finally{await fs.unlink(temp).catch(e=>{if(e.code!=='ENOENT')throw e;});}
  }
- private async replace(change:Change,want:Image|null,expected:Image|null,kind:'runtime-backups'|'runtime-staging'){
-  await this.guard();if(!same(await this.image(change.path),expected))throw Error('Runtime preimage conflict: '+change.path);
-  const file=this.target(change.path);if(want===null){if(expected!==null)await fs.unlink(file);return;}
-  const blob=await safeFile(this.grant.payloads,kind+'/'+want.sha256);if((await fs.stat(blob)).nlink!==1||!same(await hashFile(blob,limit),want))throw Error('Recovery blob integrity failure');
-  await safeDirectory(path.dirname(file));const temp=path.join(path.dirname(file),'.frostveil-runtime-'+randomUUID());
+ private async verifiedBlob(kind:'runtime-backups'|'runtime-staging',image:Image){
+  try{
+   const blob=await safeFile(this.grant.payloads,kind+'/'+image.sha256);
+   const before=await fs.lstat(blob,{bigint:true}),stamp=fileStamp(before),key=this.grant.id+':'+kind+':'+image.sha256;
+   if(!before.isFile()||before.nlink!==1n)throw Error('Unsafe recovery file');
+   const cached=observations.get(key);
+   if(cached?.stamp===stamp&&same(cached.image,image))return blob;
+   if(!same(await hashFile(blob,limit),image))throw Error('Unexpected recovery bytes');
+   const after=await fs.lstat(blob,{bigint:true});
+   if(after.nlink!==1n||stamp!==fileStamp(after))throw Error('Recovery blob changed during verification');
+   cacheObservation(key,stamp,image);
+   return blob;
+  }catch(error){throw Error('Recovery blob integrity failure: '+kind+'/'+image.sha256,{cause:error});}
+ }
+ private async replace(
+  change:Change,want:Image|null,expected:Image|null,kind:'runtime-backups'|'runtime-staging',
+  fence?:()=>Promise<void>,wholePlay?:Journal
+ ){
+  const recheck=async()=>{
+   await this.guard();await fence?.();
+   if(!same(await this.image(change.path),expected))throw Error('Runtime preimage conflict: '+change.path);
+  };
+  await recheck();
+  const file=this.target(change.path);
+  if(want===null){if(expected!==null)await fs.unlink(file);return;}
+  const blob=await this.verifiedBlob(kind,want);
+  if(!wholePlay)await safeDirectory(path.dirname(file));
+  await recheck();
+  if(wholePlay){await this.replaceWholePlay(wholePlay,change,blob,want,recheck);return;}
+  const temp=path.join(path.dirname(file),'.frostveil-runtime-'+randomUUID());
   await fs.copyFile(blob,temp,fs.constants.COPYFILE_EXCL);
-  try{const handle=await fs.open(temp,'r+');try{await handle.sync();}finally{await handle.close();}
-   await this.guard();if(!same(await this.image(change.path),expected))throw Error('Runtime preimage conflict: '+change.path);await fs.rename(temp,file);
+  try{
+   if(!same(await hashFile(temp,limit),want))throw Error('Recovery copy integrity failure');
+   const handle=await fs.open(temp,'r+');
+   try{await handle.sync();}finally{await handle.close();}
+   await recheck();
+   await fs.rename(temp,file);
   }finally{await fs.unlink(temp).catch(e=>{if(e.code!=='ENOENT')throw e;});}
  }
- private async planned(){
+ private transientTarget(j:Journal,transient:TransientCopy){
+  const change=j.files.find(file=>file.path===transient.path);
+  const image=transient.direction==='apply'?change?.after:change?.before;
+  if(!image)throw Error('Transient copy has no authorized journal image');
+  const target=this.target(transient.path),file=path.join(path.dirname(target),transient.name);
+  const relative=(transient.path.startsWith('@config/')?'@config/':'')+
+   path.relative(this.destination(transient.path).root,file).split(path.sep).join('/');
+  if(j.files.some(entry=>entry.path.toLowerCase()===relative.toLowerCase()))throw Error('Transient copy overlaps a planned target');
+  return{target,file,relative,image};
+ }
+ private async replaceWholePlay(j:Journal,change:Change,blob:string,want:Image,recheck:()=>Promise<void>){
+  const transient:TransientCopy={
+   path:change.path,name:'.frostveil-runtime-'+randomUUID(),direction:j.state==='restoring'?'restore':'apply',identity:null,
+  };
+  const {target,file}=this.transientTarget(j,transient);
+  j.wholePlay!.transient=transient;
+  await this.store.write(journal,j);
+  await recheck();
+  const handle=await fs.open(file,'wx',0o600);
+  let stamp:string;
+  try{
+   const stat=await handle.stat({bigint:true});
+   if(!stat.isFile()||stat.nlink!==1n||stat.size!==0n)throw Error('Unsafe reserved whole-Play transient copy');
+   transient.identity=stat.dev+':'+stat.ino;
+   await this.store.write(journal,j);
+   await this.requireTransientStamp(file,fileStamp(stat));
+   await recheck();
+   const source=await fs.open(blob,'r');
+   try{
+    const buffer=Buffer.alloc(1024*1024);
+    for(let offset=0;offset<want.size;){
+     const length=Math.min(buffer.length,want.size-offset);
+     const {bytesRead}=await source.read(buffer,0,length,offset);
+     if(bytesRead!==length)throw Error('Whole-Play transient source truncated');
+     for(let written=0;written<length;){
+      const {bytesWritten}=await handle.write(buffer,written,length-written,offset+written);
+      if(!bytesWritten)throw Error('Whole-Play transient copy stopped');
+      written+=bytesWritten;
+     }
+     offset+=length;
+    }
+   }
+   finally{await source.close();}
+   await handle.sync();
+   stamp=fileStamp(await handle.stat({bigint:true}));
+  }finally{await handle.close();}
+  await this.requireTransientStamp(file,stamp);
+  if(!same(await hashFile(file,want.size),want))throw Error('Recovery copy integrity failure');
+  await this.options.wholePlayCheckpoint?.('after-target-temp-staged',change.path,change.writer);
+  await recheck();
+  await this.requireTransientStamp(file,stamp);
+  await fs.rename(file,target);
+  // If interrupted, the persisted reservation now points to an absent file.
+  // The next reservation or terminal state write clears it durably.
+  delete j.wholePlay!.transient;
+ }
+ private async requireTransientStamp(file:string,stamp:string){
+  await noLinks(file);
+  const stat=await fs.lstat(file,{bigint:true});
+  if(!stat.isFile()||stat.nlink!==1n||fileStamp(stat)!==stamp)throw Error('Whole-Play transient copy changed');
+ }
+ private async preflightTransient(j:Journal){
+  const transient=j.wholePlay?.transient;
+  if(!transient)return null;
+  const {file,relative,image}=this.transientTarget(j,transient);
+  let stat:BigIntStats;
+  try{stat=await fs.lstat(file,{bigint:true});}
+  catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error;}
+  const stamp=fileStamp(stat);
+  await this.requireTransientStamp(file,stamp);
+  if(transient.identity===null)throw Error('Unowned whole-Play transient reservation. Retain the file for recovery review: '+transient.name);
+  if(stat.dev+':'+stat.ino!==transient.identity||stat.size>BigInt(image.size))throw Error('Whole-Play transient copy identity or size conflicts');
+  const source=await this.verifiedBlob(transient.direction==='apply'?'runtime-staging':'runtime-backups',image);
+  const before=await fs.lstat(source,{bigint:true});
+  const candidate=await fs.open(file,'r');
+  try{
+   if(fileStamp(await candidate.stat({bigint:true}))!==stamp)throw Error('Whole-Play transient copy changed');
+   const expected=await fs.open(source,'r');
+   try{
+    if(fileStamp(await expected.stat({bigint:true}))!==fileStamp(before))throw Error('Whole-Play transient source changed');
+    const actualBytes=Buffer.alloc(64*1024),expectedBytes=Buffer.alloc(actualBytes.length);
+    for(let offset=0;offset<Number(stat.size);){
+     const length=Math.min(actualBytes.length,Number(stat.size)-offset);
+     const a=await candidate.read(actualBytes,0,length,offset),b=await expected.read(expectedBytes,0,length,offset);
+     if(a.bytesRead!==length||b.bytesRead!==length||!actualBytes.subarray(0,length).equals(expectedBytes.subarray(0,length)))throw Error('Unexpected whole-Play transient bytes');
+     offset+=length;
+    }
+   }finally{await expected.close();}
+  }finally{await candidate.close();}
+  await this.requireTransientStamp(source,fileStamp(before));
+  await this.requireTransientStamp(file,stamp);
+  return{relative,stamp};
+ }
+ private async clearTransient(j:Journal,observed:Awaited<ReturnType<RuntimeTransaction['preflightTransient']>>){
+  if(!j.wholePlay?.transient)return;
+  const {path:relative}=j.wholePlay.transient;
+  const {file}=this.transientTarget(j,j.wholePlay.transient);
+  if(observed){
+   const parents=new Map(j.wholePlay.directories.map(dir=>[dir.path.toLowerCase(),dir]));
+   await this.guardParents(parents,relative);
+   await this.requireTransientStamp(file,observed.stamp);
+   await fs.unlink(file);
+  }else{
+   try{await fs.lstat(file);throw Error('Whole-Play transient appeared after recovery preflight');}
+   catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+  }
+  delete j.wholePlay.transient;
+ }
+ private async planned(previousWholePlay?:Journal,verifiedTransient?:string){
   if(!this.policy)throw Error('Signed runtime policy required for preparation');assertRuntimeCohort(this.policy,this.grant.targetClass==='managed-fixture');
-  const isolation=await planCreationIsolation(this.grant,this.policy.creations,[...this.policy.files.map(f=>f.path),...this.policy.managedFiles.map(f=>f.path)],this.options.iniDirectories);
+  const extra=previousWholePlay?.files.filter(f=>f.kind==='modpack'&&!f.path.startsWith('@config/')).map(f=>f.path)??[];
+  const approved=[...this.policy.files.map(f=>f.path),...this.policy.managedFiles.map(f=>f.path),...extra];
+  if(verifiedTransient&&!verifiedTransient.startsWith('@config/'))approved.push(verifiedTransient);
+  const isolation=await planCreationIsolation(this.grant,this.policy.creations,approved,this.options.iniDirectories);
   const files:Change[]=[];
   for(const f of this.policy.files){const before=await this.image(f.path),after={size:f.size,sha256:f.sha256};if(!same(before,after))files.push({path:f.path,before,after});}
   for(const f of isolation.writes){const before=await this.image(f.path),after={size:f.bytes.length,sha256:digest(f.bytes)};if(!same(before,after))files.push({path:f.path,before,after});}
@@ -85,6 +376,12 @@ export class RuntimeTransaction {
   return{files,isolation};
  }
  async history(){const j=await this.current();return{canRestore:!!j&&j.state!=='restored',recoveryRequired:!!j&&!['active','restored'].includes(j.state)};}
+ async assertStandaloneWriteAllowed(){
+  const current=await this.current();
+  if(current?.schemaVersion===2&&current.state!=='restored'){
+   throw Error('Restore the existing whole-Play recovery journal before a standalone write');
+  }
+ }
  async neededPayloads(){
   if(!this.policy)throw Error('Signed runtime policy required');const needed:string[]=[];
   for(const f of this.policy.files){if(same(await this.image(f.path),{size:f.size,sha256:f.sha256}))continue;
@@ -104,10 +401,334 @@ export class RuntimeTransaction {
    if(!same(await hashFile(file,limit),want)||(await fs.stat(file)).nlink!==1)throw Error('Acquisition cache changed; retained for review');await fs.unlink(file);
   }
  }
- async inspect(){await checkManagedRoots(this.grant);const {files}=await this.planned(),j=await this.current();return{changedFiles:files.length,backupBytes:files.reduce((n,f)=>n+(f.before?.size??0),0),downloadBytes:files.filter(f=>!f.path.startsWith('@')&&f.path!=='Skyrim.ccc'&&f.after!==null).reduce((n,f)=>n+(f.after?.size??0),0),stagingBytes:files.reduce((n,f)=>n+(f.after?.size??0),0),canRestore:!!j&&j.state!=='restored',recoveryRequired:!!j&&!['active','restored'].includes(j.state)};}
+ async inspect(){
+  await checkManagedRoots(this.grant);
+  const j=await this.current(),{files}=await this.planned(j?.wholePlay&&j.state!=='restored'?j:undefined);
+  return{changedFiles:files.length,backupBytes:files.reduce((n,f)=>n+(f.before?.size??0),0),downloadBytes:files.filter(f=>!f.path.startsWith('@')&&f.path!=='Skyrim.ccc'&&f.after!==null).reduce((n,f)=>n+(f.after?.size??0),0),stagingBytes:files.reduce((n,f)=>n+(f.after?.size??0),0),canRestore:!!j&&j.state!=='restored',recoveryRequired:!!j&&!['active','restored'].includes(j.state)};
+ }
+ private async stageBytes(bytes:Buffer,after:Image){
+  const scratch=path.join(this.grant.payloads,'runtime-profile-'+randomUUID());
+  await fs.writeFile(scratch,bytes,{flag:'wx'});
+  try{await this.save('runtime-staging',scratch,after);}
+  finally{await fs.unlink(scratch);}
+  return this.verifiedBlob('runtime-staging',after);
+ }
+ private async stageRuntimeFile(file:RuntimeCohort['files'][number],sourceRoot?:string){
+  const after={size:file.size,sha256:file.sha256};
+  const blob=this.blob('runtime-staging',after.sha256);
+  try{await fs.lstat(blob);return this.verifiedBlob('runtime-staging',after);}
+  catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+  if(!sourceRoot)throw Error('Missing verified runtime source: '+file.path);
+  let source:string;
+  try{source=await safeFile(sourceRoot,file.path);}
+  catch(error){
+   if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;
+   source=await safeFile(sourceRoot,file.depot+'/'+file.path);
+  }
+  if((await fs.lstat(source)).nlink!==1)throw Error('Hard-linked runtime source: '+file.path);
+  await this.save('runtime-staging',source,after);
+  return this.verifiedBlob('runtime-staging',after);
+ }
+ private async runtimeIntents(
+  policy:Readonly<RuntimeCohort>,previous:Journal|null,
+  capture:(relative:string)=>Promise<ObservedImage|null>,
+  acquire:(needed:readonly string[])=>Promise<string>,signal:AbortSignal,verifiedTransient?:string
+ ){
+  const {files,isolation}=await this.planned(previous?.wholePlay&&previous.state!=='restored'?previous:undefined,verifiedTransient);
+  for(const change of files){
+   if(!same(await capture(change.path),change.before))throw Error('Runtime preimage changed during planning: '+change.path);
+  }
+  const intents=new Map<string,Intent>();
+  const needed=await this.neededPayloads(),sourceRoot=needed.length?await acquire(needed):undefined;
+  for(const file of policy.files){
+   signal.throwIfAborted();
+   const after={size:file.size,sha256:file.sha256},observed=await capture(file.path);
+   const source=same(observed,after)?undefined:await this.stageRuntimeFile(file,sourceRoot);
+   intents.set(file.path.toLowerCase(),{path:file.path,after,source,writer:'runtime'});
+  }
+  for(const change of files){
+   if(intents.has(change.path.toLowerCase())||change.path.startsWith('@config/'))continue;
+   const write=isolation.writes.find(file=>file.path===change.path);
+   const source=write&&change.after?await this.stageBytes(write.bytes,change.after):undefined;
+   intents.set(change.path.toLowerCase(),{path:change.path,after:change.after,source,writer:'runtime'});
+  }
+  for(const [relative,base64] of [
+   ['@config/plugins.txt',policy.configuration.pluginsBase64],['@config/loadorder.txt',policy.configuration.loadorderBase64]
+  ] as const){
+   const bytes=Buffer.from(base64,'base64'),after={size:bytes.length,sha256:digest(bytes)};
+   const source=same(await capture(relative),after)?undefined:await this.stageBytes(bytes,after);
+   intents.set(relative,{path:relative,after,source,writer:'profile',managed:true});
+  }
+  return intents;
+ }
+ private async acceptWholePlayWrite(write:WholePlayWrite,intents:Map<string,Intent>){
+  if(!validImage(write)||!path.isAbsolute(write.source)||write.writer!==undefined&&!writerName.test(write.writer)){
+   throw Error('Invalid whole-Play writer image');
+  }
+  const key=write.path.toLowerCase(),previous=intents.get(key);
+  const after={size:write.size,sha256:write.sha256};
+  if(previous){
+   if(!same(previous.after,after))throw Error('Whole-Play after-image conflicts with '+previous.writer+': '+previous.path);
+   return;
+  }
+  const relative=managedRuntimePath(write.path);
+  this.managedPaths.add(relative);
+  const source=path.resolve(write.source);
+  if(write.sourceGrant){
+   const grant=write.sourceGrant;
+   if(grant.targetClass!==undefined||!contained(grant.payloads,source))throw Error('Whole-Play source outside verified package staging');
+   await checkRoots(grant);
+  }else if(![this.grant.installation,this.grant.configDirectory!,this.grant.payloads,this.options.wholePlayStorage]
+     .some(root=>root!==undefined&&contained(root,source))){
+   throw Error('Whole-Play source outside selected installation and Launcher staging');
+  }
+  await noLinks(source);
+  const stat=await fs.lstat(source,{bigint:true});
+  if(!stat.isFile()||stat.nlink!==1n||stat.size!==BigInt(after.size))throw Error('Unsafe staged whole-Play writer source');
+  intents.set(key,{path:relative,after,source,sourceGrant:write.sourceGrant,writer:write.writer??'managed',managed:true});
+ }
+ private async checkWholePlaySpace(changes:readonly Change[],needsBackup:readonly Image[]){
+  if(!changes.length)return;
+  const use=new Map<string,number>();
+  const add=(root:string,bytes:number)=>use.set(root,(use.get(root)??0)+bytes);
+  for(const change of changes){
+   if(!change.after)continue;
+   add(this.destination(change.path).root,change.after.size);
+   add(this.grant.payloads,change.after.size);
+  }
+  const originals=new Map(needsBackup.map(image=>[image.sha256,image.size]));
+  for(const size of originals.values())add(this.grant.payloads,size);
+  const volumes=new Map<string,{bytes:number;roots:string[]}>();
+  for(const [root,bytes] of use){
+   const device=String((await fs.lstat(root,{bigint:true})).dev);
+   const volume=volumes.get(device)??{bytes:64*1024**2,roots:[]};
+   volume.bytes+=bytes;volume.roots.push(root);volumes.set(device,volume);
+  }
+  for(const {bytes,roots} of volumes.values()){
+   if(!Number.isSafeInteger(bytes))throw Error('Whole-Play storage requirement exceeds supported bound');
+   for(const root of roots){
+    const free=this.options.freeBytes?await this.options.freeBytes(root):await fs.statfs(root).then(stat=>Number(stat.bavail)*Number(stat.bsize));
+    if(!Number.isSafeInteger(free)||free<bytes)throw Error('Insufficient disk space for whole-Play targets and recovery');
+   }
+  }
+ }
+ private async stageWholePlay(
+  files:readonly Change[],intents:Map<string,Intent>,active:Map<string,Change>,resuming:boolean
+ ){
+  const backups=new Map<string,Image>();
+  for(const file of files){
+   if(file.before)backups.set(file.before.sha256,file.before);
+  }
+  await this.checkWholePlaySpace(files,[...backups.values()]);
+  for(const file of files){
+   if(file.after){
+    const intent=intents.get(file.path.toLowerCase());
+    if(!intent?.source)throw Error('Whole-Play writer did not stage its expected image: '+file.path);
+    if(intent.sourceGrant)await checkRoots(intent.sourceGrant);
+    await noLinks(intent.source);
+    const stat=await fs.lstat(intent.source,{bigint:true});
+    if(!stat.isFile()||stat.nlink!==1n)throw Error('Unsafe whole-Play staging source');
+    await this.save('runtime-staging',intent.source,file.after);
+    const final=await fs.lstat(intent.source,{bigint:true});
+    if(final.nlink!==1n||fileStamp(final)!==fileStamp(stat))throw Error('Whole-Play staging source changed: '+file.path);
+   }
+   if(file.before){
+    const prior=active.get(file.path.toLowerCase());
+    if(!resuming&&(!prior?.before||same(prior.before,prior.after))){
+     await this.save('runtime-backups',this.target(file.path),file.before);
+    }
+   }
+  }
+ }
+ private async verifyOriginalBlobs(files:readonly Change[]){
+  const seen=new Map<string,Image>();
+  for(const file of files){
+   if(!file.before||same(file.before,file.after))continue;
+   const earlier=seen.get(file.before.sha256);
+   if(earlier&&!same(earlier,file.before))throw Error('Conflicting whole-Play original blob identity');
+   seen.set(file.before.sha256,file.before);
+  }
+  for(const image of seen.values())await this.verifiedBlob('runtime-backups',image);
+ }
+ async prepareWholePlay(
+  planner:WholePlayPlanner,acquire:(needed:readonly string[])=>Promise<string>,
+  verifyRuntime:()=>Promise<void>,signal:AbortSignal
+ ){
+  if(!this.policy)throw Error('Signed runtime policy required for whole-Play preparation');
+  const policy=this.policy;
+  const validateRuntime=()=>assertRuntimeCohort(policy,this.grant.targetClass==='managed-fixture');
+  const policyHash=digest(Buffer.from(JSON.stringify(policy)));
+  const release=await this.store.lease(true);
+  try{
+   await this.guard();signal.throwIfAborted();validateRuntime();
+   const previous=await this.current();
+   const pending=previous&&['prepared','applying'].includes(previous.state)?previous:null;
+   if(previous&&['modpack','restoring'].includes(previous.state)||pending&&!pending.wholePlay){
+    throw Error('Restore the interrupted runtime before Play');
+   }
+   if(previous&&previous.state!=='restored'&&previous.steamStamp!==undefined&&previous.steamStamp!==this.options.steamStamp){
+    throw Error('Steam identity changed; Restore or review the recorded installation before Play');
+   }
+   if(pending&&pending.policyHash!==policyHash)throw Error('Interrupted Play requires its original signed runtime policy; Restore remains available');
+   const transient=pending?await this.preflightTransient(pending):null;
+   const active=new Map((previous?.state==='active'?previous.files:[]).map(file=>[file.path.toLowerCase(),file]));
+   const observed=new Map<string,{path:string;image:ObservedImage|null}>();
+   const capture=async(relative:string)=>{
+    const key=relative.toLowerCase(),old=observed.get(key);
+    if(old)return old.image;
+    const image=await this.snapshot(relative);
+    observed.set(key,{path:relative,image});
+    return image;
+   };
+   for(const file of active.values()){
+    if(!same(await capture(file.path),file.after))throw Error('Active runtime profile conflict; restore/review external changes first: '+file.path);
+   }
+   if(pending){
+    for(const file of pending.files){
+     const got=await capture(file.path),before=file.intermediate===undefined?file.before:file.intermediate;
+     if(!same(got,file.after)&&!same(got,before))throw Error('Interrupted Play target conflict: '+file.path);
+    }
+   }
+   const intents=await this.runtimeIntents(policy,previous,capture,acquire,signal,transient?.relative);
+   const pendingRemovals=new Set(pending?.files.filter(file=>file.writer==='runtime'&&file.after===null)
+    .map(file=>file.path.toLowerCase()));
+   const projectedFile=async(relative:string)=>{
+    const key=relative.toLowerCase(),known=intents.get(key);
+    if(known)return known.after===null?null:known.source??this.target(known.path);
+    if(pendingRemovals.has(key)&&observed.get(key)?.image===null)return null;
+    const canonical=relative==='Skyrim.ccc'||relative==='SkyrimReservedAddOnIndexes.txt'?relative:managedRuntimePath(relative.replace(/^data\//i,'Data/'));
+    if(canonical!=='Skyrim.ccc'&&canonical!=='SkyrimReservedAddOnIndexes.txt')this.managedPaths.add(canonical);
+    return await capture(canonical)?this.target(canonical):null;
+   };
+   const isRuntimeRemoval=(relative:string)=>{
+    const key=relative.toLowerCase();
+    const intent=intents.get(key);
+    return intent?.writer==='runtime'&&intent.after===null||pendingRemovals.has(key);
+   };
+   const plan=await planner({policy,signal,projectedFile,isRuntimeRemoval});
+   if(typeof plan.cohortId!=='string'||!hash.test(plan.cohortId)||!Array.isArray(plan.writes)||plan.writes.length>26000)throw Error('Invalid whole-Play writer plan');
+   if(pending?.wholePlay&&pending.wholePlay.cohortId!==plan.cohortId){
+    throw Error('Interrupted Play requires the original admitted pack; Restore remains available');
+   }
+   for(const write of plan.writes){
+    signal.throwIfAborted();
+    await this.acceptWholePlayWrite(write,intents);
+   }
+   for(const file of policy.managedFiles){
+    const key=file.path.toLowerCase(),known=intents.get(key);
+    if(!same(known?known.after:await capture(file.path),file))throw Error('Whole-Play writer conflicts with signed runtime policy: '+file.path);
+    if(!known)intents.set(key,{path:file.path,after:onlyImage(file),writer:'managed',managed:true});
+   }
+   const changes:Change[]=[];
+   const pendingByPath=new Map((pending?.files??[]).map(file=>[file.path.toLowerCase(),file]));
+   const ordered=[...intents.values()].sort((a,b)=>Number(a.writer==='profile')-Number(b.writer==='profile'));
+   for(const intent of ordered){
+    const key=intent.path.toLowerCase(),before=await capture(intent.path),prior=active.get(key),interrupted=pendingByPath.get(key);
+    if(interrupted&&!same(interrupted.after,intent.after))throw Error('Interrupted Play writer plan changed: '+intent.path);
+    if(same(before,intent.after))continue;
+    if(pending&&!interrupted)throw Error('Interrupted Play cannot add another target: '+intent.path);
+    changes.push(interrupted??{
+     path:intent.path,before:prior?prior.before:onlyImage(before),after:intent.after,
+     writer:intent.writer,...(intent.managed?{kind:'modpack'} as const:{}),...(prior?{intermediate:onlyImage(before)}:{})
+    });
+   }
+   for(const file of pendingByPath.values()){
+    if(!intents.has(file.path.toLowerCase())&&!same(await capture(file.path),file.after)){
+     throw Error('Interrupted Play writer did not verify its pending target: '+file.path);
+    }
+   }
+   await this.stageWholePlay(changes,intents,active,!!pending);
+   const changed=new Set(changes.map(file=>file.path.toLowerCase()));
+   const combined=[
+    ...[...active.values()].filter(file=>!changed.has(file.path.toLowerCase()))
+     .map(file=>({...file,writer:file.writer??(file.path.startsWith('@config/')?'profile':file.kind==='modpack'?'managed':'runtime')})),
+    ...changes
+   ];
+   if(combined.length>26000)throw Error('Whole-Play recovery inventory exceeds bound');
+   const originals=pending?.files??combined;
+   const directories=pending?.wholePlay?.directories??await this.planDirectories(combined,previous?.state==='active'?previous.wholePlay?.directories??[]:[]);
+   // A later inventory cannot authorize more writes. It only checks the
+   // original signed policy and the admitted writer/journal paths for drift.
+   const approved=[...policy.files,...policy.managedFiles,...intents.values(),...originals]
+    .map(file=>file.path).filter(relative=>!relative.startsWith('@config/'));
+   const auditIsolation=async(installed:boolean)=>{
+    const permitted=transient&&!installed&&!transient.relative.startsWith('@config/')?[...approved,transient.relative]:approved;
+    const isolation=await planCreationIsolation(this.grant,policy.creations,permitted,this.options.iniDirectories);
+    const hasPlannedRemoval=(relative:string)=>intents.get(relative.toLowerCase())?.after===null;
+    const conflict=isolation.quarantine.find(relative=>installed||!hasPlannedRemoval(relative));
+    if(conflict)throw Error('Creation isolation changed during whole-Play preparation: '+conflict);
+    if(installed&&isolation.writes.length)throw Error('Whole-Play profile still requires Creation isolation');
+   };
+   const fence=async()=>{
+    signal.throwIfAborted();await this.guard();validateRuntime();
+    for(const record of observed.values()){
+     if((await this.snapshot(record.path))?.stamp!==record.image?.stamp)throw Error('Whole-Play target or profile changed during preflight: '+record.path);
+    }
+    for(const dir of directories)await this.checkDirectory(dir);
+   };
+   const verify=async(j?:Journal)=>{
+    await this.options.wholePlayCheckpoint?.('before-ready');
+    await this.guard();signal.throwIfAborted();validateRuntime();
+    await auditIsolation(true);
+    const verified=new Map<string,{path:string;stamp:string|undefined}>();
+    for(const {path:relative,after} of [...intents.values(),...(j?.files??[])]){
+     const snapshot=await this.snapshot(relative);
+     if(!same(snapshot,after))throw Error('Whole-Play final image differs: '+relative);
+     verified.set(relative.toLowerCase(),{path:relative,stamp:snapshot?.stamp});
+    }
+    await verifyRuntime();
+    await plan.verifyInstalled();
+    await this.guard();signal.throwIfAborted();validateRuntime();
+    await auditIsolation(true);
+    for(const {path:relative,stamp} of verified.values()){
+     if((await this.snapshot(relative))?.stamp!==stamp)throw Error('Whole-Play final image changed during verification: '+relative);
+    }
+   };
+   if(!pending&&!changes.length){
+    await plan.revalidate();
+    await this.verifyOriginalBlobs(originals);
+    await fence();await verify(previous?.state==='active'?previous:undefined);
+    return;
+   }
+   const j:Journal=pending??{
+    schemaVersion:2,installationId:this.grant.id,policyHash,state:'prepared',files:combined,
+    ...(this.options.steamStamp?{steamStamp:this.options.steamStamp}:{}),wholePlay:{cohortId:plan.cohortId,directories}
+   };
+   if(!pending){
+    await this.options.wholePlayCheckpoint?.('before-preimages-commit');
+    await plan.revalidate();
+    await this.verifyOriginalBlobs(originals);
+    await auditIsolation(false);
+    await fence();
+    await this.store.write(journal,j);
+    await this.options.wholePlayCheckpoint?.('after-preimages-commit');
+   }
+   await plan.revalidate();
+   await this.verifyOriginalBlobs(originals);
+   await auditIsolation(false);
+   await fence();
+   await this.clearTransient(j,transient);
+   j.state='applying';await this.store.write(journal,j);
+   await this.ensureDirectories(j);
+   const parentRecords=new Map(directories.map(dir=>[dir.path.toLowerCase(),dir]));
+   for(const change of changes){
+    const before=observed.get(change.path.toLowerCase())?.image;
+    if(before===undefined)throw Error('Missing whole-Play preimage observation');
+    await this.options.wholePlayCheckpoint?.('before-target-write',change.path,change.writer);
+    await this.replace(change,change.after,before,'runtime-staging',async()=>{
+     signal.throwIfAborted();validateRuntime();await this.guardParents(parentRecords,change.path);
+     if((await this.snapshot(change.path))?.stamp!==before?.stamp)throw Error('Whole-Play target identity changed: '+change.path);
+    },j);
+    await this.options.wholePlayCheckpoint?.('after-target-write',change.path,change.writer);
+   }
+   await verify(j);
+   j.state='active';await this.store.write(journal,j);
+  }finally{await release();}
+ }
  async apply(sourceRoot:string,signal?:AbortSignal){
   const release=await this.store.lease();try{
    await this.guard();signal?.throwIfAborted();const previous=await this.current();
+   if(previous?.schemaVersion===2&&previous.state!=='restored')throw Error('Restore the existing whole-Play recovery journal before a standalone write');
    if(previous&&!['active','restored'].includes(previous.state))throw Error('Runtime recovery required before Play');
    const steamChanged=previous?.state==='active'&&previous.steamStamp!==undefined&&this.options.steamStamp!==undefined&&previous.steamStamp!==this.options.steamStamp;
    const steamOwned=(f:Change)=>f.kind!=='modpack'&&(this.policy!.files.some(n=>n.path===f.path)||f.path==='Skyrim.ccc'||f.path==='SkyrimReservedAddOnIndexes.txt'||f.after===null&&/^Data\/cc[A-Za-z0-9_-]+(?: - [A-Za-z0-9 _-]+)?\.(?:esm|esp|esl|bsa)$/i.test(f.path));
@@ -141,7 +762,9 @@ export class RuntimeTransaction {
   * This method does not install mod payloads or replace their trust checks. */
  async beginModpack(){const release=await this.store.lease();try{
   await this.guard();if(!this.policy)throw Error('Signed runtime policy required');assertRuntimeCohort(this.policy,this.grant.targetClass==='managed-fixture');
-  const previous=await this.current();if(previous?.state==='modpack')return;
+  const previous=await this.current();
+  if(previous?.schemaVersion===2&&previous.state!=='restored')throw Error('Restore the existing whole-Play recovery journal before a standalone write');
+  if(previous?.state==='modpack')return;
   if(previous&&!['active','restored'].includes(previous.state))throw Error('Runtime recovery required');
   const initial=previous?.state==='active'?previous.files:[];
   const updates:Change[]=[],actual=new Map<string,Image|null>();
@@ -161,7 +784,7 @@ export class RuntimeTransaction {
   for(const c of configs){const f=updates.find(n=>n.path===c.path);if(f)await this.replace(f,f.after,actual.get(f.path)!,'runtime-staging');}
  }finally{await release();}}
  async completeModpack(){const release=await this.store.lease();try{
-  await this.guard();if(!this.policy)throw Error('Signed runtime policy required');const j=await this.current();if(!j||!['modpack','active'].includes(j.state))throw Error('No pending modpack snapshot');
+  await this.guard();if(!this.policy)throw Error('Signed runtime policy required');const j=await this.current();if(!j||j.schemaVersion!==1||!['modpack','active'].includes(j.state))throw Error('No pending modpack snapshot');
   for(const f of [...this.policy.files,...this.policy.managedFiles])if(!same(await this.image(f.path),{size:f.size,sha256:f.sha256}))throw Error('Modpack incomplete/integrity failure: '+f.path);
   for(const f of j.files)if(!same(await this.image(f.path),f.after))throw Error('Modpack incomplete/integrity failure: '+f.path);
   if(j.state!=='active'){j.state='active';await this.store.write(journal,j);}
@@ -190,16 +813,88 @@ export class RuntimeTransaction {
    if(free<required)throw Error('Insufficient disk space for runtime restore at '+destination+' root');
   }
  }
- private async finish(j:Journal,restore:boolean,signal?:AbortSignal){
-  if(restore)await this.checkRestoreSpace(j.files);
-  j.state=restore?'restoring':'applying';await this.store.write(journal,j);
-  for(const f of restore?[...j.files].reverse():j.files){signal?.throwIfAborted();await this.guard();let expected=restore?f.after:f.before;const want=restore?f.before:f.after,got=await this.image(f.path);if(same(got,want))continue;if(restore&&f.intermediate!==undefined&&same(got,f.intermediate))expected=f.intermediate;if(!same(got,expected))throw Error('Runtime recovery conflict: '+f.path);await this.replace(f,want,expected,restore?'runtime-backups':'runtime-staging');await this.options.checkpoint?.('file-applied');}
-  j.state=restore?'restored':'active';await this.store.write(journal,j);
+ private async preflightRestore(j:Journal,parents:ReadonlyMap<string,DirectoryRecord>){
+  const backups=new Map<string,Image>(),targets=new Map<string,ObservedImage|null>();
+  const observed=new Map<string,ObservedImage|null>();
+  for(const change of j.files){
+   const got=await this.snapshot(change.path);
+   observed.set(change.path,got);
+   const atPreimage=same(got,change.before);
+   const atIntermediate=change.intermediate!==undefined&&same(got,change.intermediate);
+   if(!same(got,change.after)&&!(j.state!=='active'&&(atPreimage||atIntermediate))){
+    throw Error('Runtime restore conflict: '+change.path);
+   }
+   if(atPreimage)continue;
+   if(j.wholePlay)await this.guardParents(parents,change.path);
+   targets.set(change.path,got);
+   if(change.before){
+    const existing=backups.get(change.before.sha256);
+    if(existing&&!same(existing,change.before))throw Error('Conflicting recovery blob identity');
+    backups.set(change.before.sha256,change.before);
+   }
+  }
+  await this.checkRestoreSpace(j.files);
+  for(const image of backups.values())await this.verifiedBlob('runtime-backups',image);
+  await this.guard();
+  for(const [relative,snapshot] of observed){
+   if(j.wholePlay&&targets.has(relative))await this.guardParents(parents,relative);
+   if((await this.snapshot(relative))?.stamp!==snapshot?.stamp)throw Error('Runtime restore conflict: '+relative);
+  }
+  return targets;
  }
- async recover(){const release=await this.store.lease(true);try{await this.guard();const j=await this.current();if(j&&!['active','restored','modpack'].includes(j.state))await this.finish(j,j.state==='restoring');}finally{await release();}}
- async restore(){const release=await this.store.lease(true);try{await this.guard();const j=await this.current();if(!j||j.state==='restored')return;if(!['active','restoring','modpack'].includes(j.state))throw Error('Recover interrupted preparation before restore');
-  // Preflight all files before restoring even the first one.
-  for(const f of j.files){const got=await this.image(f.path);if(!same(got,f.after)&&!(['restoring','modpack'].includes(j.state)&&(same(got,f.before)||f.intermediate!==undefined&&same(got,f.intermediate))))throw Error('Runtime restore conflict: '+f.path);}
-  await this.finish(j,true);
- }finally{await release();}}
+ private async restoreFiles(j:Journal){
+  const parents=new Map(j.wholePlay?.directories.map(dir=>[dir.path.toLowerCase(),dir])??[]);
+  const transient=await this.preflightTransient(j);
+  const targets=await this.preflightRestore(j,parents);
+  await this.clearTransient(j,transient);
+  j.state='restoring';
+  await this.store.write(journal,j);
+  for(const change of [...j.files].reverse()){
+   const expected=targets.get(change.path);
+   if(expected===undefined)continue;
+   await this.replace(change,change.before,expected,'runtime-backups',async()=>{
+    if(j.wholePlay)await this.guardParents(parents,change.path);
+    if((await this.snapshot(change.path))?.stamp!==expected?.stamp)throw Error('Runtime restore conflict: '+change.path);
+   },j.wholePlay?j:undefined);
+   await this.options.checkpoint?.('file-applied');
+  }
+  await this.removeOwnedDirectories(j);
+  await this.guard();
+  for(const change of j.files){
+   if(!same(await this.image(change.path),change.before))throw Error('Runtime restore conflict: '+change.path);
+  }
+  j.state='restored';
+  await this.store.write(journal,j);
+ }
+ private async finish(j:Journal,restore:boolean,signal?:AbortSignal){
+  if(restore){await this.restoreFiles(j);return;}
+  j.state='applying';await this.store.write(journal,j);
+  for(const change of j.files){
+   signal?.throwIfAborted();await this.guard();
+   const got=await this.image(change.path);
+   if(same(got,change.after))continue;
+   if(!same(got,change.before))throw Error('Runtime recovery conflict: '+change.path);
+   await this.replace(change,change.after,change.before,'runtime-staging');
+   await this.options.checkpoint?.('file-applied');
+  }
+  j.state='active';await this.store.write(journal,j);
+ }
+ async recover(){
+  const release=await this.store.lease(true);
+  try{
+   await this.guard();
+   const j=await this.current();
+   if(!j||['active','restored','modpack'].includes(j.state))return;
+   if(j.wholePlay&&j.state!=='restoring')throw Error('Resume interrupted Play with pinned authority or Restore it offline');
+   await this.finish(j,j.state==='restoring');
+  }finally{await release();}
+ }
+ async restore(){
+  const release=await this.store.lease(true);
+  try{
+   await this.guard();
+   const j=await this.current();
+   if(j&&j.state!=='restored')await this.finish(j,true);
+  }finally{await release();}
+ }
 }

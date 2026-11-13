@@ -11,6 +11,7 @@ import {durableWrite} from './installer/metadata';
 import {downloadGraphicsSource,validateSourceDownload} from './graphics-source-download';
 import {playerBootstrapTargets} from './player-bootstrap-targets';
 import {navigationRepairTargets} from './navigation-repair-targets';
+import type {PlayProjection,PlayWrite,PlayWriter} from './runtime/whole-play';
 
 export interface BsaRecord {offset:number;storedSize:number;compressed:boolean;embeddedName:boolean;bsaVersion:number;}
 export interface ArchiveSource {archiveName?:string;archiveSize?:number;archiveSha256?:string;downloadUrl?:string;member?:string;memberSize?:number;memberSha256?:string;installedArchive?:string;bsa?:BsaRecord;contentBase64?:string;}
@@ -50,7 +51,7 @@ async function extractMember(archive:string,member:string,destination:string,siz
 }
 
 /** Authenticated plan targets only, from verified local archives or pinned R2 downloads. */
-export async function repairGraphicsSources(game:string,storage:string,running:()=>Promise<boolean>,plan:GraphicsSourcePlan,options:RepairOptions):Promise<{changed:number;backupDirectory?:string}>{
+export async function repairGraphicsSources(game:string,storage:string,running:()=>Promise<boolean>,plan:GraphicsSourcePlan,options:RepairOptions,projection?:PlayProjection):Promise<{changed:number;backupDirectory?:string;writes?:PlayWrite[]}>{
  validatePlan(plan);await noLinks(game);const base=path.join(storage,'graphics-source-repair');await safeDirectory(base);
  const lockPath=path.join(base,'operation.lock');
  const lockBytes=JSON.stringify({pid:process.pid,token:randomUUID()});
@@ -83,16 +84,25 @@ export async function repairGraphicsSources(game:string,storage:string,running:(
  };
  try{
   await stopped();
-  try{const pending=JSON.parse(await fs.readFile(await safeFile(base,'active.json'),'utf8')) as Journal;await rollback(pending);}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
+  try{const activeFile=await safeFile(base,'active.json');if(projection)throw Error('Finish legacy graphics recovery before preparing Play');const pending=JSON.parse(await fs.readFile(activeFile,'utf8')) as Journal;await rollback(pending);}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
   options.signal?.throwIfAborted();
-  const changed:{entry:Entry;before:Observation}[]=[];
-  for(let i=0;i<plan.files.length;i++){const entry=plan.files[i]!,before=await observe(game,entry.path);if(!equal(before,entry))changed.push({entry,before});if(i%25===0)options.progress?.('checking',i,plan.files.length);}
+  const projected=async(relative:string):Promise<Observation>=>{
+  if(!projection)return observe(game,relative);
+  const source=await projection.projectedFile(relative);
+  if(!source)return null;
+  await noLinks(source);
+  const info=await fs.lstat(source);
+  if(!info.isFile()||info.nlink!==1)throw Error('Unsafe or hard-linked graphics asset');
+  return hashFile(source,MAX);
+ };
+ const changed:{entry:Entry;before:Observation}[]=[];
+  for(let i=0;i<plan.files.length;i++){const entry=plan.files[i]!,before=await projected(entry.path);if(!equal(before,entry))changed.push({entry,before});if(i%25===0)options.progress?.('checking',i,plan.files.length);}
   if(!changed.length)return{changed:0};
   const id=randomUUID(),tx=path.join(base,id);await safeDirectory(path.join(tx,'before'));await safeDirectory(path.join(tx,'stage'));
   const archiveCache=new Map<string,string>(),memberCache=new Map<string,string>();
   const sourceArchive=async(source:ArchiveSource)=>{
    const key=source.installedArchive??source.archiveName!;if(archiveCache.has(key))return archiveCache.get(key)!;
-   if(source.installedArchive){const p=await safeFile(game,source.installedArchive);if(source.archiveSha256){const actual=await hashFile(p,2*1024*1024*1024);if(actual.sha256!==source.archiveSha256||actual.size!==source.archiveSize)throw Error('Installed BSA source hash mismatch: '+key);}archiveCache.set(key,p);return p;}
+   if(source.installedArchive){const p=projection?await projection.projectedFile(source.installedArchive):await safeFile(game,source.installedArchive);if(!p)throw Error('Installed archive source unavailable: '+key);await noLinks(p);const stat=await fs.lstat(p);if(!stat.isFile()||stat.nlink!==1)throw Error('Unsafe installed graphics archive source: '+key);if(source.archiveSha256){const actual=await hashFile(p,2*1024*1024*1024);if(actual.sha256!==source.archiveSha256||actual.size!==source.archiveSize)throw Error('Installed BSA source hash mismatch: '+key);}archiveCache.set(key,p);return p;}
    for(const directory of options.sourceDirectories){try{const p=await safeFile(directory,source.archiveName!);const actual=await hashFile(p,2*1024*1024*1024);if(actual.size===source.archiveSize&&actual.sha256===source.archiveSha256){archiveCache.set(key,p);return p;}}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}}
    if(source.downloadUrl){options.progress?.('downloading '+key,0,source.archiveSize);const p=await downloadGraphicsSource(storage,source,running,(done,total)=>options.progress?.('downloading '+key,done,total),options.signal);archiveCache.set(key,p);return p;}
    throw Error('Original mod source archive missing or hash mismatch: '+key+'. Keep the original download in the configured source folder or Downloads.');
@@ -109,11 +119,14 @@ export async function repairGraphicsSources(game:string,storage:string,running:(
    }
    if(bytes.length!==entry.size||sha(bytes)!==entry.sha256)throw Error('Original asset hash mismatch: '+entry.path);
    await fs.writeFile(path.join(tx,'stage',String(i)),bytes,{flag:'wx'});
-   if(before){const target=await safeFile(game,entry.path);await fs.copyFile(target,path.join(tx,'before',String(i)));if(!equal(await hashFile(path.join(tx,'before',String(i)),MAX),before))throw Error('Graphics backup changed');}
+   if(before&&!projection){const target=await safeFile(game,entry.path);await fs.copyFile(target,path.join(tx,'before',String(i)));if(!equal(await hashFile(path.join(tx,'before',String(i)),MAX),before))throw Error('Graphics backup changed');}
    options.progress?.('preparing',i+1,changed.length);await stopped();
   }
   options.progress?.('prepared',changed.length,changed.length);await stopped();
   options.signal?.throwIfAborted();
+  if(projection)return{changed:changed.length,writes:changed.map(({entry},i)=>({
+   path:entry.path,source:path.join(tx,'stage',String(i)),size:entry.size,sha256:entry.sha256,writer:'source-graphics',
+  }))};
   const journal:Journal={game:path.resolve(game),version:plan.version,id,files:changed.map(({entry,before})=>({path:entry.path,before,after:{size:entry.size,sha256:entry.sha256}}))};
   await durableWrite(active,Buffer.from(JSON.stringify(journal)),true);
   try{
@@ -123,4 +136,11 @@ export async function repairGraphicsSources(game:string,storage:string,running:(
    await fs.rename(active,path.join(tx,'complete.json'));return{changed:changed.length,backupDirectory:tx};
   }catch(error){if(!await running())await rollback(journal);throw error;}
  }finally{await lock.close();await fs.unlink(lockPath);}
+}
+
+export async function planGraphicsSourcesForWholePlay(
+ game:string,storage:string,running:()=>Promise<boolean>,plan:GraphicsSourcePlan,options:RepairOptions,projection:PlayProjection,
+):Promise<PlayWriter>{
+ const result=await repairGraphicsSources(game,storage,running,plan,{...options,signal:projection.signal},projection);
+ return{authority:sha(Buffer.from(JSON.stringify(plan))),writes:result.writes??[]};
 }

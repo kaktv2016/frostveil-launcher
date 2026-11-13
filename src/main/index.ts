@@ -1,6 +1,8 @@
 import {RuntimePreparation} from './runtime/service';
-import {repairClientForPlay,clientRequirementForScan,nativeRequirementForScan} from './client-repair';
-import {repairGraphicsSources} from './graphics-source-repair';
+import {preparePlay,restorePlay} from './runtime/whole-play';
+import {planClientForWholePlay,clientRequirementForScan,nativeRequirementForScan} from './client-repair';
+import {clientRepairPin} from './client-repair-pin';
+import {planGraphicsSourcesForWholePlay,repairGraphicsSources,type GraphicsSourcePlan} from './graphics-source-repair';
 import {sourceVerifiesLegacyTarget} from './navigation-repair-targets';
 import {loadGraphicsSourcePlan,graphicsSourceDirectories} from './graphics-source-plan';
 import {ProductionDownloads} from './management/downloads';import {inspectSkyUI,SKYUI_SOURCE} from './management/external-mods';
@@ -52,7 +54,7 @@ async function start(){
  const version=fixture?async(file:string)=>path.basename(file)==='SkyrimSE.exe'?profile.runtime:profile.skseVersion:fileVersion;
  const launch=new GameLauncher(fixture?async()=>false:gameRunning,fixture?async()=>{throw Error('Real game launch blocked in fixture smoke');}:startSkse);
  let graphicsPreparation:AbortController|undefined;
- const prepareGraphics=async(orderDirectory:string,forceDownload=false)=>{
+ const prepareGraphics=async(orderDirectory:string)=>{
   if(graphicsPreparation)throw Error('Graphics preparation is already running');
   const preparation=new AbortController();graphicsPreparation=preparation;
   try{
@@ -61,8 +63,7 @@ async function start(){
   const plan=await loadGraphicsSourcePlan(storage);
   preparation.signal.throwIfAborted();
   graphicsPack.setSourceRepairTargets(plan.files.map(f=>f.path).filter(sourceVerifiesLegacyTarget));
-  if(forceDownload)await graphicsPack.downloadAndInstall(settings.directory,orderDirectory);
-  else await graphicsPack.verifyAndEnforceForPlay(settings.directory,orderDirectory);
+  await graphicsPack.downloadAndInstall(settings.directory,orderDirectory);
   preparation.signal.throwIfAborted();
   const result=await repairGraphicsSources(settings.directory,storage,gameRunning,plan,{
    sourceDirectories:await graphicsSourceDirectories(storage),
@@ -75,14 +76,18 @@ async function start(){
   }finally{graphicsPreparation=undefined;}
  };
  let busy=false;
- const scan=async(skipPackChecks=false)=>{
-  if(!settings.directory){const choices=await discoverSteam(await steamRoots());settings.directory=choices[0]??'';}
-  if(settings.directory&&!profile.files.length&&!fixture&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{profile=await downloads.baselineProfile();}catch(error){await log('Signed public baseline unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
-  if(!fixture)profile={...profile,files:await Promise.all(profile.files.map(async f=>nativeRequirementForScan(await clientRequirementForScan(f,settings.directory),settings.directory)))};
-  state.scan=settings.directory?await scanInstallation(settings.directory,profile,version):null;
+ const localScan=async(directory:string,baseline:Profile)=>{
+  const files=fixture?baseline.files:await Promise.all(baseline.files.map(async file=>
+   nativeRequirementForScan(await clientRequirementForScan(file,directory),directory)));
+  return scanInstallation(directory,{...baseline,files},version);
+ };
+ const scan=async(localOnly=false)=>{
+  if(!localOnly&&!settings.directory){const choices=await discoverSteam(await steamRoots());settings.directory=choices[0]??'';}
+  if(!localOnly&&settings.directory&&!profile.files.length&&!fixture&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{profile=await downloads.baselineProfile();}catch(error){await log('Signed public baseline unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
+  state.scan=settings.directory?await localScan(settings.directory,profile):null;
   if(!settings.directory)await log('No Steam installation detected; select a game folder');else await log(state.scan?.ready?'Installation matches local baseline; server connection NOT TESTED':'Installation incompatible/unverified — Play blocked');
-  if(!skipPackChecks&&settings.directory&&!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){const orderDir=path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');try{await downloads.inspectInstallation(settings.directory,orderDir);}catch(error){downloads.setInstalled(false);await log('Server pack check unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
-  if(!skipPackChecks&&settings.directory&&!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{await graphicsPack.inspect(settings.directory);}catch(error){await log('Graphics pack check unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
+  if(!localOnly&&settings.directory&&!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){const orderDir=path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');try{await downloads.inspectInstallation(settings.directory,orderDir);}catch(error){downloads.setInstalled(false);await log('Server pack check unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
+  if(!localOnly&&settings.directory&&!fixture&&!smoke&&!(process.argv.includes('--launcher-update-test')&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1')){try{await graphicsPack.inspect(settings.directory);}catch(error){await log('Graphics pack check unavailable: '+(error instanceof Error?error.message:'Unknown error'));}}
   state.productionDownloads=downloads.snapshot();
   state.graphicsPack=graphicsPack.snapshot();
   await writeLocal(settingsPath,settings);return state.scan;
@@ -126,21 +131,34 @@ async function start(){
  const runtimeDirectories=()=>{if(smoke)throw Error('Real runtime preparation disabled in fixture smoke');if(!settings.directory)throw Error('Select your Steam Skyrim installation first');return{game:settings.directory,config:path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition')};};
  handler('inspect-runtime',async arg=>{noArgument(arg);const d=runtimeDirectories();await runtimePreparation.inspect(d.game,d.config);});
  handler('prepare-runtime',async arg=>{noArgument(arg);const d=runtimeDirectories();await runtimePreparation.prepare(d.game,d.config);await scan();});
- handler('restore-runtime',async arg=>{noArgument(arg);const d=runtimeDirectories();await runtimePreparation.restore(d.game,d.config);await scan();});
+ handler('restore-runtime',async arg=>{
+  noArgument(arg);
+  const {game,config}=runtimeDirectories();
+  await restorePlay(runtimePreparation,game,config,async()=>{
+   downloads.setInstalled(false);
+   graphicsPack.invalidateInstalled();
+   await scan(true);
+  });
+ });
+ const standaloneWrite=async(operation:()=>Promise<unknown>)=>{
+  if(fixture||!settings.directory)return operation();
+  const {game,config}=runtimeDirectories();
+  await runtimePreparation.withStandaloneWrite(game,config,operation);
+ };
  handler('cancel-runtime',async arg=>{noArgument(arg);runtimePreparation.cancel();graphicsPreparation?.abort(Error('Runtime preparation cancelled'));graphicsPack.cancel();downloads.cancel();});
- handler('download-server-files',async arg=>{noArgument(arg);if(smoke)throw Error('Production download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await downloads.installAndActivate(settings.directory,orderDirectory);await scan();await log('Server files and SkyUI installed and activated in plugins.txt');});
+ handler('download-server-files',async arg=>{noArgument(arg);if(smoke)throw Error('Production download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await standaloneWrite(async()=>{await downloads.installAndActivate(settings.directory,orderDirectory);});await scan();await log('Server files and SkyUI installed and activated in plugins.txt');});
  handler('cancel-server-files',async arg=>{noArgument(arg);downloads.cancel();});
- handler('download-graphics-pack',async arg=>{noArgument(arg);if(smoke)throw Error('Graphics download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await prepareGraphics(orderDirectory,true);await scan();await log('Graphics pack and original-source assets verified');});
+ handler('download-graphics-pack',async arg=>{noArgument(arg);if(smoke)throw Error('Graphics download is disabled in fixture smoke');if(!settings.directory)throw Error('Select a game folder first');const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');await standaloneWrite(()=>prepareGraphics(orderDirectory));await scan();await log('Graphics pack and original-source assets verified');});
  handler('cancel-graphics-pack',async arg=>{noArgument(arg);graphicsPreparation?.abort(Error('Graphics preparation cancelled'));graphicsPack.cancel();});
  handler('open-skyui-source',async arg=>{noArgument(arg);if(smoke)throw Error('External navigation is disabled in fixture smoke');await shell.openExternal(SKYUI_SOURCE);});
  handler('inspect-skyui',async arg=>{noArgument(arg);if(smoke)throw Error('External folders are disabled in fixture smoke');const selected=(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Choose extracted SkyUI folder (read-only verification)'})).filePaths[0];if(selected)state.externalMod=await inspectSkyUI(selected);});
  handler('status',async arg=>{noArgument(arg);});
  handler('inspect-management',async arg=>{noArgument(arg);await scan();await management.inspect();});
  handler('prepare-management',async arg=>{await scan();await management.prepare(arg);});
- handler('apply-management',async arg=>{await scan();await management.apply(arg);});
+ handler('apply-management',async arg=>{await scan();await standaloneWrite(()=>management.apply(arg));});
  handler('cancel-management',async arg=>{noArgument(arg);management.cancel();});
- handler('rollback-management',async arg=>{noArgument(arg);await scan();await management.rollback();});
- handler('recover-management',async arg=>{noArgument(arg);await scan();await management.recover();});
+ handler('rollback-management',async arg=>{noArgument(arg);await scan();await standaloneWrite(()=>management.rollback());});
+ handler('recover-management',async arg=>{noArgument(arg);await scan();await standaloneWrite(()=>management.recover());});
  handler('management-fixture',async arg=>{noArgument(arg);state.managementFixture={phase:'running',message:'Disposable installation fixture running',stage:'starting',checks:[]};const emit=()=>window.webContents.send('launcher:management-fixture-state',state.managementFixture);emit();try{const result=await runManagementFixtureDemo(stage=>{state.managementFixture!.stage=stage;emit();});state.managementFixture={phase:'complete',message:'REALISTIC SANDBOX VERIFIED — real Skyrim not modified',stage:'complete',checks:result.checks};}catch(error){state.managementFixture={phase:'error',message:error instanceof Error?error.message:'Fixture failed',stage:'error',checks:[]};throw error;}finally{emit();}});
 
  handler('scan',async arg=>{noArgument(arg);await scan();});
@@ -162,7 +180,60 @@ async function start(){
  handler('cancel-installer-sandbox',async arg=>{noArgument(arg);installer.cancel();});
  handler('cancel-modpack',async arg=>{noArgument(arg);modpack.cancel();});
  handler('backup',async arg=>{noArgument(arg);if(!settings.directory)throw Error('Select a game installation first');state.backup=null;state.backup=await createBackup(settings.directory,path.join(storage,'backups'),profile);await log(`Verified integration backup: ${state.backup.files} files (${state.backup.skipped.length} skipped); not a full game backup`);});
- handler('play',async arg=>{noArgument(arg);if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');if(!settings.directory)throw Error('Select your Skyrim installation first');await launch.play(async()=>{if(!smoke){const orderDirectory=fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition');if(!fixture){await runtimePreparation.prepare(settings.directory,orderDirectory);await runtimePreparation.beginModpack(settings.directory,orderDirectory);await prepareGraphics(orderDirectory);await repairClientForPlay(settings.directory,storage,gameRunning);}await downloads.prepareForPlay(settings.directory,orderDirectory);if(!fixture)await runtimePreparation.completeModpack(settings.directory,orderDirectory);}const current=await scan(!smoke&&!fixture);if(!current)throw Error('No installation selected');if(mandatoryPackPolicy){await modpack.scan(settings.directory,settings.channel,current);modpack.enforce();}return current;});await log('SKSE process started; in-game/server connection still requires manual verification');});
+ handler('play',async arg=>{
+  noArgument(arg);
+  if(['downloading','installing'].includes(updater.snapshot().state))throw Error('Finish launcher update operation first');
+  if(!settings.directory)throw Error('Select your Skyrim installation first');
+  await launch.play(async()=>{
+   if(smoke){
+    const current=await scan();
+    if(!current)throw Error('No installation selected');
+    return current;
+   }
+   if(mandatoryPackPolicy)throw Error('The additional pack verifier has no pinned whole-Play admission');
+   const {game,config}=runtimeDirectories();
+   let graphicsSourcePlan:GraphicsSourcePlan;
+   let packAdmission:Awaited<ReturnType<ProductionDownloads['wholePlayAdmission']>>;
+   let verifiedBaseline:Profile|undefined;
+   try{
+   const current=await preparePlay(runtimePreparation,game,config,{
+    legacyGraphics:async projection=>{
+     packAdmission=await downloads.wholePlayAdmission(projection.signal);
+     graphicsSourcePlan=await loadGraphicsSourcePlan(storage);
+     projection.signal.throwIfAborted();
+     graphicsPack.setSourceRepairTargets(graphicsSourcePlan.files.map(file=>file.path).filter(sourceVerifiesLegacyTarget));
+     const reserved=new Set([...packAdmission.packagedTargets,clientRepairPin.path.toLowerCase(),
+      ...graphicsSourcePlan.files.map(file=>file.path.toLowerCase())]);
+     return graphicsPack.planWholePlay(projection,reserved);
+    },
+    sourceGraphics:async projection=>planGraphicsSourcesForWholePlay(game,storage,gameRunning,graphicsSourcePlan,{
+     sourceDirectories:await graphicsSourceDirectories(storage),
+     progress:(phase,done,total)=>{
+      const count=total?(phase.startsWith('downloading ')?` ${((done??0)/1048576).toFixed(1)} / ${(total/1048576).toFixed(1)} MB`:` ${done}/${total}`):'';
+      graphicsPack.reportSourceRepair(`Preparing player files · ${phase}${count}`);
+     },
+    },projection),
+    client:projection=>planClientForWholePlay(storage,projection,gameRunning),
+    pack:projection=>packAdmission.plan(game,config,projection),
+    scan:async baseline=>{
+     const current=await localScan(game,baseline);
+     if(!current.ready)throw Error('Final installation scan did not verify the signed Play profile');
+     verifiedBaseline=baseline;
+     return current;
+    },
+   });
+   if(verifiedBaseline)profile=verifiedBaseline;
+   state.scan=current;
+   return current;
+   }catch(error){
+    state.scan=null;
+    downloads.setInstalled(false);
+    graphicsPack.invalidateInstalled();
+    throw error;
+   }
+  });
+  await log('SKSE process started; in-game/server connection still requires manual verification');
+ });
  app.on('second-instance',()=>{window.show();if(window.isMinimized())window.restore();window.focus();});
  window.once('ready-to-show',()=>{window.show();});
  await window.loadURL('app://launcher/index.html');window.show();window.focus();

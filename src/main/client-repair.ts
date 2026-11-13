@@ -1,4 +1,6 @@
 import fs from 'node:fs/promises';import path from 'node:path';import {randomUUID,createHash}from'node:crypto';import {safeDirectory,safeFile,noLinks,hashFile,checkExistingAncestors}from'./files';import {clientRepairPin}from'./client-repair-pin';
+import {durableWrite} from './installer/metadata';
+import type {PlayProjection,PlayWriter} from './runtime/whole-play';
 interface Pin{path:string;size:number;sha256:string;url:string;previous:{size:number;sha256:string};previousVersions?:readonly {size:number;sha256:string}[];}
 /** Only this reviewed old->new transition. Never pin an arbitrary observed file. */
 export function effectiveClientRequirement<T extends {path:string;size:number;sha256:string}>(file:T,pin:Pin=clientRepairPin):T{return file.path.toLowerCase()===pin.path.toLowerCase()&&[pin.previous,...(pin.previousVersions??[])].some(p=>file.size===p.size&&file.sha256===p.sha256)?{...file,size:pin.size,sha256:pin.sha256}:file;}
@@ -19,6 +21,42 @@ export async function repairClientForPlay(game:string,storage:string,running:()=
  const installed=await hashFile(target);if(installed.sha256!==pin.sha256||installed.size!==pin.size)throw Error('Installed client verification failed');
 }
 
+export async function planClientForWholePlay(
+ storage:string,projection:PlayProjection,running:()=>Promise<boolean>,download:(url:string)=>Promise<Buffer>=acquire,pin:Pin=clientRepairPin,
+):Promise<PlayWriter>{
+ if(pin.path!=='Data/Platform/Plugins/skymp5-client.js')throw Error('Unexpected repair target');
+ projection.signal.throwIfAborted();
+ if(await running())throw Error('Skyrim/SKSE is running; close it before client repair');
+ const target=await projection.projectedFile(pin.path);
+ if(!target)throw Error('Pinned SkyMP client is missing');
+ await noLinks(target);
+ const stat=await fs.lstat(target);
+ if(!stat.isFile()||stat.nlink!==1)throw Error('Unsafe or hard-linked client refused');
+ const before=await hashFile(target,8*1024*1024);
+ const authority=pin.sha256;
+ if(before.sha256===pin.sha256&&before.size===pin.size)return{writes:[],authority};
+ if(![pin.previous,...(pin.previousVersions??[])].some(p=>before.sha256===p.sha256&&before.size===p.size))
+  throw Error('Unrecognized SkyMP client; refusing to overwrite an unreviewed file');
+ const staging=path.join(storage,'whole-play-client');
+ await safeDirectory(staging);
+ const source=path.join(staging,pin.sha256+'.js');
+ try{await safeFile(staging,path.basename(source));}
+ catch(error){
+  if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;
+  const bytes=await download(pin.url);
+  projection.signal.throwIfAborted();
+  if(bytes.length!==pin.size||createHash('sha256').update(bytes).digest('hex')!==pin.sha256)
+   throw Error('Client repair hash mismatch');
+  if(await running())throw Error('Skyrim/SKSE started during client download; repair stopped');
+  await durableWrite(source,bytes,true);
+ }
+ await noLinks(source);
+ const staged=await fs.lstat(source);
+ const image=await hashFile(source,8*1024*1024);
+ if(!staged.isFile()||staged.nlink!==1||image.size!==pin.size||image.sha256!==pin.sha256)
+  throw Error('Protected client staging does not match pinned bytes');
+ return{authority,writes:[{path:pin.path,source,size:pin.size,sha256:pin.sha256,writer:'client'}]};
+}
 export async function clientRequirementForScan<T extends {path:string;size:number;sha256:string}>(file:T,game:string,pin:Pin=clientRepairPin):Promise<T>{const next=effectiveClientRequirement(file,pin);if(next===file)return file;try{const actual=await hashFile(await safeFile(game,pin.path),8*1024*1024);if(actual.sha256===pin.sha256&&actual.size===pin.size)return next;}catch{}return file;}
 
 const nativeTransition={path:'Data/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll',size:15676928,sha256:'c91b5ed52adf1328877366c9497a668e2abaf1c5314b2b9ed422b762320f1a66',url:'',previousVersions:[{size:15675904,sha256:'52b7572f75f5b09fe8db8bf6f04931522c11d6573181bf88ac5039042e09338d'},{size:15674880,sha256:'8549f8be88fefec1341399a64293b3798c8ea5f20c34a60204d0088759d4025b'},{size:15668224,sha256:'18b530ef76a5b84d6da090b5e9c87f7e93b436e02104b48aa1602a8b26d6e30a'}],previous:{size:15668224,sha256:'ce58aa2ddddb72e8c941d4fde5edcdfa5398815e33cf95efead0fd71608e4666'}};

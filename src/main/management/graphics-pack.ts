@@ -2,7 +2,12 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import cp from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { hashFile, noLinks, relativePath, safeDirectory } from '../files';
+import { pluginName } from '../modpack/schema';
+import type { PlayProjection, PlayWrite, PlayWriter } from '../runtime/whole-play';
 import { sourceVerifiesLegacyTarget } from '../navigation-repair-targets';
 
 export interface GraphicsManifest {
@@ -45,6 +50,105 @@ const DEFAULT_MASTER_PLUGINS = [
   'Natural Waterfalls - Blackreach.esp',
 ];
 
+function graphicsActivationImages(manifest: GraphicsManifest, existingText: string) {
+    const bom = existingText.startsWith('\uFEFF') ? '\uFEFF' : '';
+    const masterList = manifest.masterPlugins ?? DEFAULT_MASTER_PLUGINS;
+    const masterSet = new Set(masterList.map(p => p.toLowerCase()));
+    const nonMasterList = manifest.activePlugins.filter(p => !masterSet.has(p.toLowerCase()));
+
+    // Canonical Master-First order:
+    // 1. All 8 ESM-flagged masters in topological order
+    // 2. FrostveilCourierNavigation.esp (server-required full plugin immediately after masters)
+    // 3. All 19 non-master Graphics & World plugins in topological order
+    // 4. SkyUI_SE.esp (client-only required UI plugin)
+    const canonicalOrder = [
+      ...masterList,
+      'FrostveilCourierNavigation.esp',
+      ...nonMasterList,
+      'SkyUI_SE.esp',
+    ];
+
+    // Retain enabled mods absent from the remote canonical list. A manifest is
+    // not permission to disable the player's unrelated installed plugins.
+    const canonicalNames = new Set(canonicalOrder.map(p => p.toLowerCase()));
+    const retained = existingText.replace(/^\uFEFF/, '').split(/\r?\n/)
+      .map(line => line.trim()).filter(line => line.startsWith('*'))
+      .map(line => line.slice(1).trim())
+      .filter(name => !canonicalNames.has(name.toLowerCase()));
+    for (const name of retained) {
+      if (!canonicalNames.has(name.toLowerCase())) {canonicalOrder.push(name);canonicalNames.add(name.toLowerCase());}
+    }
+    const pluginsLines = [
+      '# This file is used by Skyrim to keep track of your downloaded content.',
+      '# Please do not modify this file.',
+      ...canonicalOrder.map(p => `*${p}`),
+    ];
+    const loadorderLines = [
+      'Skyrim.esm',
+      'Update.esm',
+      'Dawnguard.esm',
+      'HearthFires.esm',
+      'Dragonborn.esm',
+      'ccBGSSSE001-Fish.esm',
+      'ccQDRSSE001-SurvivalMode.esl',
+      'ccBGSSSE037-Curios.esl',
+      'ccBGSSSE025-AdvDSGS.esm',
+      '_ResourcePack.esl',
+      ...canonicalOrder,
+    ];
+
+    const nextPluginsText = bom + pluginsLines.join('\r\n') + '\r\n';
+    const nextLoadorderText = loadorderLines.join('\r\n') + '\r\n';
+    return {nextPluginsText,nextLoadorderText};
+}
+
+const legacyBaseFiles = ['d3dx9_42.dll', 'Data/Lux.esp', 'Data/Ulvenwald.esp', 'Data/BlendedRoads.esp'];
+const legacyArchiveLimit = 9 * 1024 ** 3;
+
+interface LegacyImage {
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+interface LegacyArchive {
+  url: string;
+  size: number;
+  sha256: string;
+}
+
+function legacyArchive(url: unknown, size: unknown, sha256: unknown): LegacyArchive {
+  if (typeof url !== 'string' || typeof size !== 'number' || !Number.isSafeInteger(size) ||
+      size < 1 || size > legacyArchiveLimit || typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(sha256)) {
+    throw Error('Missing bounded legacy graphics archive identity');
+  }
+  const address = new URL(url);
+  if (address.origin !== new URL(R2_MANIFEST_URL).origin || address.username || address.password ||
+      address.search || address.hash || !address.pathname.endsWith('.zip')) {
+    throw Error('Unapproved legacy graphics archive URL');
+  }
+  return {url, size, sha256};
+}
+
+async function matchesLegacyImage(file: string | null, image: {size: number; sha256: string}) {
+  if (!file) return false;
+  await noLinks(file);
+  const stat = await fs.lstat(file);
+  if (!stat.isFile() || stat.nlink !== 1) throw Error('Unsafe or hard-linked legacy graphics file');
+  if (stat.size !== image.size) return false;
+  return (await hashFile(file, image.size)).sha256 === image.sha256;
+}
+
+function limitBytes(size: number) {
+  let received = 0;
+  return new Transform({
+    transform(chunk, _encoding, done) {
+      received += chunk.length;
+      if (received > size) return done(Error('Graphics staging exceeds the planned byte limit'));
+      done(null, chunk);
+    },
+  });
+}
 export class GraphicsPackService {
   private state: GraphicsPackState = {
     phase: 'idle',
@@ -354,6 +458,241 @@ export class GraphicsPackService {
     return this.snapshot();
   }
 
+  /**
+   * Normal Play admits only named legacy members whose output is independently
+   * authorized by the signed runtime inventory. Extraction writes into Launcher
+   * staging, and profile and preferences are owned by the whole-Play plan.
+   */
+  async planWholePlay(projection: PlayProjection, reservedTargets: ReadonlySet<string> = new Set()): Promise<PlayWriter> {
+    const {policy, signal, projectedFile} = projection;
+    signal.throwIfAborted();
+    const manifest = await this.fetchManifest(signal, true);
+    if (typeof manifest.version !== 'string' || !/^[\w.-]{1,80}$/.test(manifest.version) ||
+        !Array.isArray(manifest.activePlugins) || manifest.activePlugins.length > 254 ||
+        (manifest.masterPlugins !== undefined && (!Array.isArray(manifest.masterPlugins) || manifest.masterPlugins.length > 254)) ||
+        !manifest.integrityFiles || Array.isArray(manifest.integrityFiles)) {
+      throw Error('Legacy graphics manifest cannot be bound to the signed runtime profile');
+    }
+    for (const name of [...manifest.activePlugins, ...(manifest.masterPlugins ?? DEFAULT_MASTER_PLUGINS)]) pluginName(name);
+    const pluginsText = Buffer.from(policy.configuration.pluginsBase64, 'base64').toString('utf8');
+    const loadorderText = Buffer.from(policy.configuration.loadorderBase64, 'base64').toString('utf8');
+    const profile = graphicsActivationImages(manifest, pluginsText);
+    if (profile.nextPluginsText !== pluginsText || profile.nextLoadorderText !== loadorderText) {
+      throw Error('Legacy graphics activation differs from the exact signed runtime profile bytes');
+    }
+
+    const expected = new Map(policy.managedFiles.map(file => [file.path.toLowerCase(), file]));
+    const targets = new Map<string, LegacyImage>();
+    const integrity = Object.entries(manifest.integrityFiles);
+    if (integrity.length > 25000) throw Error('Legacy graphics inventory exceeds the signed runtime bound');
+    for (const [name, identity] of integrity) {
+      const relative = relativePath(name);
+      const key = relative.toLowerCase();
+      if (this.sourceRepairTargets.has(key)) continue;
+      const signed = expected.get(key);
+      if (!signed || !identity || signed.sha256 !== identity.sha256 || signed.size !== identity.size || targets.has(key)) {
+        throw Error('Legacy graphics output is not authorized by the signed runtime: ' + relative);
+      }
+      targets.set(key, signed);
+    }
+    let needsBase = false;
+    for (const name of legacyBaseFiles) {
+      const key = name.toLowerCase();
+      const signed = expected.get(key);
+      if (!signed) throw Error('Signed runtime omits a required legacy graphics target: ' + name);
+      if (this.sourceRepairTargets.has(key)) continue;
+      targets.set(key, signed);
+      if (!await matchesLegacyImage(await projectedFile(signed.path), signed)) needsBase = true;
+    }
+
+    const patchName = 'frostveil-integrity-patch-v' + manifest.version + '.zip';
+    const missing = new Map<string, LegacyImage>();
+    for (const [key, target] of targets) {
+      signal.throwIfAborted();
+      if (!await matchesLegacyImage(await projectedFile(target.path), target)) missing.set(key, target);
+    }
+
+    // The legacy cold installer extracted the full archive. Only admit named
+    // members that intersect the authenticated runtime inventory, and leave
+    // reviewed source-repair targets to their pinned recipe.
+    const candidates = new Map<string, LegacyImage>();
+    for (const [key, target] of expected) {
+      if (targets.has(key) || reservedTargets.has(key) || this.sourceRepairTargets.has(key)) continue;
+      signal.throwIfAborted();
+      if (!await matchesLegacyImage(await projectedFile(target.path), target)) candidates.set(key, target);
+    }
+    const base = async () => this.playArchive(
+      legacyArchive(manifest.downloadUrl, manifest.size, manifest.sha256), signal, manifest.packageName,
+    );
+    const patch = async () => this.playArchive(legacyArchive(
+      manifest.integrityPatchUrl, manifest.integrityPatchSize, manifest.integrityPatchSha256,
+    ), signal, patchName);
+    const archives: string[] = [];
+    if (missing.size || candidates.size) {
+      if (manifest.integrityPatchUrl) archives.push(await patch());
+      if (needsBase || candidates.size || !archives.length) archives.push(await base());
+    }
+    const indexed = await Promise.all(archives.map(async archive => ({
+      archive, members: await this.listPlayMembers(archive, signal),
+    })));
+    const writes: PlayWrite[] = [];
+    for (const [key, target] of [...missing, ...candidates]) {
+      const sources = indexed.flatMap(({archive, members}) => {
+        const member = members.get(key);
+        return member ? [{archive, member}] : [];
+      });
+      const source = sources.length ? await this.stagePlayMember(sources, target, signal) : undefined;
+      if (!source) {
+        if (missing.has(key)) throw Error('Exact signed legacy graphics archive member unavailable: ' + target.path);
+        continue;
+      }
+      writes.push({...target, source, writer: 'legacy-graphics'});
+    }
+    const authority = createHash('sha256').update(JSON.stringify({
+      version: manifest.version,
+      plugins: profile,
+      targets: [...targets.values()],
+      archive: [manifest.sha256, manifest.integrityPatchSha256],
+    })).digest('hex');
+    return {
+      authority,
+      writes,
+      publishReady: () => {
+        this.update({
+          phase: 'complete',
+          installed: true,
+          version: manifest.version,
+          availableVersion: manifest.version,
+          message: 'Verified graphics pack and signed runtime profile',
+        });
+      },
+    };
+  }
+
+  private async playArchive(archive: LegacyArchive, signal: AbortSignal, legacyName: string): Promise<string> {
+    if (typeof legacyName !== 'string' || relativePath(legacyName).includes('/') || !legacyName.endsWith('.zip')) {
+      throw Error('Invalid legacy graphics archive name');
+    }
+    const existing = path.join(this.storageDir, 'r2-cache', legacyName);
+    try {
+      if (await matchesLegacyImage(existing, archive)) return existing;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const root = path.join(this.storageDir, 'whole-play-graphics');
+    await safeDirectory(root);
+    const target = path.join(root, archive.sha256 + '.zip');
+    try {
+      if (await matchesLegacyImage(target, archive)) return target;
+      throw Error('Protected graphics archive differs from the planned bytes');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const free = await fs.statfs(root);
+    if (Number(free.bsize) * Number(free.bavail) < archive.size) throw Error('Insufficient space for graphics archive staging');
+    const response = await fetch(archive.url, {
+      redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(15 * 60_000)]),
+    });
+    if (response.status !== 200 || !response.body) throw Error('Legacy graphics archive unavailable');
+    const declared = response.headers.get('content-length');
+    if (declared !== null && Number(declared) !== archive.size) {
+      await response.body.cancel();
+      throw Error('Legacy graphics archive length differs from the plan');
+    }
+    const temp = path.join(root, archive.sha256 + '-' + randomUUID() + '.part');
+    try {
+      await pipeline(Readable.fromWeb(response.body as never), limitBytes(archive.size),
+        fsSync.createWriteStream(temp, {flags: 'wx'}), {signal});
+      if (!await matchesLegacyImage(temp, archive)) throw Error('Legacy graphics archive hash differs from the plan');
+      await noLinks(root);
+      await fs.link(temp, target);
+    } finally {
+      await fs.unlink(temp).catch(() => {});
+    }
+    if (!await matchesLegacyImage(target, archive)) throw Error('Staged legacy graphics archive changed');
+    return target;
+  }
+
+  private async listPlayMembers(archive: string, signal: AbortSignal) {
+    await noLinks(archive);
+    const child = cp.spawn('tar.exe', ['-tf', archive], {
+      signal, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const exited = new Promise<void>((resolve, reject) => {
+      child.on('error', reject);
+      child.on('close', code => code === 0 ? resolve() : reject(Error('Legacy graphics archive inventory unavailable')));
+    });
+    const chunks: Buffer[] = [];
+    const read = async () => {
+      let bytes = 0;
+      for await (const chunk of child.stdout) {
+        bytes += chunk.length;
+        if (bytes > 16 * 1024 * 1024) throw Error('Legacy graphics archive inventory exceeds bound');
+        chunks.push(chunk);
+      }
+    };
+    try { await Promise.all([read(), exited]); }
+    finally { if (child.exitCode === null) child.kill(); }
+
+    const members = new Map<string, string>();
+    for (const raw of Buffer.concat(chunks).toString('utf8').split(/\r?\n/)) {
+      if (!raw || raw.endsWith('/')) continue;
+      const name = relativePath(raw.replace(/^\.\//, ''));
+      const key = name.toLowerCase();
+      if (members.has(key)) throw Error('Ambiguous member in legacy graphics archive: ' + name);
+      members.set(key, raw);
+    }
+    return members;
+  }
+
+  private async stagePlayMember(
+    sources: readonly {archive: string; member: string}[],
+    target: LegacyImage,
+    signal: AbortSignal,
+  ): Promise<string | undefined> {
+    const root = path.join(this.storageDir, 'whole-play-graphics');
+    await safeDirectory(root);
+    const staged = path.join(root, target.sha256 + '.asset');
+    try {
+      if (await matchesLegacyImage(staged, target)) return staged;
+      throw Error('Protected graphics staging differs from the signed image: ' + target.path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    for (const {archive, member} of sources) {
+      signal.throwIfAborted();
+      const tmp = path.join(root, target.sha256 + '-' + randomUUID() + '.part');
+      const child = cp.spawn('tar.exe', ['-xOf', archive, '--', member], {
+        signal, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const extracted = new Promise<void>((resolve, reject) => {
+        child.on('error', reject);
+        child.on('close', code => code === 0 ? resolve() : reject(Error('Archive member unavailable')));
+      });
+      try {
+        await Promise.all([extracted, pipeline(child.stdout, limitBytes(target.size),
+          fsSync.createWriteStream(tmp, {flags: 'wx'}), {signal})]);
+        if (!await matchesLegacyImage(tmp, target)) continue;
+        await noLinks(root);
+        await fs.link(tmp, staged);
+      } catch (error) {
+        child.kill();
+        signal.throwIfAborted();
+        if ((error as NodeJS.ErrnoException).code && (error as NodeJS.ErrnoException).code !== 'EPIPE') throw error;
+      } finally {
+        await fs.unlink(tmp).catch(() => {});
+      }
+      try {
+        if (await matchesLegacyImage(staged, target)) return staged;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  }
+
+  invalidateInstalled() {
+    this.update({installed: false, phase: 'idle', message: 'Graphics pack needs verification after Restore'});
+  }
   async downloadAndInstall(gameDirectory: string, orderDirectory: string): Promise<GraphicsPackState> {
     if (this.controller) throw new Error('A download is already in progress');
     if (!gameDirectory) throw new Error('Game directory is required');
@@ -556,53 +895,7 @@ export class GraphicsPackService {
       existingText = '';
     }
 
-    const bom = existingText.startsWith('\uFEFF') ? '\uFEFF' : '';
-    const masterList = manifest.masterPlugins ?? DEFAULT_MASTER_PLUGINS;
-    const masterSet = new Set(masterList.map(p => p.toLowerCase()));
-    const nonMasterList = manifest.activePlugins.filter(p => !masterSet.has(p.toLowerCase()));
-
-    // Canonical Master-First order:
-    // 1. All 8 ESM-flagged masters in topological order
-    // 2. FrostveilCourierNavigation.esp (server-required full plugin immediately after masters)
-    // 3. All 19 non-master Graphics & World plugins in topological order
-    // 4. SkyUI_SE.esp (client-only required UI plugin)
-    const canonicalOrder = [
-      ...masterList,
-      'FrostveilCourierNavigation.esp',
-      ...nonMasterList,
-      'SkyUI_SE.esp',
-    ];
-
-    // Retain enabled mods absent from the remote canonical list. A manifest is
-    // not permission to disable the player's unrelated installed plugins.
-    const canonicalNames = new Set(canonicalOrder.map(p => p.toLowerCase()));
-    const retained = existingText.replace(/^\uFEFF/, '').split(/\r?\n/)
-      .map(line => line.trim()).filter(line => line.startsWith('*'))
-      .map(line => line.slice(1).trim())
-      .filter(name => !canonicalNames.has(name.toLowerCase()));
-    for (const name of retained) {
-      if (!canonicalNames.has(name.toLowerCase())) {canonicalOrder.push(name);canonicalNames.add(name.toLowerCase());}
-    }
-    const pluginsLines = [
-      '# This file is used by Skyrim to keep track of your downloaded content.',
-      '# Please do not modify this file.',
-      ...canonicalOrder.map(p => `*${p}`),
-    ];
-    const loadorderLines = [
-      'Skyrim.esm',
-      'Update.esm',
-      'Dawnguard.esm',
-      'HearthFires.esm',
-      'Dragonborn.esm',
-      'ccBGSSSE001-Fish.esm',
-      'ccQDRSSE001-SurvivalMode.esl',
-      'ccBGSSSE037-Curios.esl',
-      'ccBGSSSE025-AdvDSGS.esm',
-      '_ResourcePack.esl',
-      ...canonicalOrder,
-    ];
-
-    const nextPluginsText = bom + pluginsLines.join('\r\n') + '\r\n';
+    const {nextPluginsText,nextLoadorderText} = graphicsActivationImages(manifest, existingText);
     if (existingText !== nextPluginsText) {
       await fs.writeFile(pluginsFile, nextPluginsText, 'utf8');
     }
@@ -613,7 +906,6 @@ export class GraphicsPackService {
     } catch {
       existingLoadorder = '';
     }
-    const nextLoadorderText = loadorderLines.join('\r\n') + '\r\n';
     if (existingLoadorder !== nextLoadorderText) {
       await fs.writeFile(loadorderFile, nextLoadorderText, 'utf8');
     }
