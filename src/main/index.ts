@@ -111,6 +111,11 @@ async function start(){
  const setSelection=async(directory:string)=>{
   scanRevision++;
   selectInstallation(state,directory);
+  modpack.invalidate();
+  downloads.setInstalled(false);
+  graphicsPack.invalidateInstalled();
+  state.productionDownloads={...(state.productionDownloads??downloads.snapshot()),installed:false};
+  state.graphicsPack=graphicsPack.snapshot();
   await refreshRecovery();
  };
  const scan=async(localOnly=false)=>{
@@ -286,13 +291,7 @@ async function start(){
 
  handler('scan',async arg=>{noArgument(arg);await scan();});
  handler('choose',async arg=>{noArgument(arg);const selected=fixture?path.join(fixture,'game'):(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Select folder containing SkyrimSE.exe'})).filePaths[0];if(selected){
-  await setSelection(selected);
-  modpack.invalidate();
-  downloads.setInstalled(false);
-  graphicsPack.invalidateInstalled();
-  state.productionDownloads={...(state.productionDownloads??downloads.snapshot()),installed:false};
-  state.graphicsPack=graphicsPack.snapshot();
-  await saveSettings();
+  await Promise.all([setSelection(selected),saveSettings()]);
   await scan(true);
  }});
  handler('channel',async arg=>{if(arg!=='stable')throw Error('Beta is disabled until channel isolation is verified');settings.channel=validateSettings({directory:settings.directory,channel:arg}).channel;state.updates=updateState(settings.channel);await saveSettings();});

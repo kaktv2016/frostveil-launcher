@@ -80,6 +80,7 @@ export class RuntimePreparation extends RealRuntimePreparation {
   }
   protected override async acquire(_policy: Readonly<RuntimeCohort>, _cache: string, signal: AbortSignal) {
     signal.throwIfAborted();
+    await marker('fixture-runtime-source');
     return fixturePath('depot');
   }
   protected override async wholePlayCheckpoint(stage: WholePlayCheckpoint) {
@@ -102,12 +103,16 @@ export class ProductionDownloads extends EventEmitter {
   }
   async inspectInstallation() {
     await marker('provider-inspection-started');
+    while (await mode('inspection-mode') === 'stall') await delay(50);
     if (await mode('provider-mode') === 'fail') throw Error('W09 controlled provider refusal');
   }
   async wholePlayAdmission(signal: AbortSignal) {
     signal.throwIfAborted();
+    await marker('fixture-pack-admission');
     const profile = await baseline();
-    return {packagedTargets:[], plan:async () => ({cohortId:'c'.repeat(64), baseline:profile, writes:[]})};
+    return {packagedTargets:[], plan:async () => ({
+      cohortId:'c'.repeat(64), baseline:profile, writes:[], publishReady:()=>this.setInstalled(true),
+    })};
   }
   async installAndActivate(game: string) {
     if (game !== fixturePath('game-a')) throw Error('W09 unexpected server pack target');

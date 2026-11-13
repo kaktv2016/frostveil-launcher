@@ -41,6 +41,7 @@ for (const file of new Set([...runtime, ...baseline.map(x=>x.path)])) {
 await fs.writeFile(path.join(fixtureRoot,'inputs.json'),JSON.stringify({createdAt:new Date().toISOString(),runtime,baseline}));
 const setMode = (name, value) => fs.writeFile(path.join(fixtureRoot, name+'-mode'), value);
 await setMode('provider','stall');
+await setMode('inspection','ok');
 await setMode('policy','fail');
 await setMode('apply','ok');
 for (const game of [gameA, gameB]) await fs.writeFile(path.join(game, 'SkyrimSE.exe'), originalRuntime);
@@ -159,6 +160,7 @@ try {
   await setMode('provider','ok');
   await page.getByRole('button',{name:/^Dashboard/}).click();
   await expect(page.getByRole('button',{name:'Re-scan',exact:true})).toBeEnabled();
+  await setMode('inspection','stall');
   await page.getByRole('button',{name:'Re-scan',exact:true}).click();
   await waitMarker('provider-inspection-started',1);
   observed.explicitVerificationInvoked=true;
@@ -180,6 +182,17 @@ try {
   await expect(restoreButton()).toBeDisabled();
   observed.cancelledPreApplyLeavesNoRecovery=true;
 
+  await setMode('policy','ok');
+  await playButton().click();
+  await waitMarker('fixture-runtime-source',1);
+  await panel.getByRole('button',{name:'ยกเลิกการเตรียมเกม',exact:true}).click();
+  await expect(alert()).toContainText('ยกเลิกการเตรียมเกมแล้ว',{timeout:15000});
+  await journalIs('restored');
+  assert.equal(await markers('inert-skse'),0);
+  assert.equal(await markers('fixture-pack-admission'),0);
+  await setMode('inspection','ok');
+  observed.cancelDuringInFlightPackVerificationPreventsPlay=true;
+
   await page.getByRole('button',{name:/^Updates/}).click();
   const downloadPanel=page.getByTestId('production-download-panel');
   const downloadButton=downloadPanel.getByRole('button',{name:'Download & Install Server Files',exact:true});
@@ -191,7 +204,6 @@ try {
   observed.serverDownloadCancelReachesActiveMainOperation=true;
   await page.getByRole('button',{name:/^Dashboard/}).click();
 
-  await setMode('policy','ok');
   await prepareButton().click();
   await expect(panel.getByRole('status')).toContainText('ผ่านตรวจแล้ว',{timeout:15000});
   await expect(restoreButton()).toBeEnabled();
@@ -253,6 +265,19 @@ try {
   await expect(restoreButton()).toBeEnabled();
   await expect(page.getByText('READY — local compatibility baseline matches',{exact:true})).toBeVisible();
   observed.wholePlayVerifiedAndInvokedOnlyInertSkse=true;
+  await expect(page.getByText('✓ Signed server pack files verified',{exact:true})).toBeVisible();
+  await page.getByRole('button',{name:/^Installation/}).click();
+  await fs.writeFile(path.join(fixtureRoot,'selection.txt'),gameB);
+  await page.getByRole('button',{name:'Select folder',exact:true}).click();
+  await expect(page.getByText(gameB,{exact:true})).toBeVisible();
+  const away=await page.evaluate(()=>window.launcher.status());
+  assert.equal(away.settings.directory,gameB);
+  assert.equal(away.productionDownloads.installed,false);
+  assert.equal(away.runtimePreparation.canRestore,false);
+  observed.selectAwayClearsPackAndRestoreState=true;
+  await fs.writeFile(path.join(fixtureRoot,'selection.txt'),gameA);
+  await page.getByRole('button',{name:'Select folder',exact:true}).click();
+  await expect(restoreButton()).toBeEnabled();
   await restoreButton().click();
   await journalIs('restored');
   assert.deepEqual(await fs.readFile(runtimeFile),originalRuntime);
