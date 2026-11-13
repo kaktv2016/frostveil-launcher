@@ -62,6 +62,91 @@ function cacheObservation(key:string,stamp:string,image:Image){
  observations.set(key,{stamp,image});
 }
 
+function runtimeDestination(grant:SandboxGrant,raw:string){
+ const config=raw==='@config/plugins.txt'||raw==='@config/loadorder.txt';
+ return{config,root:config?grant.configDirectory!:grant.installation};
+}
+
+function runtimeTarget(grant:SandboxGrant,managedPaths:ReadonlySet<string>,raw:string,checkPaths:boolean){
+ const {config,root}=runtimeDestination(grant,raw),relative=config?raw.slice(8):relativePath(raw);
+ if(!config&&relative!=='Skyrim.ccc'&&relative!=='SkyrimReservedAddOnIndexes.txt'&&!managedPaths.has(relative)&&
+    !/^Data\/cc[A-Za-z0-9_-]+(?: - [A-Za-z0-9 _-]+)?\.(?:esm|esp|esl|bsa)$/i.test(relative))runtimePath(relative);
+ const file=path.join(root,...relative.split('/'));
+ if(checkPaths)checkExistingAncestors(file);
+ return file;
+}
+
+function recoveryDirectory(grant:SandboxGrant,relative:string,checkPaths:boolean){
+ const directory=path.join(grant.installation,...relativePath(relative).split('/'));
+ if(checkPaths)checkExistingAncestors(directory);
+ return directory;
+}
+
+function recoveryAncestors(relative:string){
+ if(relative.startsWith('@config/'))return [];
+ const parts=relativePath(relative).split('/').slice(0,-1);
+ return parts.map((_,index)=>parts.slice(0,index+1).join('/')).filter(folder=>folder.toLowerCase()!=='data');
+}
+
+function recoveryTransientTarget(grant:SandboxGrant,managedPaths:ReadonlySet<string>,j:Journal,transient:TransientCopy,checkPaths:boolean){
+ const change=j.files.find(file=>file.path===transient.path);
+ const image=transient.direction==='apply'?change?.after:change?.before;
+ if(!image)throw Error('Transient copy has no authorized journal image');
+ const target=runtimeTarget(grant,managedPaths,transient.path,checkPaths),file=path.join(path.dirname(target),transient.name);
+ const relative=(transient.path.startsWith('@config/')?'@config/':'')+
+  path.relative(runtimeDestination(grant,transient.path).root,file).split(path.sep).join('/');
+ if(j.files.some(entry=>entry.path.toLowerCase()===relative.toLowerCase()))throw Error('Transient copy overlaps a planned target');
+ return{target,file,relative,image};
+}
+
+function validateRuntimeJournal(raw:unknown,grant:SandboxGrant,managedPaths:Set<string>,checkPaths:boolean):Journal{
+ const j=raw as Journal;
+ if(!j||![1,2].includes(j.schemaVersion)||j.installationId!==grant.id||!hash.test(j.policyHash)||
+    j.steamStamp!==undefined&&!hash.test(j.steamStamp)||!['prepared','applying','active','modpack','restoring','restored'].includes(j.state)||
+    !Array.isArray(j.files)||j.files.length>26000)throw Error('Invalid runtime recovery journal');
+ if(j.schemaVersion===2){
+  if(!j.wholePlay||!hash.test(j.wholePlay.cohortId)||!Array.isArray(j.wholePlay.directories)||j.wholePlay.directories.length>26000||
+     j.state==='modpack')throw Error('Invalid whole-Play recovery journal');
+  const directories=new Set<string>();
+  for(const dir of j.wholePlay.directories){
+   if(!dir||recoveryDirectory(grant,dir.path,checkPaths)===grant.installation||typeof dir.owned!=='boolean'||
+      (dir.identity===null?!dir.owned:!filesystemIdentity.test(dir.identity))||
+      directories.has(dir.path.toLowerCase()))throw Error('Invalid whole-Play recovery directory');
+   directories.add(dir.path.toLowerCase());
+  }
+ }else if(j.wholePlay!==undefined)throw Error('Invalid legacy runtime recovery journal');
+ const names=new Set<string>();
+ for(const f of j.files){
+  if(!f||typeof f.path!=='string'||j.schemaVersion===2&&
+     (typeof f.writer!=='string'||!writerName.test(f.writer)||f.kind!==undefined&&f.kind!=='modpack')){
+   throw Error('Invalid runtime journal target');
+  }
+  if(f.kind==='modpack'&&!f.path.startsWith('@config/'))managedPaths.add(managedRuntimePath(f.path));
+  runtimeTarget(grant,managedPaths,f.path,checkPaths);
+  if(names.has(f.path.toLowerCase()))throw Error('Duplicate runtime journal target');
+  names.add(f.path.toLowerCase());
+  for(const image of [f.before,f.after,...(f.intermediate===undefined?[]:[f.intermediate])]){
+   if(image!==null&&!validImage(image))throw Error('Invalid runtime journal image');
+  }
+ }
+ if(j.wholePlay){
+  const used=new Set<string>();
+  for(const f of j.files){
+   for(const parent of recoveryAncestors(f.path))used.add(parent.toLowerCase());
+  }
+  if(j.wholePlay.directories.some(dir=>!used.has(dir.path.toLowerCase())))throw Error('Unrelated whole-Play recovery directory');
+  const transient=j.wholePlay.transient;
+  if(transient!==undefined){
+   if(!transient||typeof transient.path!=='string'||typeof transient.name!=='string'||!transientName.test(transient.name)||
+      transient.identity!==null&&(typeof transient.identity!=='string'||!filesystemIdentity.test(transient.identity))||
+      (j.state!=='applying'&&j.state!=='restoring')||
+      transient.direction!==(j.state==='restoring'?'restore':'apply'))throw Error('Invalid whole-Play transient copy');
+   recoveryTransientTarget(grant,managedPaths,j,transient,checkPaths);
+  }
+ }
+ return j;
+}
+
 /** Separate capability from mod-content writes. No executable path comes from IPC. */
 export class RuntimeTransaction {
  private managedPaths=new Set<string>();
@@ -70,31 +155,35 @@ export class RuntimeTransaction {
   assertRuntimeCohort(policy,grant.targetClass==='managed-fixture');return this.openStore(grant,policy,running,options);
  }
  static async forRecovery(grant:SandboxGrant,running:()=>Promise<boolean>,options:Options={}){return this.openStore(grant,null,running,options);}
+ /** Summarize authenticated metadata without creating a store or acquiring a writer lease. */
+ static recoveryStatus(grant:SandboxGrant,record:unknown,checkPaths:boolean){
+  const journal=validateRuntimeJournal(record,grant,new Set<string>(),checkPaths);
+  const {schemaVersion,state,policyHash,steamStamp,wholePlay}=journal;
+  // W08 never emits coerced digests or partial directory inventories. Keep
+  // recovery status conservative while leaving Restore's reader unchanged.
+  if(typeof policyHash!=='string'||steamStamp!==undefined&&typeof steamStamp!=='string'){
+   throw Error('Invalid runtime recovery digest');
+  }
+  if(wholePlay){
+   if(typeof wholePlay.cohortId!=='string'||!journal.files.length)throw Error('Invalid whole-Play recovery inventory');
+   const required=new Set(journal.files.flatMap(file=>recoveryAncestors(file.path)).map(directory=>directory.toLowerCase()));
+   if(wholePlay.directories.length!==required.size||
+      wholePlay.directories.some(directory=>directory.identity!==null&&typeof directory.identity!=='string')){
+    throw Error('Invalid whole-Play recovery directory inventory');
+   }
+  }
+  return{schemaVersion,canRestore:state!=='restored',recoveryRequired:state!=='active'&&state!=='restored'};
+ }
  private static async openStore(grant:SandboxGrant,policy:Readonly<RuntimeCohort>|null,running:()=>Promise<boolean>,options:Options){
   if(!isManagedTarget(grant))throw Error('Managed runtime installation identity required');await checkManagedRoots(grant);
   if(options.steamStamp!==undefined&&!hash.test(options.steamStamp))throw Error('Invalid verified Steam depot stamp');
   const tx=new RuntimeTransaction(grant,policy,await MetadataStore.create(grant),running,options);for(const f of policy?.managedFiles??[])tx.managedPaths.add(f.path);return tx;
  }
  private async guard(){await checkManagedRoots(this.grant);if(await this.running())throw Error('Skyrim/SKSE or Steam update active; runtime writes refused');}
- private destination(raw:string){
-  const config=raw==='@config/plugins.txt'||raw==='@config/loadorder.txt';
-  return {config,root:config?this.grant.configDirectory!:this.grant.installation};
- }
- private target(raw:string){
-  const {config,root}=this.destination(raw),rel=config?raw.slice(8):relativePath(raw);
-  if(!config&&rel!=='Skyrim.ccc'&&rel!=='SkyrimReservedAddOnIndexes.txt'&&!this.managedPaths.has(rel)&&!/^Data\/cc[A-Za-z0-9_-]+(?: - [A-Za-z0-9 _-]+)?\.(?:esm|esp|esl|bsa)$/i.test(rel))runtimePath(rel);
-  const file=path.join(root,...rel.split('/'));checkExistingAncestors(file);return file;
- }
- private directoryPath(relative:string){
-  const directory=path.join(this.grant.installation,...relativePath(relative).split('/'));
-  checkExistingAncestors(directory);
-  return directory;
- }
- private directoryAncestors(relative:string){
-  if(relative.startsWith('@config/'))return [];
-  const parts=relativePath(relative).split('/').slice(0,-1);
-  return parts.map((_,index)=>parts.slice(0,index+1).join('/')).filter(folder=>folder.toLowerCase()!=='data');
- }
+ private destination(raw:string){return runtimeDestination(this.grant,raw);}
+ private target(raw:string){return runtimeTarget(this.grant,this.managedPaths,raw,true);}
+ private directoryPath(relative:string){return recoveryDirectory(this.grant,relative,true);}
+ private directoryAncestors(relative:string){return recoveryAncestors(relative);}
  private async directoryIdentity(relative:string){
   const directory=this.directoryPath(relative);
   try{
@@ -164,50 +253,7 @@ export class RuntimeTransaction {
  private async image(raw:string):Promise<Image|null>{return onlyImage(await this.snapshot(raw));}
  private async current():Promise<Journal|null>{
   let j:Journal;try{j=await this.store.read(journal) as Journal;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return null;throw e;}
-  if(![1,2].includes(j.schemaVersion)||j.installationId!==this.grant.id||!hash.test(j.policyHash)||
-     j.steamStamp!==undefined&&!hash.test(j.steamStamp)||!['prepared','applying','active','modpack','restoring','restored'].includes(j.state)||
-     !Array.isArray(j.files)||j.files.length>26000)throw Error('Invalid runtime recovery journal');
-  if(j.schemaVersion===2){
-   if(!j.wholePlay||!hash.test(j.wholePlay.cohortId)||!Array.isArray(j.wholePlay.directories)||j.wholePlay.directories.length>26000||
-      j.state==='modpack')throw Error('Invalid whole-Play recovery journal');
-   const directories=new Set<string>();
-   for(const dir of j.wholePlay.directories){
-    if(!dir||this.directoryPath(dir.path)===this.grant.installation||typeof dir.owned!=='boolean'||
-       (dir.identity===null?!dir.owned:!filesystemIdentity.test(dir.identity))||
-       directories.has(dir.path.toLowerCase()))throw Error('Invalid whole-Play recovery directory');
-    directories.add(dir.path.toLowerCase());
-   }
-  }else if(j.wholePlay!==undefined)throw Error('Invalid legacy runtime recovery journal');
-  const names=new Set<string>();
-  for(const f of j.files){
-   if(!f||typeof f.path!=='string'||j.schemaVersion===2&&
-      (typeof f.writer!=='string'||!writerName.test(f.writer)||f.kind!==undefined&&f.kind!=='modpack')){
-    throw Error('Invalid runtime journal target');
-   }
-   if(f.kind==='modpack'&&!f.path.startsWith('@config/'))this.managedPaths.add(managedRuntimePath(f.path));
-   this.target(f.path);
-   if(names.has(f.path.toLowerCase()))throw Error('Duplicate runtime journal target');
-   names.add(f.path.toLowerCase());
-   for(const image of [f.before,f.after,...(f.intermediate===undefined?[]:[f.intermediate])]){
-    if(image!==null&&!validImage(image))throw Error('Invalid runtime journal image');
-   }
-  }
-  if(j.wholePlay){
-   const used=new Set<string>();
-   for(const f of j.files){
-    for(const parent of this.directoryAncestors(f.path))used.add(parent.toLowerCase());
-   }
-   if(j.wholePlay.directories.some(dir=>!used.has(dir.path.toLowerCase())))throw Error('Unrelated whole-Play recovery directory');
-   const transient=j.wholePlay.transient;
-   if(transient!==undefined){
-    if(!transient||typeof transient.path!=='string'||typeof transient.name!=='string'||!transientName.test(transient.name)||
-       transient.identity!==null&&(typeof transient.identity!=='string'||!filesystemIdentity.test(transient.identity))||
-       (j.state!=='applying'&&j.state!=='restoring')||
-       transient.direction!==(j.state==='restoring'?'restore':'apply'))throw Error('Invalid whole-Play transient copy');
-    this.transientTarget(j,transient);
-   }
-  }
-  return j;
+  return validateRuntimeJournal(j,this.grant,this.managedPaths,true);
  }
  private blob(kind:'runtime-backups'|'runtime-staging',sha256:string){if(!hash.test(sha256))throw Error('Invalid blob identity');return path.join(this.grant.payloads,kind,sha256);}
  private async save(kind:'runtime-backups'|'runtime-staging',source:string,want:Image){
@@ -256,14 +302,7 @@ export class RuntimeTransaction {
   }finally{await fs.unlink(temp).catch(e=>{if(e.code!=='ENOENT')throw e;});}
  }
  private transientTarget(j:Journal,transient:TransientCopy){
-  const change=j.files.find(file=>file.path===transient.path);
-  const image=transient.direction==='apply'?change?.after:change?.before;
-  if(!image)throw Error('Transient copy has no authorized journal image');
-  const target=this.target(transient.path),file=path.join(path.dirname(target),transient.name);
-  const relative=(transient.path.startsWith('@config/')?'@config/':'')+
-   path.relative(this.destination(transient.path).root,file).split(path.sep).join('/');
-  if(j.files.some(entry=>entry.path.toLowerCase()===relative.toLowerCase()))throw Error('Transient copy overlaps a planned target');
-  return{target,file,relative,image};
+  return recoveryTransientTarget(this.grant,this.managedPaths,j,transient,true);
  }
  private async replaceWholePlay(j:Journal,change:Change,blob:string,want:Image,recheck:()=>Promise<void>){
   const transient:TransientCopy={

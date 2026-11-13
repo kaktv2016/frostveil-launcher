@@ -4,6 +4,8 @@ export function selectInstallation(state:Dashboard,directory:string):void {
  if(path.resolve(state.settings.directory||'.').toLowerCase()!==path.resolve(directory).toLowerCase()){
   state.backup=null;
   state.scan=null;
+  state.runtimePreparation=undefined;
+  state.verificationWarning=undefined;
  }
  state.settings.directory=directory;
 }

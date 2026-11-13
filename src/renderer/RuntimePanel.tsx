@@ -11,15 +11,28 @@ function SteamQr({text}:{text:string}){
  }});
  return <svg role="img" aria-label="Steam Guard login QR" viewBox={`0 0 ${width} ${height}`} width={width*4} height={height*4} shapeRendering="crispEdges" style={{background:'#fff',color:'#000',whiteSpace:'pre',maxWidth:'100%',height:'auto',display:'block'}}><rect width={width} height={height} fill="#fff"/><g fill="#000">{marks}</g></svg>;
 }
-export function RuntimePanel({state,busy,onInspect,onPrepare,onRestore,onCancel}:{state?:RuntimePreparationState;busy:boolean;onInspect:()=>void;onPrepare:()=>void;onRestore:()=>void;onCancel:()=>void}){
+const recoveryGuidance = {
+ checking: 'กำลังตรวจข้อมูลกู้คืนของการติดตั้งที่เลือก',
+ absent: '',
+ recoverable: 'คุณสามารถคืนไฟล์ก่อนติดตั้ง Frostveil จากข้อมูลกู้คืนในเครื่องได้',
+ foreign: 'เลือกโฟลเดอร์เกมเดิมที่เริ่มเตรียมไว้ เพื่อคืนไฟล์ของโปรไฟล์นี้',
+ unsafe: 'ตรวจข้อมูลกู้คืนไม่ได้ กรุณาเก็บไฟล์สำรองไว้และให้ทีม Frostveil ตรวจสอบก่อนดำเนินการ',
+} satisfies Record<NonNullable<RuntimePreparationState['recovery']>, string>;
+
+export function RuntimePanel({state,busy,canCancel=busy,onInspect,onPrepare,onRestore,onCancel}:{state?:RuntimePreparationState;busy:boolean;canCancel?:boolean;onInspect:()=>void;onPrepare:()=>void;onRestore:()=>void;onCancel:()=>void}){
+ const recovery=state?.recovery;
+ const restoreAvailable=state?.canRestore&&(recovery===undefined||recovery==='recoverable');
+ const preparationBlocked=recovery==='foreign'||recovery==='unsafe';
+ const guidance=state?.recoveryMessage??(recovery?recoveryGuidance[recovery]:'');
  const bytes=(n:number)=>new Intl.NumberFormat('th-TH',{maximumFractionDigits:1}).format(n/1024**3)+' GB';
  return <section className="panel" data-testid="runtime-preparation">
   <h3>Steam Skyrim · 1.6.1170.0</h3>
   <p>ตรวจเกม → เตรียม 1.6.1170 → จัดชุดส่วนเสริม → ติดตั้ง modpack → เปิดเกม</p>
   <p role="status">{state?.message??'กด Play เพื่อเตรียมเกมอัตโนมัติ รองรับ Steam Windows / English'}</p>
+  {guidance&&guidance!==state?.message&&<p className="muted">{guidance}</p>}
   {!!state?.changedFiles&&<p>{state.changedFiles} ไฟล์ · ดาวน์โหลด {bytes(state.downloadBytes)} · สำรองต้นฉบับ {bytes(state.backupBytes)} · staging {bytes(state.stagingBytes)}</p>}
   {state?.authQr&&<div><p>เปิดแอป Steam บนมือถือ → Steam Guard → สแกน QR นี้และอนุมัติ ไม่ต้องส่งรหัสผ่านหรือรหัสยืนยัน</p><SteamQr text={state.authQr}/></div>}
-  <div className="actions"><button disabled={busy} className="secondary" onClick={onInspect}>ตรวจและดูพื้นที่</button><button disabled={busy} className="primary" onClick={onPrepare}>เตรียมเกม</button><button disabled={busy||!state?.canRestore} className="secondary" onClick={onRestore}>คืนชุดก่อนติดตั้ง Frostveil</button>{busy&&<button className="secondary" onClick={onCancel}>ยกเลิกการเตรียมเกม</button>}</div>
+  <div className="actions"><button disabled={busy} className="secondary" onClick={onInspect}>ตรวจและดูพื้นที่</button><button disabled={busy||preparationBlocked} className="primary" onClick={onPrepare}>เตรียมเกม</button><button disabled={busy||!restoreAvailable} className="secondary" onClick={onRestore}>คืนชุดก่อนติดตั้ง Frostveil</button>{busy&&canCancel&&<button className="secondary" onClick={onCancel}>ยกเลิกการเตรียมเกม</button>}</div>
   <p className="muted">เก็บชุด RP ไว้หลังปิดเกม สำรองเฉพาะไฟล์ที่เปลี่ยน ไม่สร้างเกมอีกชุด และไม่แก้เซฟของผู้เล่น</p>
  </section>;
 }
