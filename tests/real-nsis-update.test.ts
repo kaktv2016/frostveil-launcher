@@ -33,7 +33,7 @@ function runProcess(command:string,args:string[],cwd:string):Promise<{code:numbe
  });
 }
 
-interface DisposableBoot {localData:string;temp:string;profile:string;events:string;closeRequest:string;}
+interface DisposableBoot {localData:string;temp:string;documents:string;profile:string;events:string;closeRequest:string;}
 async function buildDisposableNsisInstaller(projectRoot:string,outDir:string,version:string,boot:DisposableBoot):Promise<string>{
  await fs.mkdir(outDir,{recursive:true});
  const injected=path.join(outDir,'disposable-entry');await fs.mkdir(injected);
@@ -49,6 +49,7 @@ process.env.TEMP=__fvBoot.temp;process.env.TMP=__fvBoot.temp;
 process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST='1';
 if(!process.argv.includes('--launcher-update-test'))process.argv.push('--launcher-update-test','--launcher-update-test-profile',__fvBoot.profile);
 const __fvFs=require('node:fs'),__fvApp=require('electron').app;
+__fvApp.setPath('documents',__fvBoot.documents);
 function __fvEvent(kind,detail){__fvFs.appendFileSync(__fvBoot.events,JSON.stringify({kind,detail,version:__fvApp.getVersion(),pid:process.pid,argv:process.argv,temp:require('node:os').tmpdir()})+String.fromCharCode(10));}
 const __fvError=console.error;console.error=(...args)=>{__fvEvent('stderr',args.map(String).join(' '));__fvError(...args);};
 __fvEvent('start');
@@ -123,9 +124,11 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
  const installDir=path.join(tempRoot,'installed-app');
  const isolatedLocalData=path.join(tempRoot,'isolated-local-app-data'),storage=path.join(isolatedLocalData,'SkyrimRPLauncher');
  const userDataDir=path.join(storage,'user-data');
- const boot:DisposableBoot={localData:isolatedLocalData,temp:os.tmpdir(),profile:path.join(tempRoot,'update-test-profile.json'),events:path.join(tempRoot,'boot-events.jsonl'),closeRequest:path.join(tempRoot,'close-request')};
+ const documents=path.join(tempRoot,'documents');
+ const boot:DisposableBoot={localData:isolatedLocalData,temp:os.tmpdir(),documents,profile:path.join(tempRoot,'update-test-profile.json'),events:path.join(tempRoot,'boot-events.jsonl'),closeRequest:path.join(tempRoot,'close-request')};
  await fs.mkdir(installDir,{recursive:true});
  await fs.mkdir(userDataDir,{recursive:true});
+ await fs.mkdir(documents);
 
  // Snapshot user's real 0.1.4 installation if present to verify zero interference
  const realUserInstallDir=path.join(process.env.LOCALAPPDATA??'','Programs','Skyrim RP Launcher');
