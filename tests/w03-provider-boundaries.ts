@@ -73,6 +73,10 @@ export async function fileVersion(file: string) {
   return boundary.version(file);
 }
 
+export async function readPeVersion(file: string, _handle: Awaited<ReturnType<typeof fs.open>>, _size: number) {
+  return fileVersion(file);
+}
+
 export async function ensureDepotHelper(storage: string) {
   const boundary = fixture();
   assert.equal(storage, boundary.storage);

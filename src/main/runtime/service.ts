@@ -3,17 +3,19 @@ import path from 'node:path';
 import type {BigIntStats} from 'node:fs';
 import {createHash,randomUUID} from 'node:crypto';
 import {checkExistingAncestors,contained,hashFile,noLinks,safeDirectory,safeFile} from '../files';
-import {gameRunning,steamRoots,fileVersion} from '../windows';
+import {gameRunning,steamRoots} from '../windows';
 import {registerRuntimePreparationTarget,runtimePreparationDirectory} from '../installer/managed-target';
 import {MetadataStore} from '../installer/metadata';
 import type {SandboxGrant} from '../installer/sandbox';
 import {verifySteamSelection,verifySteamRecoverySelection,assertSteamIdle} from './steam';
 import {assertRuntimeCohort,authenticateRuntimeCohort,type RuntimeCohort} from './policy';
-import {RuntimeTransaction,stageRuntimeExecutable,verifyRuntimeExecutable,type RuntimeExecutableProof,type WholePlayCheckpoint,type WholePlayPlanner} from './transaction';
+import {RuntimeTransaction,stageRuntimeExecutable,verifyRuntimeExecutable,type RuntimeExecutableProof,type RuntimeVersionReader,type WholePlayCheckpoint,type WholePlayPlanner} from './transaction';
+import {readPeVersion} from './pe-version';
 import {ensureDepotHelper,acquireDepots} from './depot';
 import type {RuntimePreparationState,RuntimeRecoveryState} from '../../shared/runtime-contracts';
 const policyUrl='https://pub-276cbfc24fc84b30bbef7eaa4f57067c.r2.dev/runtime/steam-1170.json';
 const runtimeJournal='runtime-preparation/journal.json';
+const policyLedger='runtime-preparation/policy-ledger.json';
 const digest=/^[a-f0-9]{64}$/;
 const installationId=/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const selectionsInUse=new Set<string>();
@@ -167,7 +169,7 @@ export class RuntimePreparation {
   const helper=await ensureDepotHelper(this.storage,policy,signal);
   return acquireDepots(policy,helper,cache,signal,(phase,message,authQr)=>this.updateOperation(signal,{phase,message,authQr}),needed);
  }
- protected runtimeVersion(file:string){return fileVersion(file,true);}
+ protected runtimeVersion(...args:Parameters<RuntimeVersionReader>){return readPeVersion(...args);}
  private runtimeCache(payloads:string,policy:Readonly<RuntimeCohort>){
   const digest=createHash('sha256').update(JSON.stringify({depots:policy.depots,files:policy.files})).digest('hex');
   return path.join(payloads,'steam-depots',digest);
@@ -221,6 +223,19 @@ export class RuntimePreparation {
   const release=await this.profileBootstrapLease(directory,checkStagingRoots);
   try{
   await noExistingRegistration();
+  const metadata=path.join(directory,'metadata');
+  const ledgerFile=path.join(metadata,policyLedger);
+  let hasLedger=true;
+  try{await noLinks(ledgerFile);}
+  catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;hasLedger=false;}
+  if(hasLedger){
+   const keyFile=await safeFile(metadata,'auth-key');
+   const keyStat=await fs.lstat(keyFile);
+   if(keyStat.nlink!==1||keyStat.size!==32)throw Error('Invalid runtime policy ledger key');
+   const key=await fs.readFile(keyFile);
+   if(key.length!==32)throw Error('Invalid runtime policy ledger key');
+   this.checkLedger(policy,await MetadataStore.readAuthenticated(ledgerFile,key));
+  }
   const executable=policy.files.find(file=>file.path.toLowerCase()==='skyrimse.exe');
   if(!executable)throw Error('Signed runtime executable is missing');
   const needed:RuntimeCohort['files']=[];
@@ -269,7 +284,7 @@ export class RuntimePreparation {
     await guard();await checkStagingRoots();
    });
   }
-  const checkExecutable=await verifyRuntimeExecutable(executableFile,executable,policy.runtime,file=>this.runtimeVersion(file));
+  const checkExecutable=await verifyRuntimeExecutable(executableFile,executable,policy.runtime,(...args)=>this.runtimeVersion(...args));
   const proof:RuntimeExecutableProof={file:executableFile,expected:executable,check:async()=>{
    await checkStagingRoots();
    await checkExecutable();
@@ -509,7 +524,7 @@ export class RuntimePreparation {
    await this.ledger(selected.store,policy);
    const tx=await RuntimeTransaction.open(selected.grant,policy,selected.guard,{
     iniDirectories:this.iniDirectory?[config,this.iniDirectory]:[config],
-    steamStamp:selected.steamStamp,wholePlayStorage:this.storage,runtimeVersion:file=>this.runtimeVersion(file),
+    steamStamp:selected.steamStamp,wholePlayStorage:this.storage,runtimeVersion:(...args)=>this.runtimeVersion(...args),
     wholePlayCheckpoint:async(stage,relative,writer)=>{
      if(stage==='after-preimages-commit'){
       this.updateOperation(signal,{...recoveryState('recoverable',true),phase:'applying',message:'สำรองไฟล์ต้นฉบับครบแล้ว กำลังเตรียมไฟล์ Play'});
@@ -532,10 +547,17 @@ export class RuntimePreparation {
    this.updateOperation(signal,{phase:'ready',message:'runtime และไฟล์ Play ผ่านการตรวจสอบครบแล้ว',authQr:undefined});
   });
  }
- private async ledger(store:MetadataStore,policy:Readonly<RuntimeCohort>){
+ private checkLedger(policy:Readonly<RuntimeCohort>,raw:unknown){
   const createdAt=Date.parse(policy.createdAt),sha256=createHash('sha256').update(JSON.stringify(policy)).digest('hex');
-  try{const previous=await store.read('runtime-preparation/policy-ledger.json') as {createdAt:number;sha256:string};if(createdAt<previous.createdAt||createdAt===previous.createdAt&&sha256!==previous.sha256)throw Error('Stale/conflicting runtime metadata');if(createdAt===previous.createdAt)return;}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
-  await store.write('runtime-preparation/policy-ledger.json',{createdAt,sha256});
+  const previous=raw as {createdAt?:number;sha256?:string}|null;
+  if(!previous||!Number.isSafeInteger(previous.createdAt)||typeof previous.sha256!=='string'||!digest.test(previous.sha256))throw Error('Invalid runtime policy ledger');
+  if(createdAt<previous.createdAt!||createdAt===previous.createdAt&&sha256!==previous.sha256)throw Error('Stale/conflicting runtime metadata');
+  return createdAt===previous.createdAt;
+ }
+ private async ledger(store:MetadataStore,policy:Readonly<RuntimeCohort>){
+  try{if(this.checkLedger(policy,await store.read(policyLedger)))return;}
+  catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+  await store.write(policyLedger,{createdAt:Date.parse(policy.createdAt),sha256:createHash('sha256').update(JSON.stringify(policy)).digest('hex')});
  }
  async inspect(game:string,config:string){return this.run(game,config,true,async signal=>{
   this.updateOperation(signal,{phase:'checking',message:'ตรวจเกมและ metadata ที่ลงลายเซ็นแล้ว',authQr:undefined});
@@ -571,7 +593,7 @@ export class RuntimePreparation {
   await this.ledger(c.store,p);
   await provisioned?.proof.check();
   const tx=await RuntimeTransaction.open(c.grant,p,c.guard,{
-   iniDirectories:this.iniDirectory?[config,this.iniDirectory]:[config],steamStamp:c.steamStamp,runtimeVersion:file=>this.runtimeVersion(file),
+   iniDirectories:this.iniDirectory?[config,this.iniDirectory]:[config],steamStamp:c.steamStamp,runtimeVersion:(...args)=>this.runtimeVersion(...args),
    admittedExecutable:provisioned?.proof,
   });
   await tx.recover(signal);

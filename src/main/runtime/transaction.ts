@@ -8,7 +8,7 @@ import {relativePath,safeDirectory,safeFile,hashFile,checkExistingAncestors,cont
 import {checkRoots,type SandboxGrant} from '../installer/sandbox';
 import {assertRuntimeCohort,runtimePath,managedRuntimePath,type RuntimeCohort} from './policy';
 import {planCreationIsolation,type Isolation} from './creations';
-import {fileVersion} from '../windows';
+import {readPeVersion} from './pe-version';
 
 interface Image {size:number;sha256:string;}
 interface ObservedImage extends Image {stamp:string;}
@@ -42,7 +42,7 @@ interface Options {
  freeBytes?:(root:string)=>Promise<number>;checkpoint?:(stage:string)=>Promise<void>;
  iniDirectories?:readonly string[];steamStamp?:string;wholePlayStorage?:string;
  wholePlayCheckpoint?:(stage:WholePlayCheckpoint,path?:string,writer?:string)=>Promise<void>;
- runtimeVersion?:(file:string)=>Promise<string>;
+ runtimeVersion?:RuntimeVersionReader;
  admittedExecutable?:RuntimeExecutableProof;
 }
 interface Intent {
@@ -70,28 +70,47 @@ function cacheObservation(key:string,stamp:string,image:Image){
 
 async function executableStamp(file:string){
  await noLinks(file);
- const stat=await fs.lstat(file,{bigint:true});
+ return regularExecutableStamp(await fs.lstat(file,{bigint:true}));
+}
+function regularExecutableStamp(stat:BigIntStats){
  if(!stat.isFile()||stat.nlink!==1n)throw Error('Unsafe runtime executable');
  return fileStamp(stat);
 }
 
+export type RuntimeVersionReader=(file:string,handle:Awaited<ReturnType<typeof fs.open>>,size:number)=>Promise<string>;
 /** Bind the version resource to a stable observation of the signed bytes. */
 export async function verifyRuntimeExecutable(
- file:string,expected:Image,version:string,readVersion:(file:string)=>Promise<string>,final=false
+ file:string,expected:Image,version:string,readVersion:RuntimeVersionReader,final=false
 ){
  const stamp=await executableStamp(file);
- if(!same(await hashFile(file,limit),expected))throw Error('Runtime executable does not match the signed image');
  const check=async()=>{
   if(await executableStamp(file)!==stamp)throw Error('Runtime executable changed during version verification');
  };
- await check();
  const message=final?'Final runtime version verification failed; Restore is available':
   'Preflight runtime version verification failed; expected Skyrim '+version;
- let observed:string;
- try{observed=await readVersion(file);}catch(cause){throw Error(message,{cause});}
- await check();
- if(observed!==version)throw Error(message);
- return check;
+ const handle=await fs.open(file,'r');
+ try{
+  const checkHandle=async()=>{
+   if(regularExecutableStamp(await handle.stat({bigint:true}))!==stamp)throw Error('Runtime executable changed during version verification');
+  };
+  await checkHandle();
+  const digest=createHash('sha256'),buffer=Buffer.alloc(1024*1024);
+  if(!validImage(expected))throw Error('Invalid signed executable image');
+  for(let offset=0;offset<expected.size;){
+   const {bytesRead}=await handle.read(buffer,0,Math.min(buffer.length,expected.size-offset),offset);
+   if(!bytesRead)throw Error('Runtime executable does not match the signed image');
+   digest.update(buffer.subarray(0,bytesRead));offset+=bytesRead;
+  }
+  if((await handle.stat({bigint:true})).size!==BigInt(expected.size)||digest.digest('hex')!==expected.sha256){
+   throw Error('Runtime executable does not match the signed image');
+  }
+  await checkHandle();
+  let observed:string;
+  try{observed=await readVersion(file,handle,expected.size);}catch(cause){throw Error(message,{cause});}
+  await checkHandle();await check();
+  if(observed!==version)throw Error(message);
+  return check;
+ }finally{await handle.close();}
 }
 
 async function writeRuntimeBlob(file:string,source:string,want:Image,guard:()=>Promise<void>){
@@ -333,7 +352,7 @@ export class RuntimeTransaction {
    await admitted.check();
    return async(checkInstalled=true)=>{if(checkInstalled)await requireInstalled();await admitted.check();};
   }
-  const version=this.options.runtimeVersion??(this.grant.targetClass==='managed-fixture'?undefined:(file:string)=>fileVersion(file,true));
+  const version=this.options.runtimeVersion??(this.grant.targetClass==='managed-fixture'?undefined:readPeVersion);
   if(!version)return async()=>{};
   const check=await verifyRuntimeExecutable(file,entry,policy.runtime,version,final);
   await requireInstalled();

@@ -6,6 +6,7 @@ import test from 'node:test';
 import {promisify} from 'node:util';
 import {createHash} from 'node:crypto';
 import {canonicalTemporaryRoot} from '../src/main/temporary-root';
+import {readPeVersion} from '../src/main/runtime/pe-version';
 
 test('W03 Windows version reader binds cached results to file identity and can bypass the cache', async t => {
   const temp = await canonicalTemporaryRoot();
@@ -87,4 +88,11 @@ test('W03 Windows reads a version resource from an extensionless staged executab
   const version=await fileVersion(named,true);
   assert.ok(version,'The inert Windows PE must have a readable version resource');
   assert.equal(await fileVersion(staged,true),version);
+  const {verifyRuntimeExecutable}=await import('../src/main/runtime/transaction');
+  const expected={size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')};
+  const proof=await verifyRuntimeExecutable(staged,expected,version,readPeVersion);
+  await proof();
+  const file=await fs.open(staged,'r');
+  try{await assert.rejects(readPeVersion(staged,file,64),/Invalid x64 PE/);}
+  finally{await file.close();}
 });

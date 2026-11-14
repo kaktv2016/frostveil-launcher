@@ -260,11 +260,11 @@ async function start(){
    await scan(true);
   });
  });
- const standaloneWrite=async(operation:()=>Promise<unknown>)=>{
+ const standaloneWrite=async(operation:()=>Promise<unknown>,recover=false)=>{
   if(fixture||!settings.directory)return operation();
   const {game,config}=runtimeDirectories();
   await runtimePreparation.withStandaloneWrite(game,config,async()=>{
-   await verifySteamSelection(game,await steamRoots());
+   if(!recover)await verifySteamSelection(game,await steamRoots());
    return operation();
   });
  };
@@ -293,8 +293,8 @@ async function start(){
  handler('prepare-management',async arg=>{await scan();await management.prepare(arg);});
  handler('apply-management',async arg=>{await scan();await standaloneWrite(()=>management.apply(arg));});
  handler('cancel-management',async arg=>{noArgument(arg);management.cancel();});
- handler('rollback-management',async arg=>{noArgument(arg);await scan();await standaloneWrite(()=>management.rollback());});
- handler('recover-management',async arg=>{noArgument(arg);await scan();await standaloneWrite(()=>management.recover());});
+ handler('rollback-management',async arg=>{noArgument(arg);await scan();await standaloneWrite(()=>management.rollback(),true);});
+ handler('recover-management',async arg=>{noArgument(arg);await scan();await standaloneWrite(()=>management.recover(),true);});
  handler('management-fixture',async arg=>{noArgument(arg);state.managementFixture={phase:'running',message:'Disposable installation fixture running',stage:'starting',checks:[]};const emit=()=>window.webContents.send('launcher:management-fixture-state',state.managementFixture);emit();try{const result=await runManagementFixtureDemo(stage=>{state.managementFixture!.stage=stage;emit();});state.managementFixture={phase:'complete',message:'REALISTIC SANDBOX VERIFIED — real Skyrim not modified',stage:'complete',checks:result.checks};}catch(error){state.managementFixture={phase:'error',message:error instanceof Error?error.message:'Fixture failed',stage:'error',checks:[]};throw error;}finally{emit();}});
 
  handler('scan',async arg=>{noArgument(arg);await scan();});

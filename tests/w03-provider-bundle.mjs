@@ -14,13 +14,14 @@ export const w03ProviderBoundaries = {
 
     const expected = new Set([
       JSON.stringify([service, '../windows']),
+      JSON.stringify([service, './pe-version']),
       JSON.stringify([target, '../windows']),
       JSON.stringify([policy, '../distribution/policy']),
       JSON.stringify([service, './depot']),
       JSON.stringify([depot, 'node:child_process']),
     ]);
     const matched = new Set();
-    builder.onResolve({filter: /^(\.\.\/windows|\.\.\/distribution\/policy|\.\/depot|node:child_process)$/}, args => {
+    builder.onResolve({filter: /^(\.\.\/windows|\.\.\/distribution\/policy|\.\/depot|\.\/pe-version|node:child_process)$/}, args => {
       const boundary = JSON.stringify([args.importer, args.path]);
       if (expected.has(boundary)) {
         matched.add(boundary);

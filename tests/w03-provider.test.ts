@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {createHash, sign} from 'node:crypto';
+import {createHash, createHmac, randomBytes, sign} from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import test, {type TestContext} from 'node:test';
@@ -309,6 +309,24 @@ test('W03 profile bootstrap only recovers a verified dead owner lease',async t=>
   await assert.rejects(fs.stat(temp),{code:'ENOENT'});
   assert.equal(f.service.snapshot().phase,'ready');
   assert.equal(f.invocations.length,1);
+});
+
+test('W03 missing profile refuses an older authenticated policy before acquisition',async t=>{
+  const f=await fixture(t,'missing-profile');
+  const metadata=path.join(f.directory,'metadata');
+  const runtime=path.join(metadata,'runtime-preparation');
+  await fs.mkdir(runtime,{recursive:true});
+  const key=randomBytes(32);
+  await fs.writeFile(path.join(metadata,'auth-key'),key,{flag:'wx'});
+  const body=JSON.stringify({createdAt:Date.parse(f.policy.createdAt)+1,sha256:sha('previously admitted policy')});
+  await fs.writeFile(path.join(runtime,'policy-ledger.json'),JSON.stringify({body,mac:createHmac('sha256',key).update(body).digest('hex')}),{flag:'wx'});
+  const prior=await f.ledger(),targets=await f.targets();
+  await assert.rejects(f.prepare(),/Stale\/conflicting runtime metadata/);
+  assert.equal(f.invocations.length,0);
+  assert.deepEqual(await f.targets(),targets);
+  assert.deepEqual(await f.ledger(),prior);
+  assert.equal(await f.journal(),null);
+  await assert.rejects(fs.lstat(f.config),{code:'ENOENT'});
 });
 
 test('W03 cold trio verifies before Ready and two warm runs plus staged reuse need no new helper', async t => {
