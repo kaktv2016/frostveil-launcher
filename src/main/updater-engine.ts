@@ -244,10 +244,10 @@ export class NsisEngine extends EventEmitter implements UpdateEngine {
   }
  }
 
- async install(){
+ async install(beforeSpawn:()=>Promise<void>){
   if(!this.verifiedFile||!this.verifiedBinding||!this.authenticated)throw Error('Verified Ed25519 NSIS download required');
   await this.ledger.check(this.authenticated);
-  const handoffFile=await prepareVerifiedInstallHandoff(this.verifiedFile,this.verifiedBinding.binding,this.storageDir);
+  const handoffFile=await prepareVerifiedInstallHandoff(this.verifiedFile,this.verifiedBinding.binding,this.storageDir,beforeSpawn);
   const args=['--updated','/S','--force-run',...(this.options.installDirectory?['/D='+this.options.installDirectory]:[])];
   if(this.options.runHandoffInstaller){
    await this.options.runHandoffInstaller(handoffFile,args);

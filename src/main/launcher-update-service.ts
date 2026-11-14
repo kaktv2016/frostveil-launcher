@@ -3,7 +3,7 @@ import type {LauncherUpdate} from '../shared/contracts';
 export interface UpdateEngine {
  on(event:string,listener:(value:any)=>void):unknown;
  removeListener(event:string,listener:(value:any)=>void):unknown;
- check():Promise<unknown>;download():Promise<void>;install():void|Promise<void>;cancel():void;
+ check():Promise<unknown>;download():Promise<void>;install(beforeSpawn:()=>Promise<void>):void|Promise<void>;cancel():void;
 }
 interface Options {version:string;checkEnabled:boolean;downloadTrusted:boolean;installed:boolean;now?:()=>number;gameRunning:()=>Promise<boolean>;sourceUrl?:string;}
 const DEFAULT_SOURCE='https://github.com/kaktv2016/frostveil-launcher/releases';
@@ -112,10 +112,22 @@ export class LauncherUpdateService {
   try{await this.engine.download();if(this.snapshot().state==='downloading')throw Error('Download was not verified');}catch(error){this.fail(error);}finally{this.lock=false;}
  }
  defer(){if(!['downloaded','deferred'].includes(this.value.state)||this.lock)throw Error('No downloaded update');this.set({state:'deferred',message:'Update deferred; it will not install automatically on quit'});}
+ private async requireIdleGame(){
+  if(await this.options.gameRunning())throw Error('Skyrim/SKSE is running; close it yourself before updating');
+  if(this.disposed)throw Error('Launcher closed before installer handoff');
+ }
  async install(){
   if(this.disposed||this.lock||!this.options.installed||!this.options.downloadTrusted||!['downloaded','deferred'].includes(this.value.state))throw Error('Installed signed NSIS build and verified download required');
   this.lock=true;const previous=this.value.state;
-  try{if(await this.options.gameRunning())throw Error('Skyrim/SKSE is running; close it yourself before updating');this.set({state:'installing',message:'Restarting through NSIS updater; installation not yet confirmed',canInstall:false});await this.engine.install();}catch(error){const message=error instanceof Error&&error.message.startsWith('Skyrim/SKSE is running')?error.message:'Verified update installation could not start; retry later';this.set({state:previous,message,canInstall:true});throw Error(message);}finally{this.lock=false;}
+  try{
+   await this.requireIdleGame();
+   this.set({state:'installing',message:'Restarting through NSIS updater; installation not yet confirmed',canInstall:false});
+   await this.engine.install(()=>this.requireIdleGame());
+  }catch(error){
+   const message=error instanceof Error&&error.message.startsWith('Skyrim/SKSE is running')?error.message:'Verified update installation could not start; retry later';
+   this.set({state:previous,message,canInstall:true});
+   throw Error(message);
+  }finally{this.lock=false;}
  }
  dispose(){this.disposed=true;this.engine.cancel();for(const [name,listener] of this.listeners)this.engine.removeListener(name,listener);this.subscribers.clear();}
 }

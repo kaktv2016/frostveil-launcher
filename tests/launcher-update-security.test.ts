@@ -438,6 +438,8 @@ test('L2-Ed25519 #15 & #16: unapproved redirect host is rejected and active Skyr
   const transport=LauncherUpdateTransport.loopback(origin,'disposable-test');
   let handoffExecuted=false;
   let skyrimRunning=true;
+  let startsDuringHandoff=false;
+  let processChecks=0;
   let clock=fx.nowMs;
   const engine=new NsisEngine([],{
    source:fx.source,
@@ -453,7 +455,10 @@ test('L2-Ed25519 #15 & #16: unapproved redirect host is rejected and active Skyr
    downloadTrusted:true,
    installed:true,
    now:()=>clock,
-   gameRunning:async()=>skyrimRunning
+   gameRunning:async()=>{
+    processChecks++;
+    return skyrimRunning||(startsDuringHandoff&&processChecks===2);
+   }
   });
 
   await service.check();
@@ -482,8 +487,18 @@ test('L2-Ed25519 #15 & #16: unapproved redirect host is rejected and active Skyr
   assert.equal(handoffExecuted,false);
   assert.equal(service.snapshot().state,'downloaded');
 
-  // Once Skyrim is closed, install succeeds via verified handoff
+  // An external process can start while the verified installer is copied.
   skyrimRunning=false;
+  processChecks=0;
+  startsDuringHandoff=true;
+  await assert.rejects(()=>service.install(),/Skyrim\/SKSE is running/);
+  assert.equal(processChecks,2);
+  assert.equal(handoffExecuted,false);
+  assert.equal(service.snapshot().state,'downloaded');
+  assert.equal(service.snapshot().canInstall,true);
+
+  // Once Skyrim remains closed, an explicit retry succeeds.
+  startsDuringHandoff=false;
   await service.install();
   assert.equal(handoffExecuted,true);
   service.dispose();

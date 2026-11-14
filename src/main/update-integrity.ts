@@ -393,7 +393,7 @@ export async function verifyDownloadedInstaller(
  if(headerRead<2||header[0]!==0x4d||header[1]!==0x5a)throw updateError('Downloaded file is not a valid Windows PE installer','ERR_UPDATER_INVALID_INSTALLER');
 }
 
-export async function prepareVerifiedInstallHandoff(cachedFile:string,binding:Ed25519InstallerBinding,storageDir:string):Promise<string>{
+export async function prepareVerifiedInstallHandoff(cachedFile:string,binding:Ed25519InstallerBinding,storageDir:string,beforeFinalVerification?:()=>Promise<void>):Promise<string>{
  await verifyDownloadedInstaller(cachedFile,validateLauncherUpdateManifest(JSON.parse(Buffer.from(binding.envelope.payloadBase64,'base64').toString('utf8'))).installer.sha512,[],authenticode,binding);
  const authenticated=authenticateLauncherUpdate(binding.envelope,binding.source,binding.release,binding.installedVersion,binding.now);
  const beforeStat=await fs.lstat(cachedFile);
@@ -410,6 +410,7 @@ export async function prepareVerifiedInstallHandoff(cachedFile:string,binding:Ed
  if(afterIdentity!==beforeIdentity||Math.abs(afterStat.mtimeMs-beforeStat.mtimeMs)>1||afterStat.nlink!==1)throw updateError('Cached installer mutated during handoff copy','ERR_UPDATER_INSTALLER_REPLACED');
  const handoffStat=await fs.lstat(handoffFile);
  const handoffIdentity=await fileIdentity(handoffFile);
+ await beforeFinalVerification?.();
  await verifyDownloadedInstaller(handoffFile,authenticated.manifest.installer.sha512,[],authenticode,{
   ...binding,
   expectedIdentity:handoffIdentity,
