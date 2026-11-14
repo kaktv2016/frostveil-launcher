@@ -99,6 +99,7 @@ async function fixture(t:TestContext,preferences:Buffer|null){
  await fs.mkdir(path.dirname(prefsPath),{recursive:true});
  if(preferences)await fs.writeFile(prefsPath,preferences);else await fs.rm(prefsPath,{force:true});
  const signed=policy();let acquisitions=0,policyLoads=0;
+ let duringAcquire:(()=>Promise<void>)|undefined;
  const stagedRuntime=path.join(source,'SkyrimSE.exe');await fs.writeFile(stagedRuntime,runtimeAfter);
  const stagedLoader=path.join(source,'skse64_loader.exe');await fs.writeFile(stagedLoader,loaderBytes);
  const stagedSkse=path.join(source,'skse64_1_6_1170.dll');await fs.writeFile(stagedSkse,skseRuntimeBytes);
@@ -111,7 +112,7 @@ async function fixture(t:TestContext,preferences:Buffer|null){
   protected override async loadPolicy(){policyLoads++;return signed;}
   protected override async acquire(value:Readonly<RuntimeCohort>,_destination:string,signal:AbortSignal,requested:readonly string[]){
    signal.throwIfAborted();assert.equal(value,signed);acquisitions++;
-   assert.deepEqual([...requested].sort(),['SkyrimSE.exe']);return source;
+   assert.deepEqual([...requested].sort(),['SkyrimSE.exe']);await duringAcquire?.();return source;
   }
   protected override async runtimeVersion(file:string){
    assert.ok([executable,stagedExecutable].includes(file));
@@ -182,6 +183,7 @@ async function fixture(t:TestContext,preferences:Buffer|null){
  const snapshot=async()=>({images:await targetImages(),journal:sha(await fs.readFile(journalPath))});
  return{grant,game,config,runtime,adapters,prefsPath,preferences,snapshot,
   targetImages,journalPath,versionProbes,executable,stagedExecutable,
+  duringAcquire:(action:()=>Promise<void>)=>{duringAcquire=action;},
   setExecutableVersion:(version:string)=>{executableVersion=version;},
   swapExecutableBeforeJournal:()=>{driftAt='before-preimages-commit';},
   interruptAfterJournal:()=>{stopAfterJournal=true;},
@@ -400,4 +402,26 @@ test('legacy graphics activation with the same active order and different signed
 test('a legacy graphics output outside the authenticated runtime inventory is refused during planning',async t=>{
  const f=await legacyGraphicsFixture(t,{plugins:graphicPlugins,loadorder:graphicLoadorder,unauthorized:true});
  await assert.rejects(()=>f.graphics.planWholePlay(f.projection),/not authorized by the signed runtime/i);
+});
+
+test('W02 Whole Play acquisition leaves the transaction lease available',async t=>{
+ const f=await fixture(t,null);
+ let inspected=false;
+ f.duringAcquire(async()=>{
+  const store=await MetadataStore.create(f.grant);
+  const release=await store.lease();
+  try{inspected=true;}finally{await release();}
+ });
+ await preparePlay(f.runtime,f.game,f.config,f.adapters);
+ assert.equal(inspected,true);
+});
+
+test('W02 Whole Play refuses a target preimage edit during acquisition',async t=>{
+ const f=await fixture(t,null),modified=Buffer.from('external edit during acquisition');
+ const pathChanged=path.join(f.config,'plugins.txt');
+ f.duringAcquire(async()=>{await fs.writeFile(pathChanged,modified);});
+ await assert.rejects(preparePlay(f.runtime,f.game,f.config,f.adapters),/preimage changed during acquisition/i);
+ assert.deepEqual(await fs.readFile(pathChanged),modified);
+ assert.deepEqual(await fs.readFile(f.executable),runtimeBefore);
+ await assert.rejects(fs.stat(f.journalPath),{code:'ENOENT'});
 });

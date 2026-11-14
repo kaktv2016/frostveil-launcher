@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {PassThrough} from 'node:stream';
 import {contained, noLinks} from '../src/main/files';
-export {acquireDepots} from '../src/main/runtime/depot';
+export {acquireDepots,inspectDepotReuse,promoteLegacyDepots} from '../src/main/runtime/depot';
 
 // Only the W03 test bundle substitutes these ephemeral keys at the policy
 // import. Verification still runs the production-shaped policy rules.

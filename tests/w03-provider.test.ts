@@ -10,6 +10,9 @@ import {RuntimePreparation} from '../src/main/runtime/service';
 import {verifySteamSelection} from '../src/main/runtime/steam';
 import {canonicalTemporaryRoot} from '../src/main/temporary-root';
 import type {RuntimeCohort} from '../src/main/runtime/policy';
+import {measureCacheRoots} from '../src/main/runtime/cache-census';
+import {cacheScopeId,packagedCachePolicy} from '../src/main/runtime/cache-policy';
+import {openCacheAccounting} from '../src/main/runtime/cache-ledger';
 import type {RuntimePreparationState} from '../src/shared/runtime-contracts';
 import {bindFixture, fixtureKeys} from './w03-provider-boundaries';
 
@@ -108,7 +111,7 @@ async function fixture(t: TestContext, start: 'cold' | 'warm' | 'missing-profile
   await writeBundled(envelope(policy));
 
   let response = () => Response.json(envelope(policy));
-  let mode: 'success' | 'disconnect' | 'cancel' = 'success';
+  let mode: 'success' | 'disconnect' | 'cancel' | 'overrun' = 'success';
   let version = policy.runtime as string;
   const requests: string[] = [], targetWrites: string[] = [], faults: unknown[] = [];
   const states: RuntimePreparationState[] = [];
@@ -141,18 +144,22 @@ async function fixture(t: TestContext, start: 'cold' | 'warm' | 'missing-profile
       assert.ok(manifestStart > 3 && qrStart > manifestStart);
       const requested = (await fs.readFile(path.join(cwd, 'cohort-files.txt'), 'utf8')).split('\n');
       invocations.push({ids: args.slice(3, manifestStart), manifests: args.slice(manifestStart+1, qrStart), requested, challenges: args.filter(a => a === '-qr').length});
-      assert.ok(mode === 'success' || requested.includes(partialFile.path));
-      for (const name of mode === 'success' ? requested : [partialFile.path]) {
+      assert.ok(mode === 'success' || mode === 'overrun' || requested.includes(partialFile.path));
+      for (const name of mode === 'success' || mode === 'overrun' ? requested : [partialFile.path]) {
         const f = payloads.find(f => f.path === name);
         assert.ok(f, 'fixture requests must stay in the signed inventory');
         const file = path.join(raw, f.path);
         await fs.mkdir(path.dirname(file), {recursive: true});
         await fs.writeFile(file, f.target, {flag: 'wx'});
       }
+      if(mode==='overrun'){
+        const excess=path.join(raw,'unattributed-growth.bin');
+        await fs.writeFile(excess,Buffer.alloc(256*1024,0x61),{flag:'wx'});
+      }
       child.stdout.write('synthetic helper diagnostic\n'+qr);
       if (mode === 'disconnect') child.stderr.write('Lost connection to Steam\n');
       if (mode === 'cancel') assert.ok(child.killed, 'the challenge subscriber must cancel this helper');
-      child.finish(mode === 'success' ? 0 : mode === 'cancel' ? null : 1);
+      child.finish(mode === 'success' || mode === 'overrun' ? 0 : mode === 'cancel' ? null : 1);
     }
   }));
 
@@ -471,4 +478,69 @@ test('W03 policy accepts authenticated fallback only on 404 and refuses stale, c
   assert.deepEqual(f.targetWrites, []);
   assert.equal(f.requests.length, 9);
   assertNoAcquisition(f.states);
+});
+
+test('W02 verified legacy cohort needs no helper even when helper setup is unavailable', async t => {
+  const f=await fixture(t);
+  const cache=path.join(f.directory,'packages','steam-depots',depotsDigest);
+  for (const file of payloads) {
+    const legacy=path.join(cache,file.depot,file.path);
+    await fs.mkdir(path.dirname(legacy),{recursive:true});
+    await fs.writeFile(legacy,file.target,{flag:'wx'});
+  }
+  await fs.unlink(path.join(f.root,'inert-helper.bin'));
+  await f.prepare();
+  assert.equal(f.service.snapshot().phase,'ready');
+  assertNoAcquisition(f.states);
+  assert.equal(f.invocations.length,0);
+  assert.deepEqual((await f.rawFiles()).map(file=>file?.sha256),files.map(file=>file.sha256));
+});
+test('W02 helper overrun preserves bytes and blocks any further raw growth on this boot', async t=>{
+  const f=await fixture(t),before=await f.targets();
+  f.setMode('overrun');
+  await assert.rejects(f.prepare(),/Cache accounting helper overrun/);
+  assert.equal(f.invocations.length,1);
+  const marker=path.join(f.directory,'packages','steam-depots',depotsDigest,'cohort','unattributed-growth.bin');
+  const prior=await identity(marker);
+  assert.ok(prior);
+  assert.deepEqual(await f.targets(),before);
+  assert.equal(await f.journal(),null);
+
+  const {roots:[root]}=await measureCacheRoots([f.storage]);
+  assert.ok(root?.fileId);
+  const scope=cacheScopeId(root.path,root.volumeId,root.fileId);
+  const record=await openCacheAccounting(path.join(f.storage,'runtime-cache-accounting'),scope,ledger=>ledger.readActive());
+  assert.equal(record?.state,'overrun');
+  const missing=path.join(f.directory,'packages','steam-depots',depotsDigest,'cohort',payloads[0]!.path);
+  const backedAside=missing+'.fixture-kept';
+  await fs.rename(missing,backedAside);
+  await assert.rejects(f.prepare(),/previous helper quiescence is unverified/);
+  assert.equal(f.invocations.length,1);
+  assert.deepEqual(await identity(marker),prior);
+  assert.ok(await identity(backedAside));
+  assert.deepEqual(await f.targets(),before);
+});
+test('W02 candidate bundle with a missing policy denies helper growth and still verifies warm reuse', {
+  skip: !packagedCachePolicy.required
+}, async t=>{
+  const f=await fixture(t),before=await f.targets();
+  process.env.FROSTVEIL_PACKAGED_CACHE_POLICY='{"required":false}';
+  t.after(()=>{delete process.env.FROSTVEIL_PACKAGED_CACHE_POLICY;});
+  await assert.rejects(f.prepare(),/Cache accounting policy/);
+  assert.equal(f.invocations.length,0);
+  assert.deepEqual(await f.targets(),before);
+  assert.equal(await f.journal(),null);
+  const legacy=path.join(f.directory,'packages','steam-depots',depotsDigest);
+  for(const file of payloads){
+    const source=path.join(legacy,file.depot,file.path);
+    await fs.mkdir(path.dirname(source),{recursive:true});
+    await fs.writeFile(source,file.target,{flag:'wx'});
+  }
+  await f.prepare();
+  assert.equal(f.invocations.length,0);
+  assert.equal(f.service.snapshot().phase,'ready');
+  f.setResponse(()=>new Response(null,{status:503}));
+  await f.restore();
+  assert.equal((await f.readJournal()).state,'restored');
+  assert.deepEqual((await f.targets()).map(file=>file?.sha256),before.map(file=>file?.sha256));
 });

@@ -12,6 +12,7 @@ import {assertRuntimeCohort,authenticateRuntimeCohort,type RuntimeCohort} from '
 import {RuntimeTransaction,stageRuntimeExecutable,verifyRuntimeExecutable,type RuntimeExecutableProof,type RuntimeVersionReader,type WholePlayCheckpoint,type WholePlayPlanner} from './transaction';
 import {readPeVersion} from './pe-version';
 import {ensureDepotHelper,acquireDepots} from './depot';
+import {accountDepotAcquisition} from './cache-acquisition';
 import type {RuntimePreparationState,RuntimeRecoveryState} from '../../shared/runtime-contracts';
 const policyUrl='https://pub-276cbfc24fc84b30bbef7eaa4f57067c.r2.dev/runtime/steam-1170.json';
 const runtimeJournal='runtime-preparation/journal.json';
@@ -47,6 +48,9 @@ function operationMessage(error:unknown,cancelled:boolean){
  const message=error instanceof Error?error.message:'';
  if(/game running|close Skyrim|Skyrim\/SKSE or Steam update active|Steam update|Steam installation changed/i.test(message))
   return 'ปิด Skyrim และ SKSE หรือรอให้ Steam อัปเดตเสร็จ แล้วลองอีกครั้ง';
+ if(/Cache accounting recovery required/i.test(message))return 'พบการดาวน์โหลดค้าง ตรวจข้อมูลกู้คืนหรือรีสตาร์ต Windows เพื่อยืนยันว่าโปรแกรมดาวน์โหลดหยุดแล้ว';
+ if(/Cache accounting policy/i.test(message))return 'ชุดทดสอบยังไม่มีนโยบายพื้นที่จัดเก็บที่ตรงกับโปรไฟล์และไดรฟ์นี้ ติดต่อทีม Frostveil';
+ if(/Cache accounting admission refused|Cache accounting helper overrun/i.test(message))return 'พื้นที่จัดเก็บเกินที่กำหนด เก็บไฟล์เดิมไว้และตรวจสอบพื้นที่หรือใช้ปุ่มคืนไฟล์';
  if(/disk space|free space/i.test(message))return 'พื้นที่ว่างไม่เพียงพอ ตรวจพื้นที่ของเกม โปรไฟล์ และข้อมูลสำรอง แล้วลองอีกครั้ง';
  if(/another whole-Play recovery journal owns/i.test(message))return 'เลือกโฟลเดอร์เกมเดิมที่เริ่มเตรียมไว้เพื่อคืนไฟล์';
  if(/preflight runtime version verification failed/i.test(message))
@@ -165,9 +169,13 @@ export class RuntimePreparation {
   else throw Error('Signed runtime metadata unavailable (HTTP '+response.status+'); game unchanged');
   return authenticateRuntimeCohort(JSON.parse(bytes.toString('utf8')));
  }
- protected async acquire(policy:Readonly<RuntimeCohort>,cache:string,signal:AbortSignal,needed:readonly string[]){
-  const helper=await ensureDepotHelper(this.storage,policy,signal);
-  return acquireDepots(policy,helper,cache,signal,(phase,message,authQr)=>this.updateOperation(signal,{phase,message,authQr}),needed);
+ protected async acquire(policy:Readonly<RuntimeCohort>,cache:string,signal:AbortSignal,needed:readonly string[],
+  selection?:{game:string;config:string;backupBytes:number;stagingBytes:number}){
+  if(!selection)throw Error('Cache accounting requires the selected installation and profile');
+  return accountDepotAcquisition(this.storage,selection,policy,cache,needed,signal,async missing=>{
+   const helper=await ensureDepotHelper(this.storage,policy,signal);
+   return acquireDepots(policy,helper,cache,signal,(phase,message,authQr)=>this.updateOperation(signal,{phase,message,authQr}),missing);
+  });
  }
  protected runtimeVersion(...args:Parameters<RuntimeVersionReader>){return readPeVersion(...args);}
  private runtimeCache(payloads:string,policy:Readonly<RuntimeCohort>){
@@ -270,12 +278,9 @@ export class RuntimePreparation {
    }catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;missing.push(relative);}
   }
   if(missing.length){
-   const requested=new Set(missing),neededBytes=policy.files.filter(file=>requested.has(file.path)).reduce((total,file)=>total+file.size,0);
-   const space=await fs.statfs(payloads);
-   if(Number(space.bavail)*Number(space.bsize)<neededBytes*2+128*1024**2)throw Error('Insufficient disk space for runtime acquisition');
-   await safeDirectory(cache);
    await checkStagingRoots();
-   source=await this.acquire(policy,cache,signal,missing);
+   source=await this.acquire(policy,cache,signal,missing,{game:selection.game,config:profile,
+    backupBytes:0,stagingBytes:needed.reduce((bytes,file)=>bytes+file.size,0)});
    if(source!==retained)throw Error('Unexpected runtime acquisition location');
   }
   if(!executableFile){
@@ -533,15 +538,9 @@ export class RuntimePreparation {
     }
    });
    const acquire=async(needed:readonly string[])=>{
-    const files=new Set(needed);
-    const neededBytes=policy.files.filter(file=>files.has(file.path)).reduce((total,file)=>total+file.size,0);
-    const space=await fs.statfs(selected.grant.payloads);
-    if(Number(space.bavail)*Number(space.bsize)<neededBytes*2+128*1024**2){
-     throw Error('Insufficient disk space for whole-Play runtime acquisition');
-    }
-    const cache=this.runtimeCache(selected.grant.payloads,policy);
-    await safeDirectory(cache);
-    return this.acquire(policy,cache,signal,needed);
+    const cache=this.runtimeCache(selected.grant.payloads,policy),plan=await tx.inspect();
+    return this.acquire(policy,cache,signal,needed,{game:selected.grant.installation,
+     config:selected.grant.configDirectory!,backupBytes:plan.backupBytes,stagingBytes:plan.stagingBytes});
    };
    await tx.prepareWholePlay(planner,acquire,()=>tx.verifyInstalledRuntime(),signal);
    this.updateOperation(signal,{phase:'ready',message:'runtime และไฟล์ Play ผ่านการตรวจสอบครบแล้ว',authQr:undefined});
@@ -600,11 +599,11 @@ export class RuntimePreparation {
   const plan=await tx.inspect();
   this.updateOperation(signal,{...plan,...await this.readRecovery({game,config},c.store)});
   if(plan.changedFiles){
-   const required=plan.backupBytes+plan.stagingBytes+plan.downloadBytes*2+128*1024**2;
-   for(const root of [c.grant.installation,c.grant.payloads,this.storage,c.grant.configDirectory!]){const stat=await fs.statfs(root);if(Number(stat.bavail)*Number(stat.bsize)<required)throw Error('Insufficient disk space for download, staging and original-file backups');}
    const needed=await tx.neededPayloads();
-   const cache=this.runtimeCache(c.grant.payloads,p);await safeDirectory(cache);
-   const source=provisioned?.source??(needed.length?await this.acquire(p,cache,signal,needed):cache);
+   const cache=this.runtimeCache(c.grant.payloads,p);
+   const source=provisioned?.source??(needed.length?await this.acquire(p,cache,signal,needed,{
+    game:c.grant.installation,config:c.grant.configDirectory!,backupBytes:plan.backupBytes,stagingBytes:plan.stagingBytes
+   }):cache);
    this.updateOperation(signal,{phase:'applying',message:'ตรวจครบแล้ว กำลังเตรียม runtime และพักส่วนเสริมที่ไม่ใช้',authQr:undefined});await tx.apply(source,signal);
   }
   const checkInstalled=await tx.verifyInstalledRuntime();

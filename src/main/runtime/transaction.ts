@@ -579,14 +579,13 @@ export class RuntimeTransaction {
  private async runtimeIntents(
   policy:Readonly<RuntimeCohort>,previous:Journal|null,
   capture:(relative:string)=>Promise<ObservedImage|null>,
-  acquire:(needed:readonly string[])=>Promise<string>,signal:AbortSignal,verifiedTransient?:string
+  sourceRoot:string|undefined,signal:AbortSignal,verifiedTransient?:string
  ){
   const {files,isolation}=await this.planned(previous?.wholePlay&&previous.state!=='restored'?previous:undefined,verifiedTransient);
   for(const change of files){
    if(!same(await capture(change.path),change.before))throw Error('Runtime preimage changed during planning: '+change.path);
   }
   const intents=new Map<string,Intent>();
-  const needed=await this.neededPayloads(),sourceRoot=needed.length?await acquire(needed):undefined;
   for(const file of policy.files){
    signal.throwIfAborted();
    const after={size:file.size,sha256:file.sha256},observed=await capture(file.path);
@@ -705,7 +704,7 @@ export class RuntimeTransaction {
   const policy=this.policy;
   const validateRuntime=()=>assertRuntimeCohort(policy,this.grant.targetClass==='managed-fixture');
   const policyHash=digest(Buffer.from(JSON.stringify(policy)));
-  const release=await this.store.lease(true);
+  let release:(()=>Promise<void>)|undefined=await this.store.lease(true);
   try{
    await this.guard();signal.throwIfAborted();validateRuntime();
    const previous=await this.current();
@@ -736,7 +735,38 @@ export class RuntimeTransaction {
      if(!same(got,file.after)&&!same(got,before))throw Error('Interrupted Play target conflict: '+file.path);
     }
    }
-   const intents=await this.runtimeIntents(policy,previous,capture,acquire,signal,transient?.relative);
+   const preflightPlan=(await this.planned(previous?.wholePlay&&previous.state!=='restored'?previous:undefined,transient?.relative)).files;
+   const needed=await this.neededPayloads();
+   let sourceRoot:string|undefined;
+   if(needed.length){
+    for(const file of preflightPlan)await capture(file.path);
+    for(const file of policy.files)await capture(file.path);
+    for(const relative of ['@config/plugins.txt','@config/loadorder.txt'])await capture(relative);
+    const journalBefore=JSON.stringify(previous);
+    const releaseForAcquisition=release;
+    release=undefined;
+    await releaseForAcquisition();
+    sourceRoot=await acquire(needed);
+    release=await this.store.lease(true);
+    await this.guard();signal.throwIfAborted();validateRuntime();
+    if(JSON.stringify(await this.current())!==journalBefore)throw Error('Whole-Play journal changed during acquisition; inspect recovery before retrying');
+    for(const {path:relative,image} of observed.values()){
+     if((await this.snapshot(relative))?.stamp!==image?.stamp)throw Error('Whole-Play preimage changed during acquisition: '+relative);
+    }
+   }
+   const stagedPlan=(await this.planned(previous?.wholePlay&&previous.state!=='restored'?previous:undefined,transient?.relative)).files;
+   if(needed.length&&JSON.stringify(stagedPlan)!==JSON.stringify(preflightPlan)){
+    throw Error('Whole-Play plan changed during acquisition; retry after verifying the selected profile');
+   }
+   const templateChanges:Change[]=[];
+   for(const [relative,base64] of [['@config/plugins.txt',policy.configuration.pluginsBase64],
+      ['@config/loadorder.txt',policy.configuration.loadorderBase64]] as const){
+    const bytes=Buffer.from(base64,'base64'),after={size:bytes.length,sha256:digest(bytes)},before=await capture(relative);
+    if(!same(before,after))templateChanges.push({path:relative,before,after});
+   }
+   const staging=[...stagedPlan,...templateChanges];
+   await this.checkWholePlaySpace(staging,staging.flatMap(file=>file.before?[file.before]:[]));
+   const intents=await this.runtimeIntents(policy,previous,capture,sourceRoot,signal,transient?.relative);
    const pendingRemovals=new Set(pending?.files.filter(file=>file.writer==='runtime'&&file.after===null)
     .map(file=>file.path.toLowerCase()));
    const projectedFile=async(relative:string)=>{
@@ -883,7 +913,7 @@ export class RuntimeTransaction {
    }
    await verify(j);
    j.state='active';await this.store.write(journal,j);
-  }finally{await release();}
+  }finally{await release?.();}
  }
  async apply(sourceRoot:string,signal?:AbortSignal){
   const release=await this.store.lease();try{
