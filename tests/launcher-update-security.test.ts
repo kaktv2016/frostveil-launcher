@@ -381,6 +381,31 @@ test('L2-Ed25519 #12, #13, #14: installer SHA-512/SHA-256 mismatch, size mismatc
   const handoffOk=await prepareVerifiedInstallHandoff(file,binding,dir);
   assert.equal((await fs.readFile(handoffOk)).equals(fx.installerBytes),true);
 
+  // Advance the trusted clock past expiry during the first read of the copied
+  // handoff. Final verification must finish before the late process guard.
+  const beforeFinalExpiry=Date.parse(fx.manifest.expiresAt)-1;
+  let reads=0;
+  let checkedProcess=false;
+  await assert.rejects(
+   ()=>prepareVerifiedInstallHandoff(file,{
+    ...binding,
+    now:()=>++reads<5?beforeFinalExpiry:beforeFinalExpiry+1
+   },dir,async()=>{checkedProcess=true;}),
+   (err:any)=>err?.code==='ERR_UPDATER_EXPIRED_KEY'
+  );
+  assert.equal(checkedProcess,false);
+
+  // A mutation during the late process check must still refuse execution.
+  const existing=new Set(await fs.readdir(path.join(dir,'launcher-updates')));
+  await assert.rejects(
+   ()=>prepareVerifiedInstallHandoff(file,binding,dir,async()=>{
+    const handoff= (await fs.readdir(path.join(dir,'launcher-updates'))).find(name=>!existing.has(name));
+    assert.ok(handoff);
+    await fs.appendFile(path.join(dir,'launcher-updates',handoff,fx.manifest.installer.assetName),'changed');
+   }),
+   (err:any)=>err?.code==='ERR_UPDATER_INSTALLER_REPLACED'
+  );
+
   // Now create a hardlink to simulate link attack -> nlink > 1 rejected
   const hardlinkPath=path.join(dir,'linked.exe');
   await fs.link(file,hardlinkPath);

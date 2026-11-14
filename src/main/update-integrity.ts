@@ -393,7 +393,7 @@ export async function verifyDownloadedInstaller(
  if(headerRead<2||header[0]!==0x4d||header[1]!==0x5a)throw updateError('Downloaded file is not a valid Windows PE installer','ERR_UPDATER_INVALID_INSTALLER');
 }
 
-export async function prepareVerifiedInstallHandoff(cachedFile:string,binding:Ed25519InstallerBinding,storageDir:string,beforeFinalVerification?:()=>Promise<void>):Promise<string>{
+export async function prepareVerifiedInstallHandoff(cachedFile:string,binding:Ed25519InstallerBinding,storageDir:string,beforeSpawn?:()=>Promise<void>):Promise<string>{
  await verifyDownloadedInstaller(cachedFile,validateLauncherUpdateManifest(JSON.parse(Buffer.from(binding.envelope.payloadBase64,'base64').toString('utf8'))).installer.sha512,[],authenticode,binding);
  const authenticated=authenticateLauncherUpdate(binding.envelope,binding.source,binding.release,binding.installedVersion,binding.now);
  const beforeStat=await fs.lstat(cachedFile);
@@ -408,14 +408,24 @@ export async function prepareVerifiedInstallHandoff(cachedFile:string,binding:Ed
  const afterStat=await fs.lstat(cachedFile);
  const afterIdentity=await fileIdentity(cachedFile);
  if(afterIdentity!==beforeIdentity||Math.abs(afterStat.mtimeMs-beforeStat.mtimeMs)>1||afterStat.nlink!==1)throw updateError('Cached installer mutated during handoff copy','ERR_UPDATER_INSTALLER_REPLACED');
- const handoffStat=await fs.lstat(handoffFile);
+ const handoffStat=await fs.lstat(handoffFile,{bigint:true});
  const handoffIdentity=await fileIdentity(handoffFile);
- await beforeFinalVerification?.();
  await verifyDownloadedInstaller(handoffFile,authenticated.manifest.installer.sha512,[],authenticode,{
   ...binding,
   expectedIdentity:handoffIdentity,
-  expectedMtimeMs:handoffStat.mtimeMs
+  expectedMtimeMs:Number(handoffStat.mtimeNs)/1e6
  });
+ if(beforeSpawn){
+  await beforeSpawn();
+  // Keep this recheck bounded after the process probe. A full rehash here
+  // would reopen the long interval between the probe and installer launch.
+  await noLinks(handoffFile);
+  const current=await fs.lstat(handoffFile,{bigint:true});
+  if(!current.isFile()||current.nlink!==1n||current.dev!==handoffStat.dev||current.ino!==handoffStat.ino||
+     current.size!==handoffStat.size||current.mtimeNs!==handoffStat.mtimeNs||current.ctimeNs!==handoffStat.ctimeNs){
+   throw updateError('Verified handoff changed before execution','ERR_UPDATER_INSTALLER_REPLACED');
+  }
+ }
  return handoffFile;
 }
 
