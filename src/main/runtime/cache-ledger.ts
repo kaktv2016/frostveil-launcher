@@ -1,3 +1,4 @@
+import {createServer} from 'node:net';
 import {createHash, createHmac, randomBytes, randomUUID, timingSafeEqual} from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -96,7 +97,7 @@ const maxHistoryBytes = 48 * 1024 * 1024;
 const keyName = 'auth-key';
 const headName = 'head.json';
 const historyName = 'history';
-const lockName = 'cache-writer.lock';
+const lockName = 'cache-writer.lock'; // Retained marker from pre-release fixture trials.
 const reaperName = 'cache-reaper.lock';
 
 function exact(value: unknown, keys: string): void {
@@ -497,70 +498,34 @@ export class CacheLedger {
   }
 }
 
-type LockRecord = {pid:number;token:string};
-
-async function createLock(file: string) {
-  const value: LockRecord = {pid:process.pid, token:randomUUID()};
-  await noLinks(path.dirname(file));
-  const handle = await fs.open(file, 'wx', 0o600);
-  let stat;
-  try {
-    await handle.writeFile(JSON.stringify(value));
-    await handle.sync();
-    stat = await handle.stat({bigint:true});
-  } finally {
-    await handle.close();
-  }
-  return {value,stat};
-}
-
-async function readLock(file: string): Promise<LockRecord> {
-  const lock = JSON.parse((await readRegular(file, 4096)).toString('utf8')) as LockRecord;
-  exact(lock, 'pid,token');
-  if (!unsigned(lock.pid) || lock.pid === 0 || lock.pid > 0xffffffff || typeof lock.token !== 'string' ||
-      !uuid.test(lock.token)) throw Error('Invalid cache accounting lock');
-  return lock;
-}
-
-async function assertLock(file: string, claim: Awaited<ReturnType<typeof createLock>>) {
-  const value = await readLock(file);
-  if (value.token !== claim.value.token || value.pid !== claim.value.pid || !sameFile(claim.stat, await bigStat(file))) {
-    throw Error('Cache accounting lock identity changed');
-  }
-}
-
-async function cacheLock(directory: string) {
-  const file = path.join(directory, lockName), reaper = path.join(directory, reaperName);
-  try {
-    return {file,claim:await createLock(file)};
-  } catch (error) {
-    if (!isCode(error,'EEXIST')) throw error;
-  }
-  let guard;
-  try {
-    guard = await createLock(reaper);
-  } catch (error) {
-    if (!isCode(error,'EEXIST')) throw error;
-    throw Error('Cache accounting recovery lock is occupied');
-  }
-  try {
-    const stat = await bigStat(file).catch(error => { if (!isCode(error,'ENOENT')) throw error; return null; });
-    if (stat) {
-      const value = await readLock(file);
-      try {
-        process.kill(value.pid, 0);
-        throw Error('Concurrent cache accounting writer refused');
-      } catch (error) {
-        if (!isCode(error,'ESRCH')) throw error;
-      }
-      await assertLock(file, {value,stat});
-      await fs.unlink(file);
-    }
-    return {file,claim:await createLock(file)};
-  } finally {
-    await assertLock(reaper, guard);
-    await fs.unlink(reaper);
-  }
+async function cacheLock(directory:string){
+  // libuv binds a first-instance Windows pipe. The operating system releases
+  // it when the owning process exits, including exits during reconciliation.
+  // The pipe serializes cooperating ledger opens; it does not prove helper exit.
+  if(process.platform!=='win32')throw Error('Cache accounting lock requires Windows');
+  const name=digest(Buffer.from(directory.toLowerCase()));
+  const handle='\\\\.\\pipe\\frostveil-runtime-cache-'+name;
+  const server=createServer(connection=>connection.destroy());
+  await new Promise<void>((resolve,reject)=>{
+    server.once('error',reject);
+    server.listen({path:handle,exclusive:true},()=>{
+      server.removeListener('error',reject);
+      resolve();
+    });
+  }).catch(error=>{
+    if(isCode(error,'EADDRINUSE')||isCode(error,'EACCES'))throw Error('Concurrent cache accounting writer refused');
+    throw error;
+  });
+  let failed=false;
+  server.on('error',()=>{failed=true;});
+  return {
+    assertHeld(){
+      if(failed||!server.listening)throw Error('Cache accounting lock identity changed');
+    },
+    close:()=>new Promise<void>((resolve,reject)=>{
+      server.close(error=>error?reject(error):resolve());
+    })
+  };
 }
 
 export async function openCacheAccounting<T>(directory: string, scopeId: string, callback: (ledger: CacheLedger) => Promise<T>): Promise<T> {
@@ -577,14 +542,14 @@ export async function openCacheAccounting<T>(directory: string, scopeId: string,
   }
   const root = await bigStat(directory);
   if (!root.isDirectory() || root.ino === 0n) throw Error('Unknown cache accounting directory identity');
-  const {file,claim} = await cacheLock(directory);
+  const lease = await cacheLock(real);
   const assertHeld = async () => {
     await noLinks(directory);
     const current = await bigStat(directory);
     if (!current.isDirectory() || current.dev !== root.dev || current.ino !== root.ino) {
       throw Error('Cache accounting directory identity changed');
     }
-    await assertLock(file,claim);
+    lease.assertHeld();
   };
   try {
     await assertHeld();
@@ -639,7 +604,6 @@ export async function openCacheAccounting<T>(directory: string, scopeId: string,
       await ledger.close();
     }
   } finally {
-    await assertHeld();
-    await fs.unlink(file);
+    await lease.close();
   }
 }
