@@ -320,6 +320,26 @@ function entryName(sequence: number) {
   return sequence.toString().padStart(6, '0') + '.json';
 }
 
+async function publishedNames(directory:string,limit:number){
+  const names:string[]=[];
+  let seen=0;
+  // A power loss can leave a UUID-named durableWrite temp file behind. These
+  // names never authorize anything. Preserve the bytes and accept only
+  // ordinary, single-link leftovers within independent count/size bounds.
+  for await(const entry of await fs.opendir(directory)){
+    if(++seen>limit+64)throw Error('Cache accounting metadata entry bound exceeded');
+    if(entry.name.startsWith('.write-')&&uuid.test(entry.name.slice(7))){
+      const file=path.join(directory,entry.name);
+      await noLinks(file);
+      const stat=await bigStat(file);
+      if(!stat.isFile()||stat.nlink!==1n||stat.size>BigInt(maxRecordBytes)){
+        throw Error('Unsafe interrupted cache accounting publication');
+      }
+    }else names.push(entry.name);
+  }
+  return names;
+}
+
 async function openHistory(directory: string, scopeId: string, key: Buffer, assertHeld: () => Promise<void>): Promise<Snapshot> {
   const headFile = path.join(directory, headName), history = path.join(directory, historyName);
   const head = unseal<Head>(await readRegular(headFile, maxRecordBytes), key);
@@ -327,7 +347,7 @@ async function openHistory(directory: string, scopeId: string, key: Buffer, asse
   if (head.scopeId !== scopeId) throw Error('Cache accounting scope changed');
   if (!unsigned(head.sequence) || head.sequence > maxEntries || !validHash(head.digest)) throw Error('Invalid cache accounting head');
   await noLinks(history);
-  const entries = (await fs.readdir(history)).sort();
+  const entries = (await publishedNames(history,maxEntries)).sort();
   if (entries.length < head.sequence || entries.length > maxEntries || entries.length > head.sequence + 1) {
     throw Error('Missing or replayed cache accounting history');
   }
@@ -553,7 +573,7 @@ export async function openCacheAccounting<T>(directory: string, scopeId: string,
   };
   try {
     await assertHeld();
-    const names = (await fs.readdir(directory)).filter(name => name !== lockName && name !== reaperName);
+    const names = (await publishedNames(directory,8)).filter(name => name !== lockName && name !== reaperName);
     const anchorBytes = await readRegular(anchorFile,4096).catch(error => {
       if (!isCode(error,'ENOENT')) throw error;
       return null;
@@ -569,7 +589,7 @@ export async function openCacheAccounting<T>(directory: string, scopeId: string,
       if (key.length !== 32) throw Error('Invalid cache accounting metadata key');
       if (names.includes(historyName)) {
         await noLinks(history);
-        if (!(await fs.lstat(history)).isDirectory() || (await fs.readdir(history)).length) {
+        if (!(await fs.lstat(history)).isDirectory() || (await publishedNames(history,maxEntries)).length) {
           throw Error('Missing established cache accounting enrollment anchor');
         }
       }

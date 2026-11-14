@@ -180,6 +180,32 @@ fixtureTest('W02 a second process can reopen accounting after the owner is termi
   });
 });
 
+fixtureTest('W02 interruption leaves partial publication bytes intact and reopens only the committed records',async t=>{
+  const root=await temp(t),directory=path.join(root,'ledger'),request=input();
+  await fs.mkdir(directory);
+  const keyTemp=path.join(directory,'.write-'+randomUUID());
+  const bytes=Buffer.from('partial fixture metadata');
+  await fs.writeFile(keyTemp,bytes,{flag:'wx'});
+  await openCacheAccounting(directory,scope,async ledger=>{
+    assert.equal(await ledger.readActive(),null);
+    await ledger.reserve(request);
+  });
+  const eventTemp=path.join(directory,'history','.write-'+randomUUID());
+  await fs.writeFile(eventTemp,bytes,{flag:'wx'});
+  await openCacheAccounting(directory,scope,async ledger=>{
+    assert.equal((await ledger.readActive())?.operationId,request.operationId);
+    await assert.rejects(ledger.reserve(input()),/active|outstanding/i);
+  });
+  assert.deepEqual(await fs.readFile(keyTemp),bytes);
+  assert.deepEqual(await fs.readFile(eventTemp),bytes);
+  const linked=path.join(directory,'.write-'+randomUUID());
+  await fs.link(keyTemp,linked);
+  await assert.rejects(openCacheAccounting(directory,scope,async()=>assert.fail()),/Unsafe interrupted/);
+  await fs.unlink(linked);
+  await fs.writeFile(path.join(directory,'history','unknown.json'),bytes,{flag:'wx'});
+  await assert.rejects(openCacheAccounting(directory,scope,async()=>assert.fail()),/history/i);
+});
+
 if(process.argv[2]==='--accounting-crash-worker'){
   void (async()=>{
     const [directory,file]=process.argv.slice(3);
