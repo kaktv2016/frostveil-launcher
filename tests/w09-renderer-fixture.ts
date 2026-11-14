@@ -155,7 +155,7 @@ export class GraphicsPackService extends EventEmitter {
 
 export const fixtureWindows = {
   gameRunning: async () => false,
-  steamRoots: async () => [fixturePath('a')],
+  steamRoots: async () => [fixturePath('host')],
   fileVersion: async (file: string) => path.basename(file) === 'SkyrimSE.exe' ? '1.6.1170.0' : '0.2.2.6',
   startSkse: async (exe: string, cwd: string) => {
     if (cwd !== gamePath('a') || exe !== path.join(gamePath('a'), 'skse64_loader.exe')) throw Error('W09 unexpected launch path');

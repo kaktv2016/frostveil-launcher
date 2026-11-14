@@ -11,7 +11,7 @@ async function assertListedLibrary(game:string,roots:readonly string[]){
 
 async function verifySelection(game:string,roots:string[],use:'prepare'|'restore'):Promise<SteamSelection>{
  const canonical=await canonicalSteamPath(game);
- await assertListedLibrary(canonical,roots);
+ if(use==='prepare')await assertListedLibrary(canonical,roots);
  const manifest=path.resolve(canonical,'../../appmanifest_489830.acf');
  await readIdleSteamInstallation(canonical,manifest,use==='restore');
  const selection:SteamSelection=Object.freeze({game:canonical,manifest,language:'english'});
@@ -22,8 +22,8 @@ export function verifySteamSelection(game:string,roots:string[]){
  return verifySelection(game,roots,'prepare');
 }
 /** The caller must establish authenticated journal ownership before offline Restore. */
-export function verifySteamRecoverySelection(game:string,roots:string[]){
- return verifySelection(game,roots,'restore');
+export function verifySteamRecoverySelection(game:string){
+ return verifySelection(game,[],'restore');
 }
 export async function assertSteamIdle(selection:SteamSelection){
  const authority=selections.get(selection);

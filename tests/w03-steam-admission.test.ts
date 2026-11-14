@@ -122,7 +122,8 @@ test('W03 recovery tolerates missing legacy language metadata while new Steam ad
  const valid=await f.library('Legacy',acf().replace(' "UserConfig" { "language" "english" }',''));
  await assert.rejects(verifySteamSelection(valid.game,[valid.location]),/English/);
  assert.deepEqual(await discoverSteam([valid.location],{requireIdle:true}),[]);
- const recovery=await verifySteamRecoverySelection(valid.game,[valid.location]);
+ await assert.rejects(verifySteamSelection(valid.game,[f.host]),/registered library/);
+ const recovery=await verifySteamRecoverySelection(valid.game);
  assert.match(await assertSteamIdle(recovery),/^[a-f0-9]{64}$/);
  await fs.writeFile(valid.manifest,acf().replace('"english"','"french"'));
  await assert.rejects(assertSteamIdle(recovery),/English/);

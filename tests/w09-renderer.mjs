@@ -21,15 +21,16 @@ await fs.mkdir(fixtureRoot, {recursive: true});
 const install = library => path.join(fixtureRoot,library,'steamapps','common','Skyrim Special Edition');
 const gameA = install('a');
 const gameB = install('b');
-for (const dir of [path.join(gameA,'Data'),path.join(gameB,'Data'),...['depot/Data','documents','appdata','local/Skyrim Special Edition'].map(dir=>path.join(fixtureRoot,dir))]) {
+for (const dir of [path.join(gameA,'Data'),path.join(gameB,'Data'),...['host/steamapps','depot/Data','documents','appdata','local/Skyrim Special Edition'].map(dir=>path.join(fixtureRoot,dir))]) {
   await fs.mkdir(dir, {recursive: true});
 }
 const acf = (library, language='english', state='4', appId='489830') => fs.writeFile(
   path.join(fixtureRoot,library,'steamapps','appmanifest_489830.acf'),
   `"AppState" { "appid" "${appId}" "installdir" "Skyrim Special Edition" "StateFlags" "${state}" ${language===null?'':`"UserConfig" { "language" "${language}" }`} }`,
 );
-await fs.writeFile(path.join(fixtureRoot,'a','steamapps','libraryfolders.vdf'),
-  `"libraryfolders" { "0" { "path" ${JSON.stringify(path.join(fixtureRoot,'b'))} } }`);
+const libraries = (...names) => fs.writeFile(path.join(fixtureRoot,'host','steamapps','libraryfolders.vdf'),
+  `"libraryfolders" { ${names.map((name,index)=>`"${index}" { "path" ${JSON.stringify(path.join(fixtureRoot,name))} }`).join(' ')} }`);
+await libraries('a','b');
 await acf('a','english','2');
 await acf('b','french');
 const config = path.join(fixtureRoot, 'local/Skyrim Special Edition');
@@ -91,7 +92,7 @@ const mainBuild = await build({entryPoints:[path.join(repo,'src/main/index.ts')]
       if (!['managed-target.ts','service.ts'].includes(path.basename(args.importer))) return;
       return {path:'./windows',namespace:'w09-runtime-windows'};
     });
-    builder.onLoad({filter:/.*/,namespace:'w09-runtime-windows'},()=>({contents:`import path from 'node:path'; export const gameRunning=async()=>false; export const steamRoots=async()=>[path.join(process.env.FROSTVEIL_W09_FIXTURE,'a')]; export const fileVersion=async()=> '1.6.1170.0';`,loader:'js'}));
+    builder.onLoad({filter:/.*/,namespace:'w09-runtime-windows'},()=>({contents:`import path from 'node:path'; export const gameRunning=async()=>false; export const steamRoots=async()=>[path.join(process.env.FROSTVEIL_W09_FIXTURE,'host')]; export const fileVersion=async()=> '1.6.1170.0';`,loader:'js'}));
   }
 }]});
 assert.ok(mainBuild.errors.length===0);
@@ -195,6 +196,16 @@ try {
   assert.equal(await hashFile(seeded.journal),initialJournalHash);
   assert.deepEqual(await fs.readFile(path.join(gameA,'SkyrimSE.exe')),changedRuntime);
   await acf('a',null);
+  await libraries('b');
+  await fs.writeFile(path.join(fixtureRoot,'selection.txt'),gameB);
+  await choose.click();
+  await expect(page.getByText(gameB,{exact:true})).toBeVisible();
+  await expect(restoreButton()).toBeDisabled();
+  await fs.writeFile(path.join(fixtureRoot,'selection.txt'),gameA);
+  await choose.click();
+  await expect(restoreButton()).toBeEnabled();
+  assert.equal((await page.evaluate(()=>window.launcher.status())).settings.directory,gameA);
+  observed.reselectDetachedLegacyJournalForRestore=true;
   await page.getByRole('button',{name:/^Dashboard/}).click();
   await page.getByRole('button',{name:/^PLAY SKYRIM RP/}).click();
   await expect(page.getByRole('alert')).toBeVisible();
@@ -209,6 +220,7 @@ try {
   observed.actualRestoreIpcRestoredOriginalRuntime=true;
   observed.authenticatedOfflineRestoreAllowsHistoricalMissingLanguage=true;
   await acf('a');
+  await libraries('a','b');
   await setMode('provider','ok');
   await page.getByRole('button',{name:/^Dashboard/}).click();
   await expect(page.getByRole('button',{name:'Re-scan',exact:true})).toBeEnabled();

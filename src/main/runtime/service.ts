@@ -121,10 +121,16 @@ export class RuntimePreparation {
   if(this.recoveryRead===request&&this.state.selectionRevision===revision)this.update(recovery);
  }
  cancel(){this.prepared=undefined;this.operation?.controller.abort(Error('Runtime preparation cancelled'));}
+ async selectRuntimeDirectory(game:string,config:string){
+  try{return (await verifySteamSelection(game,await steamRoots())).game;}
+  catch(error){
+   if(!(await this.readRecovery({game,config})).canRestore)throw error;
+   return (await verifySteamRecoverySelection(game)).game;
+  }
+ }
  protected async runtimeTarget(game:string,config:string,requireExistingConfig=false,recoveryOnly=false){
   if(requireExistingConfig)await this.existingProfile(config);
-  const select=recoveryOnly?verifySteamRecoverySelection:verifySteamSelection;
-  const selection=await select(game,await steamRoots());
+  const selection=recoveryOnly?await verifySteamRecoverySelection(game):await verifySteamSelection(game,await steamRoots());
   await safeDirectory(this.storage);
   const grant=await registerRuntimePreparationTarget(selection,config,this.storage);
   const steamStamp=await assertSteamIdle(selection);

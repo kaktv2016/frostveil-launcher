@@ -397,7 +397,7 @@ export class RuntimeTransaction {
   };
   const {target,file}=this.transientTarget(j,transient);
   j.wholePlay!.transient=transient;
-  await this.store.write(journal,j);
+  await this.store.write(journal,j,recheck);
   await recheck();
   const handle=await fs.open(file,'wx',0o600);
   let stamp:string;
@@ -405,6 +405,7 @@ export class RuntimeTransaction {
    const stat=await handle.stat({bigint:true});
    if(!stat.isFile()||stat.nlink!==1n||stat.size!==0n)throw Error('Unsafe reserved whole-Play transient copy');
    transient.identity=stat.dev+':'+stat.ino;
+   // Record the new file identity before another version refusal can interrupt.
    await this.store.write(journal,j);
    await this.requireTransientStamp(file,fileStamp(stat));
    await recheck();
@@ -430,8 +431,8 @@ export class RuntimeTransaction {
   await this.requireTransientStamp(file,stamp);
   if(!same(await hashFile(file,want.size),want))throw Error('Recovery copy integrity failure');
   await this.options.wholePlayCheckpoint?.('after-target-temp-staged',change.path,change.writer);
-  await recheck();
   await this.requireTransientStamp(file,stamp);
+  await recheck();
   await fs.rename(file,target);
   // If interrupted, the persisted reservation now points to an absent file.
   // The next reservation or terminal state write clears it durably.
@@ -839,14 +840,18 @@ export class RuntimeTransaction {
    await this.verifyOriginalBlobs(originals);
    await auditIsolation(false);
    await fence();
+   const first=changes[0];
+   if(first)await this.options.wholePlayCheckpoint?.('before-target-write',first.path,first.writer);
    await this.clearTransient(j,transient,checkExecutable);
-   j.state='applying';await this.store.write(journal,j,checkExecutable);
+   if(j.state!=='applying'||transient){
+    j.state='applying';await this.store.write(journal,j,checkExecutable);
+   }
    await this.ensureDirectories(j,checkExecutable);
    const parentRecords=new Map(directories.map(dir=>[dir.path.toLowerCase(),dir]));
    for(const change of changes){
     const before=observed.get(change.path.toLowerCase())?.image;
     if(before===undefined)throw Error('Missing whole-Play preimage observation');
-    await this.options.wholePlayCheckpoint?.('before-target-write',change.path,change.writer);
+    if(change!==first)await this.options.wholePlayCheckpoint?.('before-target-write',change.path,change.writer);
     await this.replace(change,change.after,before,'runtime-staging',async()=>{
      signal.throwIfAborted();validateRuntime();await this.guardParents(parentRecords,change.path);
      if((await this.snapshot(change.path))?.stamp!==before?.stamp)throw Error('Whole-Play target identity changed: '+change.path);
@@ -1013,7 +1018,9 @@ export class RuntimeTransaction {
    await checkExecutable(!replacedExecutable);
   };
   await this.guard();await fence();
-  j.state='applying';await this.store.write(journal,j,fence);
+  if(j.state!=='applying'){
+   j.state='applying';await this.store.write(journal,j,fence);
+  }
   for(const change of j.files){
    signal?.throwIfAborted();await this.guard();
    const got=await this.image(change.path);

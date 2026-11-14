@@ -104,7 +104,7 @@ async function fixture(t:TestContext,preferences:Buffer|null){
  const stagedSkse=path.join(source,'skse64_1_6_1170.dll');await fs.writeFile(stagedSkse,skseRuntimeBytes);
  const executable=path.join(game,'SkyrimSE.exe'),stagedExecutable=path.join(grant.payloads,'runtime-staging',sha(runtimeAfter));
  const versionProbes:string[]=[];
- let executableVersion='1.6.1170.0',driftBeforeJournal=false;
+ let executableVersion='1.6.1170.0',driftAt:string|undefined,stopAfterJournal=false;
  let corruptOriginalBlob=false,corrupted=false,interruptWriter:string|undefined,interrupted=false,addLateUnknown=false;
  class FixturePreparation extends RuntimePreparation{
   protected override async runtimeTarget(g:string,c:string){assert.equal(g,game);assert.equal(c,config);return{grant,guard:async()=>false,steamStamp:sha('synthetic Steam identity')};}
@@ -120,8 +120,12 @@ async function fixture(t:TestContext,preferences:Buffer|null){
    return executableVersion;
   }
   protected override async wholePlayCheckpoint(stage:string,file?:string,writer?:string){
-   if(driftBeforeJournal&&stage==='before-preimages-commit'){
-    driftBeforeJournal=false;
+   if(stopAfterJournal&&stage==='after-preimages-commit'){
+    stopAfterJournal=false;
+    throw Error('Fixture interruption after journal publication');
+   }
+   if(driftAt===stage){
+    driftAt=undefined;
     const replacement=stagedExecutable+'.replacement';
     await fs.copyFile(stagedExecutable,replacement);
     await fs.rename(replacement,stagedExecutable);
@@ -179,7 +183,9 @@ async function fixture(t:TestContext,preferences:Buffer|null){
  return{grant,game,config,runtime,adapters,prefsPath,preferences,snapshot,
   targetImages,journalPath,versionProbes,executable,stagedExecutable,
   setExecutableVersion:(version:string)=>{executableVersion=version;},
-  swapExecutableBeforeJournal:()=>{driftBeforeJournal=true;},
+  swapExecutableBeforeJournal:()=>{driftAt='before-preimages-commit';},
+  interruptAfterJournal:()=>{stopAfterJournal=true;},
+  swapExecutableBeforeFirstWrite:()=>{driftAt='before-target-write';},
   stats:()=>({acquisitions,policyLoads,packCalls,verifiedWrites,scans}),
   setProfileConflict:(value:boolean)=>{profileConflict=value;},
   switchRelease:(tag:string)=>{latestRelease=tag;},
@@ -223,6 +229,20 @@ test('W03 admission Whole Play pending forward resume verifies installed executa
  assert.deepEqual(await f.snapshot(),pending);
  assert.equal(f.versionProbes.at(-1),f.executable);
  assert.equal(spawns,0);
+ await f.restart().restore(f.game,f.config);
+ assert.deepEqual(await fs.readFile(f.executable),runtimeBefore);
+});
+
+test('W03 admission leaves a prepared Whole Play journal intact on executable drift before its first write',async t=>{
+ const f=await fixture(t,null);
+ f.interruptAfterJournal();
+ await assert.rejects(preparePlay(f.runtime,f.game,f.config,f.adapters),/interruption after journal publication/);
+ const pending=await f.snapshot();
+ const journalBefore=await fs.stat(f.journalPath,{bigint:true});
+ f.swapExecutableBeforeFirstWrite();
+ await assert.rejects(preparePlay(f.restart(),f.game,f.config,f.adapters),/runtime executable.*changed/i);
+ assert.deepEqual(await f.snapshot(),pending);
+ assert.equal((await fs.stat(f.journalPath,{bigint:true})).ino,journalBefore.ino);
  await f.restart().restore(f.game,f.config);
  assert.deepEqual(await fs.readFile(f.executable),runtimeBefore);
 });

@@ -263,7 +263,10 @@ async function start(){
  const standaloneWrite=async(operation:()=>Promise<unknown>)=>{
   if(fixture||!settings.directory)return operation();
   const {game,config}=runtimeDirectories();
-  await runtimePreparation.withStandaloneWrite(game,config,operation);
+  await runtimePreparation.withStandaloneWrite(game,config,async()=>{
+   await verifySteamSelection(game,await steamRoots());
+   return operation();
+  });
  };
  handler('cancel-runtime',async arg=>{noArgument(arg);runtimePreparation.cancel();graphicsPreparation?.abort(Error('Runtime preparation cancelled'));graphicsPack.cancel();downloads.cancel();});
  let packInstall:AbortController|undefined;
@@ -298,7 +301,7 @@ async function start(){
  handler('choose',async arg=>{noArgument(arg);const selected=fixture?path.join(fixture,'game'):(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Select folder containing SkyrimSE.exe'})).filePaths[0];if(selected){
   let directory=selected;
   if(!fixture){
-   try{directory=(await verifySteamSelection(selected,await steamRoots())).game;}
+   try{directory=await runtimePreparation.selectRuntimeDirectory(selected,orderDirectory());}
    catch{throw Error('โฟลเดอร์นี้ไม่ใช่ Skyrim Special Edition ภาษาอังกฤษที่ Steam ตรวจสอบได้ กรุณาตรวจการติดตั้งแล้วเลือกใหม่');}
   }
   await Promise.all([setSelection(directory),saveSettings()]);
