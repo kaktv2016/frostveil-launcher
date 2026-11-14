@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {createHash, createHmac, randomBytes, sign} from 'node:crypto';
+import {createHash, createHmac, randomBytes, randomUUID, sign} from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import test, {type TestContext} from 'node:test';
@@ -13,6 +13,7 @@ import type {RuntimeCohort} from '../src/main/runtime/policy';
 import {measureCacheRoots} from '../src/main/runtime/cache-census';
 import {cacheScopeId,packagedCachePolicy} from '../src/main/runtime/cache-policy';
 import {openCacheAccounting} from '../src/main/runtime/cache-ledger';
+import {encodeCacheBoot,readCacheBoot} from '../src/main/runtime/cache-boot';
 import type {RuntimePreparationState} from '../src/shared/runtime-contracts';
 import {bindFixture, fixtureKeys} from './w03-provider-boundaries';
 
@@ -543,4 +544,29 @@ test('W02 candidate bundle with a missing policy denies helper growth and still 
   await f.restore();
   assert.equal((await f.readJournal()).state,'restored');
   assert.deepEqual((await f.targets()).map(file=>file?.sha256),before.map(file=>file?.sha256));
+});
+test('W02 cold Prepare leaves a prior same-boot acquisition active without starting a helper',async t=>{
+  const f=await fixture(t),before=await f.targets();
+  const raw=path.join(f.directory,'packages','steam-depots');
+  await fs.mkdir(raw,{recursive:true});
+  const {roots:[storage,rawRoot]}=await measureCacheRoots([f.storage,raw]);
+  assert.ok(storage?.fileId&&rawRoot?.fileId);
+  const scope=cacheScopeId(storage.path,storage.volumeId,storage.fileId);
+  const accounting=path.join(f.storage,'runtime-cache-accounting');
+  const operationId=randomUUID(),hostBootId=encodeCacheBoot(await readCacheBoot());
+  const {path:relative,size,sha256,depot}=files[0]!;
+  const manifest=depots.find(item=>item.id===depot)!.manifest;
+  await openCacheAccounting(accounting,scope,ledger=>ledger.reserve({
+    operationId,policyId:'fixture',profileId:'fixture',targetId:'fixture',
+    rawRootId:cacheScopeId(rawRoot.path,rawRoot.volumeId,rawRoot.fileId!),
+    rawVolumeId:rawRoot.volumeId,cohortDigest:depotsDigest,hostBootId,
+    requested:[{path:relative,size,sha256,depot,manifest,before:null}],
+    charges:[{volumeId:rawRoot.volumeId,rawBytes:4096n,helperBytes:0n}],
+    beforeAllocated:[{volumeId:rawRoot.volumeId,rawBytes:0n,helperBytes:0n}],reviewAfterMs:null,
+  }));
+  await assert.rejects(f.prepare(),/previous helper quiescence is unverified/);
+  assert.equal(f.invocations.length,0);
+  assert.deepEqual(await f.targets(),before);
+  assert.equal(await f.journal(),null);
+  assert.equal((await openCacheAccounting(accounting,scope,ledger=>ledger.readActive()))?.operationId,operationId);
 });

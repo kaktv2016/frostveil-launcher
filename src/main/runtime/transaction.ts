@@ -633,16 +633,16 @@ export class RuntimeTransaction {
   if(!stat.isFile()||stat.nlink!==1n||stat.size!==BigInt(after.size))throw Error('Unsafe staged whole-Play writer source');
   intents.set(key,{path:relative,after,source,sourceGrant:write.sourceGrant,writer:write.writer??'managed',managed:true});
  }
- private async checkWholePlaySpace(changes:readonly Change[],needsBackup:readonly Image[]){
+ private async checkWholePlaySpace(changes:readonly Change[],needsBackup?:readonly Image[]){
   if(!changes.length)return;
   const use=new Map<string,number>();
   const add=(root:string,bytes:number)=>use.set(root,(use.get(root)??0)+bytes);
   for(const change of changes){
    if(!change.after)continue;
    add(this.destination(change.path).root,change.after.size);
-   add(this.grant.payloads,change.after.size);
+   if(needsBackup)add(this.grant.payloads,change.after.size);
   }
-  const originals=new Map(needsBackup.map(image=>[image.sha256,image.size]));
+  const originals=new Map(needsBackup?.map(image=>[image.sha256,image.size]));
   for(const size of originals.values())add(this.grant.payloads,size);
   const volumes=new Map<string,{bytes:number;roots:string[]}>();
   for(const [root,bytes] of use){
@@ -891,6 +891,7 @@ export class RuntimeTransaction {
    await fence();
    const first=changes[0];
    if(first)await this.options.wholePlayCheckpoint?.('before-target-write',first.path,first.writer);
+   await this.checkWholePlaySpace(changes);
    await this.clearTransient(j,transient,checkExecutable);
    if(j.state!=='applying'||transient){
     j.state='applying';await this.store.write(journal,j,checkExecutable);

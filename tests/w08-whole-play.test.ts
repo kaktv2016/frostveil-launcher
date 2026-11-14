@@ -425,3 +425,59 @@ test('W02 Whole Play refuses a target preimage edit during acquisition',async t=
  assert.deepEqual(await fs.readFile(f.executable),runtimeBefore);
  await assert.rejects(fs.stat(f.journalPath),{code:'ENOENT'});
 });
+function simulateSharedVolumePressure(t:TestContext, directory:string){
+ const statfs=fs.statfs;
+ let freeBlocks=1_000_000;
+ const observed:number[]=[];
+ t.mock.method(fs,'statfs',async (root:string)=>{
+  assert.ok(path.isAbsolute(root));
+  assert.equal(path.parse(root).root,path.parse(directory).root);
+  const real=await statfs(root);
+  observed.push(freeBlocks);
+  return {...real,bsize:4096,bavail:freeBlocks};
+ });
+ return {consume:()=>{freeBlocks=32;},observed};
+}
+
+test('W02 independent offline Restore and later same-volume pressure stop Whole Play before staging',async t=>{
+ const f=await fixture(t,null),other=await fixture(t,null);
+ const before=await f.targetImages(),otherBefore=await other.targetImages();
+ const device=async (root:string)=>(await fs.stat(root,{bigint:true})).dev;
+ assert.equal(await device(f.grant.payloads),await device(other.grant.payloads));
+ await preparePlay(other.runtime,other.game,other.config,other.adapters);
+ const otherCalls=other.stats().policyLoads;
+ const space=simulateSharedVolumePressure(t,f.grant.directory);
+ f.duringAcquire(async()=>{
+  await other.restart().restore(other.game,other.config);
+  space.consume();
+ });
+ await assert.rejects(preparePlay(f.runtime,f.game,f.config,f.adapters),/Insufficient disk space for whole-Play/);
+ assert.ok(space.observed.includes(32));
+ assert.deepEqual(await f.targetImages(),before);
+ await assert.rejects(fs.stat(f.stagedExecutable),{code:'ENOENT'});
+ await assert.rejects(fs.stat(f.journalPath),{code:'ENOENT'});
+ assert.deepEqual((await other.targetImages()).map(file=>file.hash),otherBefore.map(file=>file.hash));
+ assert.equal(other.stats().policyLoads,otherCalls);
+});
+
+test('W02 pressure after staging stops Whole Play before Apply and retains offline recovery',async t=>{
+ const f=await fixture(t,null),before=await f.targetImages();
+ const space=simulateSharedVolumePressure(t,f.grant.directory);
+ const original=f.adapters.pack;
+ f.adapters.pack=async projection=>{
+  const result=await original(projection);
+  return {...result,revalidate:async()=>{
+   await result.revalidate?.();
+   try{await fs.stat(f.journalPath);}
+   catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return;throw error;}
+   space.consume();
+  }};
+ };
+ await assert.rejects(preparePlay(f.runtime,f.game,f.config,f.adapters),/Insufficient disk space for whole-Play/);
+ assert.deepEqual(await f.targetImages(),before);
+ const policyLoads=f.stats().policyLoads;
+ await f.restart().restore(f.game,f.config);
+ assert.deepEqual(await f.targetImages(),before);
+ assert.equal(f.stats().policyLoads,policyLoads);
+ assert.ok(space.observed.includes(32));
+});

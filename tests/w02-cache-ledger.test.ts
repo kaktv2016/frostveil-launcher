@@ -9,7 +9,7 @@ import test, {type TestContext} from 'node:test';
 import {openCacheAccounting, type CacheReservationInput, type CacheObservedFile} from '../src/main/runtime/cache-ledger';
 
 const scope = 'storage:volume/root-id';
-const fixtureTest = process.argv[2]==='--accounting-crash-worker' ? (()=>{}) as typeof test : test;
+const fixtureTest = process.argv[2]?.startsWith('--accounting-crash-') ? (()=>{}) as typeof test : test;
 const digest = 'a'.repeat(64);
 const charges = [{volumeId: 'raw', rawBytes: 4096n, helperBytes: 0n}, {volumeId: 'tool', rawBytes: 0n, helperBytes: 64n}];
 const evidence = {quiescent: true, censusStable: true, rawRootId: 'target-cache', rawVolumeId: 'raw', observed: charges, hostBootId:'boot-2'} as const;
@@ -159,25 +159,40 @@ fixtureTest('W02 resumes provably empty enrollment after first-use interruption 
   await assert.rejects(openCacheAccounting(directory,scope,async()=>assert.fail()),/anchor/i);
   assert.deepEqual(await fs.readFile(anchor+'.fixture-kept'),bytes);
 });
-fixtureTest('W02 a second process can reopen accounting after the owner is terminated inside the lease',async t=>{
+async function waitFor(pathname:string){
+  for(let attempt=0;attempt<200;attempt++){
+    try{return await fs.readFile(pathname,'utf8');}
+    catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+    await new Promise(resolve=>setTimeout(resolve,25));
+  }
+  throw Error('Timed out waiting for accounting fixture marker');
+}
+
+fixtureTest('W02 surviving helper writes after Launcher exit while a second writer is refused growth',async t=>{
   const directory=await temp(t), request=input(), worker=path.join(directory,'accounting-crash-worker.json');
+  const ledgerDirectory=path.join(directory,'ledger');
   const bytes=JSON.stringify(request,(_key,value)=>typeof value==='bigint'?value.toString()+'n':value);
   await fs.writeFile(worker,bytes,{flag:'wx'});
-  const child=spawn(process.execPath,[__filename,'--accounting-crash-worker',path.join(directory,'ledger'),worker],{windowsHide:true,stdio:['ignore','pipe','pipe']});
+  const child=spawn(process.execPath,[__filename,'--accounting-crash-worker',ledgerDirectory,worker],{windowsHide:true,stdio:'ignore'});
   const close=new Promise<void>((resolve,reject)=>{child.once('error',reject);child.once('close',()=>resolve());});
-  t.after(async()=>{if(child.exitCode===null&&!child.killed)child.kill();await close;});
-  await new Promise<void>((resolve,reject)=>{
-    const timer=setTimeout(()=>reject(Error('Timed out waiting for fixture reservation')),5000);
-    child.stdout.on('data',chunk=>{if(String(chunk).includes('W02_RESERVED')){clearTimeout(timer);resolve();}});
-    close.then(()=>{clearTimeout(timer);reject(Error('Fixture process exited before reservation'));},reject);
+  t.after(async()=>{
+    if(child.exitCode===null&&!child.killed)child.kill();
+    await close;
+    await fs.writeFile(worker+'.exit','stop').catch(()=>{});
   });
-  await assert.rejects(openCacheAccounting(path.join(directory,'ledger'),scope,async()=>assert.fail()),/lock|lease|writer/i);
+  const pid=Number(await waitFor(worker+'.ready'));
+  assert.ok(Number.isSafeInteger(pid)&&pid>0);
+  await assert.rejects(openCacheAccounting(ledgerDirectory,scope,async()=>assert.fail()),/lock|lease|writer/i);
   assert.equal(child.kill('SIGKILL'),true);
   await close;
-  await openCacheAccounting(path.join(directory,'ledger'),scope,async ledger=>{
+  assert.doesNotThrow(()=>process.kill(pid,0));
+  await openCacheAccounting(ledgerDirectory,scope,async ledger=>{
     assert.equal((await ledger.readActive())?.operationId,request.operationId);
+    await assert.rejects(ledger.reserve(input()),/outstanding|active/i);
     await assert.rejects(ledger.reconcile(request.operationId,{...evidence,hostBootId:request.hostBootId}),/boot|quiescence/i);
   });
+  await fs.writeFile(worker+'.write','continue',{flag:'wx'});
+  assert.equal(await waitFor(worker+'.wrote'),'inert helper wrote after Launcher exit');
 });
 
 fixtureTest('W02 interruption leaves partial publication bytes intact and reopens only the committed records',async t=>{
@@ -214,8 +229,33 @@ if(process.argv[2]==='--accounting-crash-worker'){
       typeof value==='string'&&/^\d+n$/.test(value)?BigInt(value.slice(0,-1)):value) as CacheReservationInput;
     await openCacheAccounting(directory,scope,async ledger=>{
       await ledger.reserve(request);
-      console.log('W02_RESERVED');
+      const helper=spawn(process.execPath,[__filename,'--accounting-crash-helper',file],{
+        detached:true,windowsHide:true,stdio:'ignore',
+      });
+      await new Promise<void>((resolve,reject)=>{helper.once('spawn',resolve);helper.once('error',reject);});
+      helper.unref();
+      await waitFor(file+'.started');
+      await fs.writeFile(file+'.ready',String(helper.pid),{flag:'wx'});
       await new Promise(resolve=>setTimeout(resolve,8000));
     });
+  })().catch(error=>{console.error(error);process.exit(1);});
+}
+if(process.argv[2]==='--accounting-crash-helper'){
+  void (async()=>{
+    const file=process.argv[3];
+    assert.ok(file);
+    await fs.writeFile(file+'.started','ready',{flag:'wx'});
+    for(let attempt=0;attempt<300;attempt++){
+      const exists=async (suffix:string)=>fs.stat(file+suffix).then(()=>true,error=>{
+        if((error as NodeJS.ErrnoException).code==='ENOENT')return false;
+        throw error;
+      });
+      if(await exists('.exit'))return;
+      if(await exists('.write')){
+        await fs.writeFile(file+'.wrote','inert helper wrote after Launcher exit',{flag:'wx'});
+        return;
+      }
+      await new Promise(resolve=>setTimeout(resolve,25));
+    }
   })().catch(error=>{console.error(error);process.exit(1);});
 }
