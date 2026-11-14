@@ -15,14 +15,20 @@ export async function createManagedFixture(options:{processActive?:()=>Promise<b
 export async function adoptManagedFixture(directory:string,g:SandboxGrant){const actual=await fs.realpath(directory),temp=await canonicalTemporaryRoot();if(g.targetClass!=='managed-fixture'||!contained(temp,actual)||!/^frostveil-l4c-[a-z0-9]+$/i.test(path.basename(actual))||g.directory!==actual||g.installation!==path.join(actual,'installation')||g.configDirectory!==path.join(actual,'profile')||g.metadata!==path.join(actual,'metadata')||g.payloads!==path.join(actual,'packages'))throw Error('Invalid managed fixture recovery target');managed.add(g);processChecks.set(g,async()=>false);await checkManagedRoots(g);Object.freeze(g.roots);Object.freeze(g);return g;}
 export async function adoptRealTarget(directory:string,g:SandboxGrant,selectedGame:string,selectedConfig:string,runtime:{ready:boolean;runtime:string},versionReader=fileVersion){if(g.targetClass!=='real-skyrim'||!runtime.ready||!['1.6.1170.0','1.6.640.0'].includes(runtime.runtime)||g.metadata!==path.join(directory,'metadata')||g.payloads!==path.join(directory,'packages')||g.directory!==await fs.realpath(directory)||g.installation!==await fs.realpath(selectedGame)||g.configDirectory!==await fs.realpath(selectedConfig)||await versionReader(path.join(selectedGame,'SkyrimSE.exe'))!==runtime.runtime)throw Error('Trusted current L1 selection required for real recovery');managed.add(g);processChecks.set(g,gameRunning);await checkManagedRoots(g);return g;}
 
+/** The future profile may be absent while its signed runtime is staged. */
+export function runtimePreparationDirectory(game:string,config:string,storage:string){
+ if([config,storage].some(r=>contained(game,r)||contained(r,game))||contained(config,storage)||contained(storage,config))throw Error('Independent runtime metadata/profile roots required');
+ const key=createHash('sha256').update(game.toLowerCase()+'\n'+config.toLowerCase()).digest('hex');
+ return path.join(storage,'managed-installations',key);
+}
+
 /** Bootstrap only: a verified Steam installation can need repair before L1 is ready.
  * Generic content authorization remains unchanged. RuntimeTransaction owns the
  * narrowly scoped executable/CCC writer and never exposes this grant to IPC. */
 export async function registerRuntimePreparationTarget(selection:SteamSelection,config:string,storage:string):Promise<SandboxGrant>{
  if(!isSteamSelection(selection))throw Error('Verified Steam capability required');await assertSteamIdle(selection);
  const game=selection.game;config=await fs.realpath(config);storage=await fs.realpath(storage);await noLinks(config);await noLinks(storage);
- if([config,storage].some(r=>contained(game,r)||contained(r,game))||contained(config,storage)||contained(storage,config))throw Error('Independent runtime metadata/profile roots required');
- const key=createHash('sha256').update(game.toLowerCase()+'\n'+config.toLowerCase()).digest('hex'),directory=path.join(storage,'managed-installations',key);await safeDirectory(directory);
+ const directory=runtimePreparationDirectory(game,config,storage);await safeDirectory(directory);
  try{
   await fs.stat(path.join(directory,'metadata/sandbox.json'));const {MetadataStore}=await import('./metadata');
   const store=await MetadataStore.recover(directory,async(actual,g)=>{

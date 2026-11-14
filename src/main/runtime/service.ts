@@ -1,14 +1,15 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {createHash} from 'node:crypto';
-import {checkExistingAncestors,contained,noLinks,safeDirectory,safeFile} from '../files';
+import type {BigIntStats} from 'node:fs';
+import {createHash,randomUUID} from 'node:crypto';
+import {checkExistingAncestors,contained,hashFile,noLinks,safeDirectory,safeFile} from '../files';
 import {gameRunning,steamRoots,fileVersion} from '../windows';
-import {registerRuntimePreparationTarget} from '../installer/managed-target';
+import {registerRuntimePreparationTarget,runtimePreparationDirectory} from '../installer/managed-target';
 import {MetadataStore} from '../installer/metadata';
 import type {SandboxGrant} from '../installer/sandbox';
-import {verifySteamSelection,assertSteamIdle} from './steam';
-import {authenticateRuntimeCohort,type RuntimeCohort} from './policy';
-import {RuntimeTransaction,type WholePlayCheckpoint,type WholePlayPlanner} from './transaction';
+import {verifySteamSelection,verifySteamRecoverySelection,assertSteamIdle} from './steam';
+import {assertRuntimeCohort,authenticateRuntimeCohort,type RuntimeCohort} from './policy';
+import {RuntimeTransaction,stageRuntimeExecutable,verifyRuntimeExecutable,type RuntimeExecutableProof,type WholePlayCheckpoint,type WholePlayPlanner} from './transaction';
 import {ensureDepotHelper,acquireDepots} from './depot';
 import type {RuntimePreparationState,RuntimeRecoveryState} from '../../shared/runtime-contracts';
 const policyUrl='https://pub-276cbfc24fc84b30bbef7eaa4f57067c.r2.dev/runtime/steam-1170.json';
@@ -46,6 +47,8 @@ function operationMessage(error:unknown,cancelled:boolean){
   return 'ปิด Skyrim และ SKSE หรือรอให้ Steam อัปเดตเสร็จ แล้วลองอีกครั้ง';
  if(/disk space|free space/i.test(message))return 'พื้นที่ว่างไม่เพียงพอ ตรวจพื้นที่ของเกม โปรไฟล์ และข้อมูลสำรอง แล้วลองอีกครั้ง';
  if(/another whole-Play recovery journal owns/i.test(message))return 'เลือกโฟลเดอร์เกมเดิมที่เริ่มเตรียมไว้เพื่อคืนไฟล์';
+ if(/preflight runtime version verification failed/i.test(message))
+  return 'ตรวจเวอร์ชัน SkyrimSE.exe ไม่ผ่าน เลือกชุดเกมที่ตรงกับ 1.6.1170.0 แล้วลองอีกครั้ง';
  if(/journal before a standalone write|interrupted play|recovery required|restore is available/i.test(message))
   return 'พบข้อมูลการเตรียมเกมที่ต้องกู้คืน ตรวจสถานะและใช้ปุ่มคืนไฟล์ก่อนลองอีกครั้ง';
  if(/conflict|changed after|changed during/i.test(message))return 'พบไฟล์ที่เปลี่ยนไปจากข้อมูลที่ตรวจไว้ เก็บไฟล์เดิมไว้และตรวจสอบก่อนลองอีกครั้ง';
@@ -118,10 +121,10 @@ export class RuntimePreparation {
   if(this.recoveryRead===request&&this.state.selectionRevision===revision)this.update(recovery);
  }
  cancel(){this.prepared=undefined;this.operation?.controller.abort(Error('Runtime preparation cancelled'));}
- protected async runtimeTarget(game:string,config:string,requireExistingConfig=false){
+ protected async runtimeTarget(game:string,config:string,requireExistingConfig=false,recoveryOnly=false){
   if(requireExistingConfig)await this.existingProfile(config);
-  const selection=await verifySteamSelection(game,await steamRoots());
-  if(!requireExistingConfig)await safeDirectory(config);
+  const select=recoveryOnly?verifySteamRecoverySelection:verifySteamSelection;
+  const selection=await select(game,await steamRoots());
   await safeDirectory(this.storage);
   const grant=await registerRuntimePreparationTarget(selection,config,this.storage);
   const steamStamp=await assertSteamIdle(selection);
@@ -134,14 +137,17 @@ export class RuntimePreparation {
    if(!(await fs.lstat(config)).isDirectory())throw Error('Expected a directory');
   }catch(error){throw Error('Whole-Play recovery requires an existing, unredirected Skyrim profile directory',{cause:error});}
  }
- private async context(game:string,config:string,requireExistingConfig=false){
+ private async context(game:string,config:string,requireExistingConfig=false,recoveryOnly=false){
   if(requireExistingConfig)await this.existingProfile(config);
-  const target=await this.runtimeTarget(game,config,requireExistingConfig);
+  const target=await this.runtimeTarget(game,config,requireExistingConfig,recoveryOnly);
   const store=await MetadataStore.create(target.grant);
   // Do not mix the independently authorized 17777 profile with normal play.
   try{const j=await store.read('npc-development/journal.json') as {state?:string};if(j.state!=='reverted')throw Error('Revert the NPC development profile before normal-server runtime preparation');}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
-  try{const settings=await safeFile(game,'Data/Platform/Plugins/skymp5-client-settings.txt'),s=await fs.stat(settings);if(s.size>1024*1024||s.nlink!==1)throw Error('Client settings exceed bound or use a hard link');const text=await fs.readFile(settings,'utf8');if(/17777/.test(text))throw Error('NPC development endpoint 17777 is active; revert the development profile first');}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
+  await this.assertNormalPlayer(game);
   return{...target,store};
+ }
+ private async assertNormalPlayer(game:string){
+  try{const settings=await safeFile(game,'Data/Platform/Plugins/skymp5-client-settings.txt'),s=await fs.stat(settings);if(s.size>1024*1024||s.nlink!==1)throw Error('Client settings exceed bound or use a hard link');const text=await fs.readFile(settings,'utf8');if(/17777/.test(text))throw Error('NPC development endpoint 17777 is active; revert the development profile first');}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
  }
  protected async loadPolicy(signal:AbortSignal):Promise<Readonly<RuntimeCohort>>{
   // No unsigned local compatibility-profile or renderer-supplied source is used.
@@ -155,7 +161,228 @@ export class RuntimePreparation {
   const helper=await ensureDepotHelper(this.storage,policy,signal);
   return acquireDepots(policy,helper,cache,signal,(phase,message,authQr)=>this.updateOperation(signal,{phase,message,authQr}),needed);
  }
- protected runtimeVersion(file:string){return fileVersion(file);}
+ protected runtimeVersion(file:string){return fileVersion(file,true);}
+ private runtimeCache(payloads:string,policy:Readonly<RuntimeCohort>){
+  const digest=createHash('sha256').update(JSON.stringify({depots:policy.depots,files:policy.files})).digest('hex');
+  return path.join(payloads,'steam-depots',digest);
+ }
+ private async provisionProfile(game:string,config:string,policy:Readonly<RuntimeCohort>,signal:AbortSignal){
+  const selection=await verifySteamSelection(game,await steamRoots());
+  const stamp=await assertSteamIdle(selection);
+  const gameIdentity=await fs.lstat(selection.game,{bigint:true});
+  const guard=async()=>{
+   signal.throwIfAborted();
+   assertRuntimeCohort(policy,false);
+   await noLinks(selection.game);
+   const current=await fs.lstat(selection.game,{bigint:true});
+   if(!current.isDirectory()||current.dev!==gameIdentity.dev||current.ino!==gameIdentity.ino)throw Error('Runtime installation identity changed');
+   if(await gameRunning())throw Error('Close Skyrim/SKSE before runtime preparation');
+   if(await assertSteamIdle(selection)!==stamp)throw Error('Steam installation changed during preparation; retry after Steam finishes');
+  };
+  await guard();
+  await this.assertNormalPlayer(selection.game);
+  const {config:profile}=await canonicalSelection(selection.game,config);
+  await safeDirectory(this.storage);
+  const storage=await fs.realpath(this.storage);
+  const directory=runtimePreparationDirectory(selection.game,profile,storage);
+  // An existing registration binds an earlier profile identity. Never recreate
+  // that profile or overwrite its recovery records after the directory vanished.
+  const noExistingRegistration=async()=>{
+   for(const relative of ['sandbox.json',runtimeJournal]){
+    const file=path.join(directory,'metadata',relative);
+    checkExistingAncestors(file);
+    try{await fs.lstat(file);}
+    catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')continue;throw error;}
+    throw Error('Runtime recovery required before Play; the original Skyrim profile directory is unavailable');
+   }
+  };
+  await noExistingRegistration();
+  const payloads=path.join(directory,'packages');
+  await safeDirectory(payloads);
+  const directoryIdentity=async(root:string)=>{
+   await noLinks(root);
+   const stat=await fs.lstat(root,{bigint:true});
+   if(!stat.isDirectory()||await fs.realpath(root)!==root)throw Error('Unsafe runtime staging directory');
+   return stat.dev+':'+stat.ino;
+  };
+  const stagingRoots=new Map(await Promise.all([directory,payloads].map(async root=>[root,await directoryIdentity(root)] as const)));
+  const checkStagingRoots=async()=>{
+   for(const [root,id] of stagingRoots)if(await directoryIdentity(root)!==id)throw Error('Runtime staging root identity changed');
+  };
+  // The desktop singleton and selection reservation cover ordinary callers.
+  // This exclusive lease also keeps separate hosts from provisioning the same
+  // profile or staging into its future store at the same time.
+  const release=await this.profileBootstrapLease(directory,checkStagingRoots);
+  try{
+  await noExistingRegistration();
+  const executable=policy.files.find(file=>file.path.toLowerCase()==='skyrimse.exe');
+  if(!executable)throw Error('Signed runtime executable is missing');
+  const needed:RuntimeCohort['files']=[];
+  let executableFile:string|undefined;
+  for(const entry of policy.files){
+   const sources=[[selection.game,entry.path],[payloads,'runtime-staging/'+entry.sha256]] as const;
+   let available:string|undefined;
+   for(const [root,relative] of sources){
+    try{
+     const file=await safeFile(root,relative),stat=await fs.lstat(file);
+     if(stat.nlink!==1)throw Error('Unsafe runtime payload before profile creation');
+     if(stat.size===entry.size&&(await hashFile(file,entry.size)).sha256===entry.sha256){
+      available=file;break;
+     }
+     if(root===payloads)throw Error('Corrupt staged runtime payload');
+    }catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+   }
+   if(!available)needed.push(entry);
+   if(entry===executable)executableFile=available;
+  }
+  const cache=this.runtimeCache(payloads,policy);
+  const retained=path.join(cache,'cohort');
+  let source:string|undefined;
+  const missing:string[]=[];
+  for(const entry of needed){
+   const relative=entry.path;
+   try{
+    const file=await safeFile(retained,relative),stat=await fs.lstat(file);
+    if(stat.nlink!==1)throw Error('Unsafe retained runtime payload before profile creation');
+    if(stat.size!==entry.size||(await hashFile(file,entry.size)).sha256!==entry.sha256){missing.push(relative);continue;}
+    source=retained;
+   }catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;missing.push(relative);}
+  }
+  if(missing.length){
+   const requested=new Set(missing),neededBytes=policy.files.filter(file=>requested.has(file.path)).reduce((total,file)=>total+file.size,0);
+   const space=await fs.statfs(payloads);
+   if(Number(space.bavail)*Number(space.bsize)<neededBytes*2+128*1024**2)throw Error('Insufficient disk space for runtime acquisition');
+   await safeDirectory(cache);
+   await checkStagingRoots();
+   source=await this.acquire(policy,cache,signal,missing);
+   if(source!==retained)throw Error('Unexpected runtime acquisition location');
+  }
+  if(!executableFile){
+   if(!source)throw Error('Missing signed runtime executable source');
+   executableFile=await stageRuntimeExecutable(payloads,await safeFile(source,executable.path),executable,async()=>{
+    await guard();await checkStagingRoots();
+   });
+  }
+  const checkExecutable=await verifyRuntimeExecutable(executableFile,executable,policy.runtime,file=>this.runtimeVersion(file));
+  const proof:RuntimeExecutableProof={file:executableFile,expected:executable,check:async()=>{
+   await checkStagingRoots();
+   await checkExecutable();
+  }};
+  const created:Array<{root:string;id:string}>=[];
+  const removeCreated=async(store?:MetadataStore)=>{
+   // Only empty directories created by this attempt are eligible. A durable
+   // apply journal keeps its exact root and remains available for Restore.
+   const metadata=path.join(directory,'metadata'),journal=path.join(metadata,runtimeJournal);
+   checkExistingAncestors(journal);
+   try{await fs.lstat(journal);return;}
+   catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+   if(store){
+    const grant=store.grant,root=created.at(-1);
+    if(!root||grant.configDirectory!==root.root||grant.roots[root.root]!==root.id||
+       grant.metadata!==metadata||await directoryIdentity(metadata)!==grant.roots[metadata])return;
+    const release=await store.lease();
+    try{
+     // Bootstrap metadata has no recovery value before an Apply journal.
+     // Retain authenticated policy replay history and all staged payloads.
+     const registration=await store.read('sandbox.json') as SandboxGrant;
+     if(registration.id!==grant.id)return;
+     const names=new Set(await fs.readdir(metadata));
+     if([...names].some(name=>!['auth-key','sandbox.json','runtime-preparation','writer.lock'].includes(name)))return;
+     if(names.has('runtime-preparation')){
+      const runtime=path.join(metadata,'runtime-preparation');
+      await noLinks(runtime);
+      if((await fs.readdir(runtime)).some(name=>name!=='policy-ledger.json'))return;
+     }
+     if((await fs.readdir(root.root)).length)return;
+     await fs.unlink(path.join(metadata,'sandbox.json'));
+    }finally{await release();}
+   }else{
+    try{await fs.lstat(path.join(metadata,'sandbox.json'));return;}
+    catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+   }
+   for(const {root,id} of created.reverse()){
+    try{if(await directoryIdentity(root)===id)await fs.rmdir(root);}
+    catch(error){if(!['ENOENT','ENOTEMPTY','EEXIST'].includes((error as NodeJS.ErrnoException).code??''))throw error;}
+   }
+   try{await fs.lstat(profile);return false;}
+   catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return true;throw error;}
+  };
+  const missingRoots:string[]=[];
+  for(let root=profile;;root=path.dirname(root)){
+   try{await noLinks(root);break;}
+   catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;missingRoots.unshift(root);}
+  }
+  try{
+   for(const root of missingRoots){
+    await noLinks(path.dirname(root));
+    await this.assertNormalPlayer(selection.game);
+    await guard();
+    await noExistingRegistration();
+    await proof.check();
+    await fs.mkdir(root);
+    created.push({root,id:await directoryIdentity(root)});
+   }
+   return{source,proof,removeCreated,release};
+  }catch(error){await removeCreated();throw error;}
+  }catch(error){await release();throw error;}
+ }
+ private async profileBootstrapLease(directory:string,checkRoots:()=>Promise<void>){
+  const file=path.join(directory,'profile-bootstrap.lock');
+  const temp=path.join(directory,'profile-bootstrap-'+randomUUID()+'.lock');
+  const token=JSON.stringify({pid:process.pid,temp:path.basename(temp)});
+  const sameLock=(a:BigIntStats,b:BigIntStats)=>a.dev===b.dev&&a.ino===b.ino&&a.mtimeNs===b.mtimeNs;
+  const unlinkOwnTemp=async(stat:BigIntStats)=>{
+   await checkRoots();
+   try{
+    const current=await fs.lstat(temp,{bigint:true});
+    if(current.isFile()&&sameLock(current,stat))await fs.unlink(temp);
+   }catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+  };
+  await checkRoots();
+  const handle=await fs.open(temp,'wx',0o600);
+  let stat:BigIntStats;
+  try{
+   await handle.writeFile(token);
+   await handle.sync();
+   stat=await handle.stat({bigint:true});
+  }finally{await handle.close();}
+  const recover=async()=>{
+   await noLinks(file);
+   const old=await fs.lstat(file,{bigint:true});
+   if(!old.isFile()||old.nlink>2n||old.size>128n)throw Error('Invalid runtime profile provisioning lease');
+   const stored=JSON.parse(await fs.readFile(file,'utf8')) as {pid?:number;temp?:string};
+   if(!Number.isSafeInteger(stored.pid)||stored.pid!<1||stored.pid!>0xffffffff||
+      typeof stored.temp!=='string'||!/^profile-bootstrap-[a-f0-9-]{36}\.lock$/.test(stored.temp)){
+    throw Error('Invalid runtime profile provisioning lease');
+   }
+   try{process.kill(stored.pid!,0);throw Error('Another runtime profile provisioning operation is active');}
+   catch(probe){if((probe as NodeJS.ErrnoException).code!=='ESRCH')throw probe;}
+   await checkRoots();await noLinks(file);
+   const current=await fs.lstat(file,{bigint:true});
+   if(!sameLock(old,current)||current.nlink!==old.nlink)throw Error('Runtime profile provisioning lease changed');
+   if(current.nlink===2n){
+    const sibling=path.join(directory,stored.temp);
+    const copy=await fs.lstat(sibling,{bigint:true});
+    if(!copy.isFile()||!sameLock(old,copy)||copy.nlink!==2n)throw Error('Runtime profile provisioning lease link changed');
+    await fs.unlink(sibling);
+   }
+   await fs.unlink(file);
+  };
+  try{
+   try{await fs.link(temp,file);}
+   catch(error){
+    if((error as NodeJS.ErrnoException).code!=='EEXIST')throw error;
+    await recover();
+    await fs.link(temp,file);
+   }
+  }finally{await unlinkOwnTemp(stat);}
+  return async()=>{
+   await checkRoots();
+   const current=await fs.lstat(file,{bigint:true});
+   if(!current.isFile()||current.nlink!==1n||!sameLock(current,stat))throw Error('Runtime profile provisioning lease changed');
+   await fs.unlink(file);
+  };
+ }
  protected async wholePlayCheckpoint(_stage:WholePlayCheckpoint,_path?:string,_writer?:string){}
  private async *relatedRecoveryRecords(selection:Selection){
   let registry:string;
@@ -276,7 +503,7 @@ export class RuntimePreparation {
    await this.ledger(selected.store,policy);
    const tx=await RuntimeTransaction.open(selected.grant,policy,selected.guard,{
     iniDirectories:this.iniDirectory?[config,this.iniDirectory]:[config],
-    steamStamp:selected.steamStamp,wholePlayStorage:this.storage,
+    steamStamp:selected.steamStamp,wholePlayStorage:this.storage,runtimeVersion:file=>this.runtimeVersion(file),
     wholePlayCheckpoint:async(stage,relative,writer)=>{
      if(stage==='after-preimages-commit'){
       this.updateOperation(signal,{...recoveryState('recoverable',true),phase:'applying',message:'สำรองไฟล์ต้นฉบับครบแล้ว กำลังเตรียมไฟล์ Play'});
@@ -291,17 +518,11 @@ export class RuntimePreparation {
     if(Number(space.bavail)*Number(space.bsize)<neededBytes*2+128*1024**2){
      throw Error('Insufficient disk space for whole-Play runtime acquisition');
     }
-    const id=createHash('sha256').update(JSON.stringify({depots:policy.depots,files:policy.files})).digest('hex');
-    const cache=path.join(selected.grant.payloads,'steam-depots',id);
+    const cache=this.runtimeCache(selected.grant.payloads,policy);
     await safeDirectory(cache);
     return this.acquire(policy,cache,signal,needed);
    };
-   const verifyRuntime=async()=>{
-    if(await this.runtimeVersion(await safeFile(selected.grant.installation,'SkyrimSE.exe'))!=='1.6.1170.0'){
-     throw Error('Final runtime version verification failed; Restore is available');
-    }
-   };
-   await tx.prepareWholePlay(planner,acquire,verifyRuntime,signal);
+   await tx.prepareWholePlay(planner,acquire,()=>tx.verifyInstalledRuntime(),signal);
    this.updateOperation(signal,{phase:'ready',message:'runtime และไฟล์ Play ผ่านการตรวจสอบครบแล้ว',authQr:undefined});
   });
  }
@@ -324,25 +545,51 @@ export class RuntimePreparation {
  async prepare(game:string,config:string){return this.run(game,config,false,async signal=>{
   this.prepared=undefined;
   this.updateOperation(signal,{phase:'checking',message:'ตรวจชุดไฟล์ Skyrim และส่วนเสริม',authQr:undefined});
+  let policy:Readonly<RuntimeCohort>|undefined,provisioned:Awaited<ReturnType<RuntimePreparation['provisionProfile']>>|undefined;
+  try{await fs.lstat(config);}
+  catch(error){
+   if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;
+   policy=await this.loadPolicy(signal);
+   provisioned=await this.provisionProfile(game,config,policy,signal);
+  }
+  let provisionedStore:MetadataStore|undefined;
+  try{
   const c=await this.context(game,config);
+  if(provisioned)provisionedStore=c.store;
   this.rememberRecoveryStore(signal,c.store);
   if(await c.guard())throw Error('Close Skyrim/SKSE before runtime preparation');
   const recovery=await RuntimeTransaction.forRecovery(c.grant,c.guard);
   await recovery.assertStandaloneWriteAllowed();
-  await recovery.recover();
-  const p=await this.loadPolicy(signal);await this.ledger(c.store,p);const tx=await RuntimeTransaction.open(c.grant,p,c.guard,{iniDirectories:this.iniDirectory?[config,this.iniDirectory]:[config],steamStamp:c.steamStamp}),plan=await tx.inspect();this.updateOperation(signal,{...plan,...await this.readRecovery({game,config},c.store)});
+  await recovery.resumeRestore();
+  const p=policy??await this.loadPolicy(signal);
+  await this.ledger(c.store,p);
+  await provisioned?.proof.check();
+  const tx=await RuntimeTransaction.open(c.grant,p,c.guard,{
+   iniDirectories:this.iniDirectory?[config,this.iniDirectory]:[config],steamStamp:c.steamStamp,runtimeVersion:file=>this.runtimeVersion(file),
+   admittedExecutable:provisioned?.proof,
+  });
+  await tx.recover(signal);
+  const plan=await tx.inspect();
+  this.updateOperation(signal,{...plan,...await this.readRecovery({game,config},c.store)});
   if(plan.changedFiles){
    const required=plan.backupBytes+plan.stagingBytes+plan.downloadBytes*2+128*1024**2;
    for(const root of [c.grant.installation,c.grant.payloads,this.storage,c.grant.configDirectory!]){const stat=await fs.statfs(root);if(Number(stat.bavail)*Number(stat.bsize)<required)throw Error('Insufficient disk space for download, staging and original-file backups');}
    const needed=await tx.neededPayloads();
-   const digest=createHash('sha256').update(JSON.stringify({depots:p.depots,files:p.files})).digest('hex'),cache=path.join(c.grant.payloads,'steam-depots',digest);await safeDirectory(cache);
-   const source=needed.length?await this.acquire(p,cache,signal,needed):cache;
+   const cache=this.runtimeCache(c.grant.payloads,p);await safeDirectory(cache);
+   const source=provisioned?.source??(needed.length?await this.acquire(p,cache,signal,needed):cache);
    this.updateOperation(signal,{phase:'applying',message:'ตรวจครบแล้ว กำลังเตรียม runtime และพักส่วนเสริมที่ไม่ใช้',authQr:undefined});await tx.apply(source,signal);
   }
-  if(await this.runtimeVersion(await safeFile(game,'SkyrimSE.exe'))!=='1.6.1170.0')throw Error('Final runtime version verification failed; restore is available');
+  const checkInstalled=await tx.verifyInstalledRuntime();
   const final=await tx.inspect();if(final.changedFiles!==0)throw Error('Runtime cohort verification failed after preparation');
+  await checkInstalled();
   this.updateOperation(signal,{...final,...await this.readRecovery({game,config},c.store),phase:'ready',message:'Skyrim 1.6.1170.0 และชุดส่วนเสริมผ่านตรวจแล้ว — ติดตั้ง modpack ต่อได้',authQr:undefined});
   signal.throwIfAborted();if(this.operation?.selectionRevision===this.state.selectionRevision)this.prepared={game,config,tx};
+  }catch(error){
+   const removed=await provisioned?.removeCreated(provisionedStore).catch(()=>false);
+   if(removed&&this.operation?.controller.signal===signal)this.operation.store=undefined;
+   throw error;
+  }
+  finally{await provisioned?.release();}
  });}
  async beginModpack(game:string,config:string){return this.run(game,config,false,async signal=>{
   const prepared=this.prepared;
@@ -360,7 +607,10 @@ export class RuntimePreparation {
  async restore(game:string,config:string){return this.run(game,config,true,async signal=>{
   this.prepared=undefined;
   this.updateOperation(signal,{phase:'restoring',message:'ตรวจ conflict และคืนไฟล์ต้นฉบับก่อน Frostveil',authQr:undefined});
-  const c=await this.context(game,config,true);
+  const local=await this.readRecovery({game,config});
+  // Only a journal authenticated for these exact selected roots may use
+  // legacy Steam metadata without an affirmative language declaration.
+  const c=await this.context(game,config,true,local.canRestore);
   this.rememberRecoveryStore(signal,c.store);
   const tx=await RuntimeTransaction.forRecovery(c.grant,c.guard,{wholePlayCheckpoint:(stage,relative,writer)=>this.wholePlayCheckpoint(stage,relative,writer)});
   await tx.restore();

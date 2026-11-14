@@ -1,5 +1,5 @@
 export type Channel='stable'|'beta';
-export interface Dashboard {runtimePreparation?:import('./runtime-contracts').RuntimePreparationState;verificationWarning?:string;}
+export interface Dashboard {runtimePreparation?:import('./runtime-contracts').RuntimePreparationState;verificationWarning?:string;steamSelectionRequired?:boolean;}
 export interface LauncherApi {
  inspectRuntime():Promise<Dashboard>;prepareRuntime():Promise<Dashboard>;restoreRuntime():Promise<Dashboard>;cancelRuntime():Promise<Dashboard>;
  onRuntimePreparation(listener:(state:import('./runtime-contracts').RuntimePreparationState)=>void):()=>void;

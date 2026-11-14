@@ -102,6 +102,9 @@ async function fixture(t:TestContext,preferences:Buffer|null){
  const stagedRuntime=path.join(source,'SkyrimSE.exe');await fs.writeFile(stagedRuntime,runtimeAfter);
  const stagedLoader=path.join(source,'skse64_loader.exe');await fs.writeFile(stagedLoader,loaderBytes);
  const stagedSkse=path.join(source,'skse64_1_6_1170.dll');await fs.writeFile(stagedSkse,skseRuntimeBytes);
+ const executable=path.join(game,'SkyrimSE.exe'),stagedExecutable=path.join(grant.payloads,'runtime-staging',sha(runtimeAfter));
+ const versionProbes:string[]=[];
+ let executableVersion='1.6.1170.0',driftBeforeJournal=false;
  let corruptOriginalBlob=false,corrupted=false,interruptWriter:string|undefined,interrupted=false,addLateUnknown=false;
  class FixturePreparation extends RuntimePreparation{
   protected override async runtimeTarget(g:string,c:string){assert.equal(g,game);assert.equal(c,config);return{grant,guard:async()=>false,steamStamp:sha('synthetic Steam identity')};}
@@ -110,8 +113,19 @@ async function fixture(t:TestContext,preferences:Buffer|null){
    signal.throwIfAborted();assert.equal(value,signed);acquisitions++;
    assert.deepEqual([...requested].sort(),['SkyrimSE.exe']);return source;
   }
-  protected override async runtimeVersion(file:string){assert.equal(file,path.join(game,'SkyrimSE.exe'));return'1.6.1170.0';}
+  protected override async runtimeVersion(file:string){
+   assert.ok([executable,stagedExecutable].includes(file));
+   assert.deepEqual(await fs.readFile(file),runtimeAfter);
+   versionProbes.push(file);
+   return executableVersion;
+  }
   protected override async wholePlayCheckpoint(stage:string,file?:string,writer?:string){
+   if(driftBeforeJournal&&stage==='before-preimages-commit'){
+    driftBeforeJournal=false;
+    const replacement=stagedExecutable+'.replacement';
+    await fs.copyFile(stagedExecutable,replacement);
+    await fs.rename(replacement,stagedExecutable);
+   }
    if(addLateUnknown&&stage==='before-ready'){
     addLateUnknown=false;await fs.writeFile(path.join(game,'Data/late-unreviewed.esp'),tes4());
    }
@@ -154,14 +168,18 @@ async function fixture(t:TestContext,preferences:Buffer|null){
   },
   scan:async selected=>{scans++;assert.equal(selected,baseline);return{directory:game,ready:true,runtime:'1.6.1170.0',skseLoader:'2.2.6',skseRuntime:'1.6.1170.0',nativeLauncherAvailable:true,files:[],errors:[],scannedAt:new Date().toISOString()};},
  };
- const snapshot=async()=>{
+ const targetImages=async()=>{
   const files:string[]=['SkyrimSE.exe',...targets.map(item=>item.path),'@config/plugins.txt','@config/loadorder.txt'];
   const images=[];
   for(const name of files){const full=name.startsWith('@config/')?path.join(config,name.slice(8)):path.join(game,name);const stat=await fs.stat(full,{bigint:true});images.push({name,hash:sha(await fs.readFile(full)),dev:String(stat.dev),ino:String(stat.ino)});}
-  const journal=await fs.readFile(path.join(grant.metadata,'runtime-preparation/journal.json'));
-  return{images,journal:sha(journal)};
+  return images;
  };
+ const journalPath=path.join(grant.metadata,'runtime-preparation/journal.json');
+ const snapshot=async()=>({images:await targetImages(),journal:sha(await fs.readFile(journalPath))});
  return{grant,game,config,runtime,adapters,prefsPath,preferences,snapshot,
+  targetImages,journalPath,versionProbes,executable,stagedExecutable,
+  setExecutableVersion:(version:string)=>{executableVersion=version;},
+  swapExecutableBeforeJournal:()=>{driftBeforeJournal=true;},
   stats:()=>({acquisitions,policyLoads,packCalls,verifiedWrites,scans}),
   setProfileConflict:(value:boolean)=>{profileConflict=value;},
   switchRelease:(tag:string)=>{latestRelease=tag;},
@@ -172,6 +190,42 @@ async function fixture(t:TestContext,preferences:Buffer|null){
   restart:()=>new FixturePreparation(grant.directory,path.join(grant.directory,'unused-policy.json'),path.dirname(prefsPath)),
  };
 }
+
+test('W03 admission Whole Play refuses a signed replacement with wrong version before journaling or writes',async t=>{
+ const f=await fixture(t,null),before=await f.targetImages();
+ f.setExecutableVersion('1.6.640.0');
+ let spawns=0;
+ const launch=new GameLauncher(async()=>false,async()=>{spawns++;});
+ await assert.rejects(launch.play(()=>preparePlay(f.runtime,f.game,f.config,f.adapters)),/runtime version/i);
+ assert.deepEqual(await f.targetImages(),before);
+ assert.deepEqual(f.versionProbes,[f.stagedExecutable]);
+ await assert.rejects(fs.stat(f.journalPath),{code:'ENOENT'});
+ assert.equal(spawns,0);
+});
+
+test('W03 admission Whole Play fences staged executable identity after version probe',async t=>{
+ const f=await fixture(t,null),before=await f.targetImages();
+ f.swapExecutableBeforeJournal();
+ await assert.rejects(preparePlay(f.runtime,f.game,f.config,f.adapters),/runtime executable.*changed/i);
+ assert.deepEqual(await f.targetImages(),before);
+ await assert.rejects(fs.stat(f.journalPath),{code:'ENOENT'});
+ assert.deepEqual(f.versionProbes,[f.stagedExecutable]);
+});
+
+test('W03 admission Whole Play pending forward resume verifies installed executable and preserves journal on refusal',async t=>{
+ const f=await fixture(t,null);f.interruptAt('runtime');
+ await assert.rejects(preparePlay(f.runtime,f.game,f.config,f.adapters),/fixture interruption/i);
+ const pending=await f.snapshot();
+ f.setExecutableVersion('1.6.640.0');
+ let spawns=0;
+ const launch=new GameLauncher(async()=>false,async()=>{spawns++;});
+ await assert.rejects(launch.play(()=>preparePlay(f.restart(),f.game,f.config,f.adapters)),/runtime version/i);
+ assert.deepEqual(await f.snapshot(),pending);
+ assert.equal(f.versionProbes.at(-1),f.executable);
+ assert.equal(spawns,0);
+ await f.restart().restore(f.game,f.config);
+ assert.deepEqual(await fs.readFile(f.executable),runtimeBefore);
+});
 
 test('normal Play composes writers once, preserves preferences, skips warm target writes, and restores the original images after restart',async t=>{
  const prefs=Buffer.from('[General]\r\nfMaxTime=1.0\r\n'),f=await fixture(t,prefs);

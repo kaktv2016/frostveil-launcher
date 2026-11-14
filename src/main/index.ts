@@ -16,6 +16,7 @@ import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {scanInstallation} from './installation';
 import {discoverSteam} from './discovery';
+import {verifySteamSelection} from './runtime/steam';
 import {fileVersion,steamRoots,gameRunning,startSkse} from './windows';
 import {createBackup} from './backup';
 import {GameLauncher} from './launch';
@@ -111,6 +112,7 @@ async function start(){
  const setSelection=async(directory:string)=>{
   scanRevision++;
   selectInstallation(state,directory);
+  state.steamSelectionRequired=undefined;
   modpack.invalidate();
   downloads.setInstalled(false);
   graphicsPack.invalidateInstalled();
@@ -121,10 +123,12 @@ async function start(){
  const scan=async(localOnly=false)=>{
   let revision=++scanRevision;
   if(!localOnly&&!settings.directory){
-   const choices=await discoverSteam(await steamRoots());
+   const choices=await discoverSteam(await steamRoots(),{requireIdle:true});
    if(revision!==scanRevision)return state.scan;
-   if(choices[0]){
-    const selected=setSelection(choices[0]);
+   const [only]=choices;
+   state.steamSelectionRequired=choices.length>1?true:undefined;
+   if(choices.length===1&&only){
+    const selected=setSelection(only);
     revision=scanRevision;
     await Promise.all([selected,saveSettings()]);
     if(revision!==scanRevision)return state.scan;
@@ -181,7 +185,8 @@ async function start(){
    await verify;
   }
   if(current()&&!localOnly){
-   await log(!directory?'No Steam installation detected; select a game folder':
+   await log(state.steamSelectionRequired?'Multiple verified Steam installations detected; select a game folder':
+    !directory?'No verified Steam installation detected; select a game folder':
     state.scan?.ready?'Installation matches local baseline; server connection NOT TESTED':'Installation incompatible/unverified — Play blocked');
   }
   return state.scan;
@@ -291,7 +296,12 @@ async function start(){
 
  handler('scan',async arg=>{noArgument(arg);await scan();});
  handler('choose',async arg=>{noArgument(arg);const selected=fixture?path.join(fixture,'game'):(await dialog.showOpenDialog(window,{properties:['openDirectory'],title:'Select folder containing SkyrimSE.exe'})).filePaths[0];if(selected){
-  await Promise.all([setSelection(selected),saveSettings()]);
+  let directory=selected;
+  if(!fixture){
+   try{directory=(await verifySteamSelection(selected,await steamRoots())).game;}
+   catch{throw Error('โฟลเดอร์นี้ไม่ใช่ Skyrim Special Edition ภาษาอังกฤษที่ Steam ตรวจสอบได้ กรุณาตรวจการติดตั้งแล้วเลือกใหม่');}
+  }
+  await Promise.all([setSelection(directory),saveSettings()]);
   await scan(true);
  }});
  handler('channel',async arg=>{if(arg!=='stable')throw Error('Beta is disabled until channel isolation is verified');settings.channel=validateSettings({directory:settings.directory,channel:arg}).channel;state.updates=updateState(settings.channel);await saveSettings();});

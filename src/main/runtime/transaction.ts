@@ -8,6 +8,7 @@ import {relativePath,safeDirectory,safeFile,hashFile,checkExistingAncestors,cont
 import {checkRoots,type SandboxGrant} from '../installer/sandbox';
 import {assertRuntimeCohort,runtimePath,managedRuntimePath,type RuntimeCohort} from './policy';
 import {planCreationIsolation,type Isolation} from './creations';
+import {fileVersion} from '../windows';
 
 interface Image {size:number;sha256:string;}
 interface ObservedImage extends Image {stamp:string;}
@@ -34,10 +35,15 @@ export interface WholePlayPlan {
 }
 export type WholePlayPlanner=(planning:WholePlayPlanning)=>Promise<WholePlayPlan>;
 export type WholePlayCheckpoint='before-preimages-commit'|'after-preimages-commit'|'before-target-write'|'after-target-temp-staged'|'after-target-write'|'before-ready';
+export interface RuntimeExecutableProof {
+ file:string;expected:Image;check:()=>Promise<void>;
+}
 interface Options {
  freeBytes?:(root:string)=>Promise<number>;checkpoint?:(stage:string)=>Promise<void>;
  iniDirectories?:readonly string[];steamStamp?:string;wholePlayStorage?:string;
  wholePlayCheckpoint?:(stage:WholePlayCheckpoint,path?:string,writer?:string)=>Promise<void>;
+ runtimeVersion?:(file:string)=>Promise<string>;
+ admittedExecutable?:RuntimeExecutableProof;
 }
 interface Intent {
  path:string;after:Image|null;writer:string;source?:string;sourceGrant?:SandboxGrant;managed?:boolean;
@@ -60,6 +66,59 @@ const observations=new Map<string,{stamp:string;image:Image}>();
 function cacheObservation(key:string,stamp:string,image:Image){
  if(observations.size>=30000)observations.delete(observations.keys().next().value!);
  observations.set(key,{stamp,image});
+}
+
+async function executableStamp(file:string){
+ await noLinks(file);
+ const stat=await fs.lstat(file,{bigint:true});
+ if(!stat.isFile()||stat.nlink!==1n)throw Error('Unsafe runtime executable');
+ return fileStamp(stat);
+}
+
+/** Bind the version resource to a stable observation of the signed bytes. */
+export async function verifyRuntimeExecutable(
+ file:string,expected:Image,version:string,readVersion:(file:string)=>Promise<string>,final=false
+){
+ const stamp=await executableStamp(file);
+ if(!same(await hashFile(file,limit),expected))throw Error('Runtime executable does not match the signed image');
+ const check=async()=>{
+  if(await executableStamp(file)!==stamp)throw Error('Runtime executable changed during version verification');
+ };
+ await check();
+ const message=final?'Final runtime version verification failed; Restore is available':
+  'Preflight runtime version verification failed; expected Skyrim '+version;
+ let observed:string;
+ try{observed=await readVersion(file);}catch(cause){throw Error(message,{cause});}
+ await check();
+ if(observed!==version)throw Error(message);
+ return check;
+}
+
+async function writeRuntimeBlob(file:string,source:string,want:Image,guard:()=>Promise<void>){
+ await safeDirectory(path.dirname(file));
+ try{
+  await noLinks(file);
+  if(!same(await hashFile(file,limit),want)||(await fs.stat(file)).nlink!==1)throw Error('Corrupt runtime content-addressed blob');
+  return;
+ }catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+ await noLinks(source);
+ const temp=file+'.'+randomUUID();
+ await fs.copyFile(source,temp,fs.constants.COPYFILE_EXCL);
+ try{
+  if(!same(await hashFile(temp,limit),want))throw Error('Runtime payload hash mismatch');
+  const handle=await fs.open(temp,'r+');
+  try{await handle.sync();}finally{await handle.close();}
+  await guard();
+  await noLinks(path.dirname(file));
+  await fs.rename(temp,file);
+ }finally{await fs.unlink(temp).catch(error=>{if(error.code!=='ENOENT')throw error;});}
+}
+
+export async function stageRuntimeExecutable(payloads:string,source:string,expected:Image,guard:()=>Promise<void>){
+ if(!hash.test(expected.sha256))throw Error('Invalid staged runtime executable identity');
+ const file=path.join(payloads,'runtime-staging',expected.sha256);
+ await writeRuntimeBlob(file,source,expected,guard);
+ return file;
 }
 
 function runtimeDestination(grant:SandboxGrant,raw:string){
@@ -207,13 +266,14 @@ export class RuntimeTransaction {
  private async checkDirectory(dir:DirectoryRecord){
   if(await this.directoryIdentity(dir.path)!==dir.identity)throw Error('Whole-Play directory identity conflict: '+dir.path);
  }
- private async ensureDirectories(j:Journal){
+ private async ensureDirectories(j:Journal,checkExecutable:()=>Promise<void>){
   for(const dir of j.wholePlay!.directories){
    await this.guard();
    await this.checkDirectory(dir);
    if(dir.identity!==null)continue;
    const directory=this.directoryPath(dir.path);
    await noLinks(path.dirname(directory));
+   await checkExecutable();
    await fs.mkdir(directory);
    dir.identity=await this.directoryIdentity(dir.path);
    if(dir.identity===null)throw Error('Whole-Play directory disappeared after creation: '+dir.path);
@@ -251,16 +311,42 @@ export class RuntimeTransaction {
   }catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error;}
  }
  private async image(raw:string):Promise<Image|null>{return onlyImage(await this.snapshot(raw));}
+ private async verifyExecutable(staged:boolean,final=false){
+  const policy=this.policy;
+  if(!policy)throw Error('Signed runtime policy required for executable admission');
+  const entry=policy.files.find(file=>file.path.toLowerCase()==='skyrimse.exe');
+  if(!entry){
+   // Small managed fixtures may exercise unrelated transaction behavior.
+   if(this.grant.targetClass==='managed-fixture')return async()=>{};
+   throw Error('Signed runtime executable is missing');
+  }
+  const file=staged?this.blob('runtime-staging',entry.sha256):this.target(entry.path);
+  const installedBefore=staged?await this.snapshot(entry.path):undefined;
+  const requireInstalled=async()=>{
+   if(installedBefore!==undefined&&(await this.snapshot(entry.path))?.stamp!==installedBefore?.stamp){
+    throw Error('Runtime executable changed during preparation');
+   }
+  };
+  const admitted=final?undefined:this.options.admittedExecutable;
+  if(admitted){
+   if(admitted.file!==file||!same(admitted.expected,entry))throw Error('Runtime executable changed during profile provisioning');
+   await admitted.check();
+   return async(checkInstalled=true)=>{if(checkInstalled)await requireInstalled();await admitted.check();};
+  }
+  const version=this.options.runtimeVersion??(this.grant.targetClass==='managed-fixture'?undefined:(file:string)=>fileVersion(file,true));
+  if(!version)return async()=>{};
+  const check=await verifyRuntimeExecutable(file,entry,policy.runtime,version,final);
+  await requireInstalled();
+  return async(checkInstalled=true)=>{if(checkInstalled)await requireInstalled();await check();};
+ }
+ async verifyInstalledRuntime(){return this.verifyExecutable(false,true);}
  private async current():Promise<Journal|null>{
   let j:Journal;try{j=await this.store.read(journal) as Journal;}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return null;throw e;}
   return validateRuntimeJournal(j,this.grant,this.managedPaths,true);
  }
  private blob(kind:'runtime-backups'|'runtime-staging',sha256:string){if(!hash.test(sha256))throw Error('Invalid blob identity');return path.join(this.grant.payloads,kind,sha256);}
  private async save(kind:'runtime-backups'|'runtime-staging',source:string,want:Image){
-  const file=this.blob(kind,want.sha256);await safeDirectory(path.dirname(file));
-  try{const existing=await safeFile(this.grant.payloads,kind+'/'+want.sha256);if(!same(await hashFile(existing,limit),want)||(await fs.stat(existing)).nlink!==1)throw Error('Corrupt runtime content-addressed blob');return;}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
-  const temp=file+'.'+randomUUID();await fs.copyFile(source,temp,fs.constants.COPYFILE_EXCL);
-  try{if(!same(await hashFile(temp,limit),want))throw Error('Runtime payload hash mismatch');const handle=await fs.open(temp,'r+');try{await handle.sync();}finally{await handle.close();}await this.guard();await fs.rename(temp,file);}finally{await fs.unlink(temp).catch(e=>{if(e.code!=='ENOENT')throw e;});}
+  await writeRuntimeBlob(this.blob(kind,want.sha256),source,want,()=>this.guard());
  }
  private async verifiedBlob(kind:'runtime-backups'|'runtime-staging',image:Image){
   try{
@@ -281,8 +367,9 @@ export class RuntimeTransaction {
   fence?:()=>Promise<void>,wholePlay?:Journal
  ){
   const recheck=async()=>{
-   await this.guard();await fence?.();
+   await this.guard();
    if(!same(await this.image(change.path),expected))throw Error('Runtime preimage conflict: '+change.path);
+   await fence?.();
   };
   await recheck();
   const file=this.target(change.path);
@@ -387,7 +474,7 @@ export class RuntimeTransaction {
   await this.requireTransientStamp(file,stamp);
   return{relative,stamp};
  }
- private async clearTransient(j:Journal,observed:Awaited<ReturnType<RuntimeTransaction['preflightTransient']>>){
+ private async clearTransient(j:Journal,observed:Awaited<ReturnType<RuntimeTransaction['preflightTransient']>>,beforeRemove?:()=>Promise<void>){
   if(!j.wholePlay?.transient)return;
   const {path:relative}=j.wholePlay.transient;
   const {file}=this.transientTarget(j,j.wholePlay.transient);
@@ -395,6 +482,7 @@ export class RuntimeTransaction {
    const parents=new Map(j.wholePlay.directories.map(dir=>[dir.path.toLowerCase(),dir]));
    await this.guardParents(parents,relative);
    await this.requireTransientStamp(file,observed.stamp);
+   await beforeRemove?.();
    await fs.unlink(file);
   }else{
    try{await fs.lstat(file);throw Error('Whole-Play transient appeared after recovery preflight');}
@@ -591,7 +679,7 @@ export class RuntimeTransaction {
  }
  async prepareWholePlay(
   planner:WholePlayPlanner,acquire:(needed:readonly string[])=>Promise<string>,
-  verifyRuntime:()=>Promise<void>,signal:AbortSignal
+  verifyRuntime:()=>Promise<void|(()=>Promise<void>)>,signal:AbortSignal
  ){
   if(!this.policy)throw Error('Signed runtime policy required for whole-Play preparation');
   const policy=this.policy;
@@ -677,6 +765,9 @@ export class RuntimeTransaction {
     }
    }
    await this.stageWholePlay(changes,intents,active,!!pending);
+   const verifyExecutable=await this.verifyExecutable(changes.some(change=>change.path.toLowerCase()==='skyrimse.exe'));
+   let replacedExecutable=false;
+   const checkExecutable=()=>verifyExecutable(!replacedExecutable);
    const changed=new Set(changes.map(file=>file.path.toLowerCase()));
    const combined=[
     ...[...active.values()].filter(file=>!changed.has(file.path.toLowerCase()))
@@ -704,6 +795,7 @@ export class RuntimeTransaction {
      if((await this.snapshot(record.path))?.stamp!==record.image?.stamp)throw Error('Whole-Play target or profile changed during preflight: '+record.path);
     }
     for(const dir of directories)await this.checkDirectory(dir);
+    await checkExecutable();
    };
    const verify=async(j?:Journal)=>{
     await this.options.wholePlayCheckpoint?.('before-ready');
@@ -715,13 +807,14 @@ export class RuntimeTransaction {
      if(!same(snapshot,after))throw Error('Whole-Play final image differs: '+relative);
      verified.set(relative.toLowerCase(),{path:relative,stamp:snapshot?.stamp});
     }
-    await verifyRuntime();
+    const checkInstalled=await verifyRuntime();
     await plan.verifyInstalled();
     await this.guard();signal.throwIfAborted();validateRuntime();
     await auditIsolation(true);
     for(const {path:relative,stamp} of verified.values()){
      if((await this.snapshot(relative))?.stamp!==stamp)throw Error('Whole-Play final image changed during verification: '+relative);
     }
+    await checkInstalled?.();
    };
    if(!pending&&!changes.length){
     await plan.revalidate();
@@ -739,16 +832,16 @@ export class RuntimeTransaction {
     await this.verifyOriginalBlobs(originals);
     await auditIsolation(false);
     await fence();
-    await this.store.write(journal,j);
+    await this.store.write(journal,j,checkExecutable);
     await this.options.wholePlayCheckpoint?.('after-preimages-commit');
    }
    await plan.revalidate();
    await this.verifyOriginalBlobs(originals);
    await auditIsolation(false);
    await fence();
-   await this.clearTransient(j,transient);
-   j.state='applying';await this.store.write(journal,j);
-   await this.ensureDirectories(j);
+   await this.clearTransient(j,transient,checkExecutable);
+   j.state='applying';await this.store.write(journal,j,checkExecutable);
+   await this.ensureDirectories(j,checkExecutable);
    const parentRecords=new Map(directories.map(dir=>[dir.path.toLowerCase(),dir]));
    for(const change of changes){
     const before=observed.get(change.path.toLowerCase())?.image;
@@ -757,7 +850,11 @@ export class RuntimeTransaction {
     await this.replace(change,change.after,before,'runtime-staging',async()=>{
      signal.throwIfAborted();validateRuntime();await this.guardParents(parentRecords,change.path);
      if((await this.snapshot(change.path))?.stamp!==before?.stamp)throw Error('Whole-Play target identity changed: '+change.path);
+     // The original installed image remains authoritative when unchanged.
+     // Keep checking the staged source through the replacement when changed.
+     await checkExecutable();
     },j);
+    if(change.path.toLowerCase()==='skyrimse.exe')replacedExecutable=true;
     await this.options.wholePlayCheckpoint?.('after-target-write',change.path,change.writer);
    }
    await verify(j);
@@ -781,6 +878,7 @@ export class RuntimeTransaction {
      try{source=await safeFile(sourceRoot,f.path);}catch(inner){if((inner as NodeJS.ErrnoException).code!=='ENOENT')throw inner;const depot=this.policy!.files.find(n=>n.path===f.path)!.depot;source=await safeFile(sourceRoot,depot+'/'+f.path);}
     }await this.save('runtime-staging',source,f.after);
    }}if(f.before)await this.save('runtime-backups',this.target(f.path),f.before);}
+   const checkExecutable=await this.verifyExecutable(files.some(change=>change.path.toLowerCase()==='skyrimse.exe'));
    await this.guard();for(const f of files)if(!same(await this.image(f.path),f.before))throw Error('Runtime preimage changed during staging');signal?.throwIfAborted();
    let combined=previous?.state==='active'?[...previous.files.filter(old=>!files.some(f=>f.path===old.path)),...files.map(f=>{const old=previous.files.find(old=>old.path===f.path);return{...f,before:old?old.before:f.before};})]:files;
    if(steamChanged){
@@ -793,7 +891,9 @@ export class RuntimeTransaction {
     combined=[...combined.filter(f=>!this.policy!.files.some(n=>n.path===f.path)&&!files.some(n=>n.path===f.path&&steamOwned(n))),...beforeUpdate,...files.filter(f=>!this.policy!.files.some(n=>n.path===f.path)&&steamOwned(f))];
    }
    const j:Journal={schemaVersion:1,installationId:this.grant.id,policyHash:digest(Buffer.from(JSON.stringify(this.policy))),...(this.options.steamStamp?{steamStamp:this.options.steamStamp}:{}),state:'prepared',files:combined};
-   await this.store.write(journal,j);await this.options.checkpoint?.('prepared');await this.finish(j,false,signal);
+   await checkExecutable();
+   await this.store.write(journal,j,checkExecutable);await this.options.checkpoint?.('prepared');
+   await this.applyFiles(j,checkExecutable,signal);
   }finally{await release();}
  }
  /** Snapshot approved modpack changes before the existing signed installers run.
@@ -905,35 +1005,73 @@ export class RuntimeTransaction {
   j.state='restored';
   await this.store.write(journal,j);
  }
- private async finish(j:Journal,restore:boolean,signal?:AbortSignal){
-  if(restore){await this.restoreFiles(j);return;}
-  j.state='applying';await this.store.write(journal,j);
+ private async applyFiles(j:Journal,checkExecutable:(checkInstalled?:boolean)=>Promise<void>,signal?:AbortSignal){
+  let replacedExecutable=false;
+  const fence=async()=>{
+   signal?.throwIfAborted();
+   assertRuntimeCohort(this.policy!,this.grant.targetClass==='managed-fixture');
+   await checkExecutable(!replacedExecutable);
+  };
+  await this.guard();await fence();
+  j.state='applying';await this.store.write(journal,j,fence);
   for(const change of j.files){
    signal?.throwIfAborted();await this.guard();
    const got=await this.image(change.path);
+   const executable=change.path.toLowerCase()==='skyrimse.exe';
+   if(executable)await fence();
    if(same(got,change.after))continue;
    if(!same(got,change.before))throw Error('Runtime recovery conflict: '+change.path);
-   await this.replace(change,change.after,change.before,'runtime-staging');
+   await this.replace(change,change.after,change.before,'runtime-staging',fence);
+   if(executable)replacedExecutable=true;
    await this.options.checkpoint?.('file-applied');
   }
   j.state='active';await this.store.write(journal,j);
  }
- async recover(){
+ private async preflightForwardResume(j:Journal){
+  // Refuse an inconsistent authenticated record before changing its state or
+  // resuming any earlier file, including one preceding the executable.
+  for(const change of j.files){
+   const got=await this.image(change.path);
+   if(same(got,change.after))continue;
+   if(!same(got,change.before))throw Error('Runtime recovery conflict: '+change.path);
+   if(change.after)await this.verifiedBlob('runtime-staging',change.after);
+  }
+ }
+ private async resumePending(restoreOnly:boolean,signal?:AbortSignal){
   const release=await this.store.lease(true);
   try{
    await this.guard();
    const j=await this.current();
    if(!j||['active','restored','modpack'].includes(j.state))return;
-   if(j.wholePlay&&j.state!=='restoring')throw Error('Resume interrupted Play with pinned authority or Restore it offline');
-   await this.finish(j,j.state==='restoring');
+   if(j.state==='restoring'){await this.restoreFiles(j);return;}
+   if(restoreOnly)return;
+   if(j.wholePlay)throw Error('Resume interrupted Play with pinned authority or Restore it offline');
+   const policy=this.policy;
+   if(!policy||j.policyHash!==digest(Buffer.from(JSON.stringify(policy)))||
+      j.steamStamp!==undefined&&j.steamStamp!==this.options.steamStamp){
+    throw Error('Runtime recovery required before Play; use the original signed policy or Restore offline');
+   }
+   assertRuntimeCohort(policy,this.grant.targetClass==='managed-fixture');
+   const executable=policy.files.find(file=>file.path.toLowerCase()==='skyrimse.exe');
+   const replacement=j.files.find(file=>file.path.toLowerCase()==='skyrimse.exe');
+   if(replacement&&(!executable||!same(replacement.after,executable))){
+    throw Error('Runtime recovery required before Play; journal executable differs from the signed policy');
+   }
+   await this.preflightForwardResume(j);
+   await this.verifyOriginalBlobs(j.files);
+   const staged=!!replacement&&!same(await this.image(replacement.path),replacement.after);
+   const checkExecutable=await this.verifyExecutable(staged);
+   await this.applyFiles(j,checkExecutable,signal);
   }finally{await release();}
  }
+ async recover(signal?:AbortSignal){await this.resumePending(false,signal);}
+ async resumeRestore(){await this.resumePending(true);}
  async restore(){
   const release=await this.store.lease(true);
   try{
    await this.guard();
    const j=await this.current();
-   if(j&&j.state!=='restored')await this.finish(j,true);
+   if(j&&j.state!=='restored')await this.restoreFiles(j);
   }finally{await release();}
  }
 }

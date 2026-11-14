@@ -2,7 +2,6 @@
 // The production main index and runtime recovery service remain real; every
 // external provider/process adapter is inert and writes only below the fixture.
 import {RuntimePreparation as RealRuntimePreparation} from '../src/main/runtime/service';
-import {registerRealTarget} from '../src/main/installer/managed-target';
 import {authenticateRuntimeCohort, type RuntimeCohort} from '../src/main/runtime/policy';
 import type {WholePlayCheckpoint} from '../src/main/runtime/transaction';
 import type {Profile} from '../src/shared/contracts';
@@ -15,9 +14,22 @@ import {setTimeout as delay} from 'node:timers/promises';
 const root = process.env.FROSTVEIL_W09_FIXTURE;
 if (!root || !path.isAbsolute(root)) throw Error('W09 fixture root missing');
 const fixturePath = (...segments: string[]) => path.join(root, ...segments);
+const gamePath = (library: string) => fixturePath(library, 'steamapps', 'common', 'Skyrim Special Edition');
 const marker = (name: string) => fs.appendFile(fixturePath('markers.jsonl'), JSON.stringify({name, at: Date.now()}) + '\n');
 const mode = (name: string) => fs.readFile(fixturePath(name), 'utf8');
 const sha = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
+export async function runtimeVersionFixture(file: string) {
+  if (file === path.join(gamePath('a'),'SkyrimSE.exe') || file === path.join(gamePath('b'),'SkyrimSE.exe')) {
+    return '1.6.1170.0';
+  }
+  const stage=fixturePath('local','SkyrimRPLauncher','managed-installations');
+  const rel=path.relative(stage,file);
+  if (!/^[a-f0-9]{64}[\\/]packages[\\/]runtime-staging[\\/][a-f0-9]{64}$/.test(rel)) {
+    throw Error('W09 unexpected staged version path');
+  }
+  await marker('fixture-staged-version');
+  return await mode('version-mode') === 'wrong' ? '1.6.640.0' : '1.6.1170.0';
+}
 async function trace<T>(run: Promise<T>): Promise<T> {
   try { return await run; }
   catch (error) {
@@ -44,19 +56,10 @@ async function baseline(): Promise<Profile> {
 }
 
 export class RuntimePreparation extends RealRuntimePreparation {
+  protected override runtimeVersion(file: string) { return runtimeVersionFixture(file); }
   override prepare(...args: Parameters<RealRuntimePreparation['prepare']>) { return trace(super.prepare(...args)); }
   override prepareWholePlay(...args: Parameters<RealRuntimePreparation['prepareWholePlay']>) { return trace(super.prepareWholePlay(...args)); }
   override restore(...args: Parameters<RealRuntimePreparation['restore']>) { return trace(super.restore(...args)); }
-  protected override async runtimeTarget(game: string, config: string) {
-    if (![fixturePath('game-a'),fixturePath('game-b')].includes(game)||config!==fixturePath('local','Skyrim Special Edition')){
-      throw Error('W09 unexpected runtime target');
-    }
-    const grant = await registerRealTarget(game, config, this['storage'], {ready: true, runtime: '1.6.1170.0'}, async file => {
-      if (path.basename(file) === 'SkyrimSE.exe') return '1.6.1170.0';
-      throw Error('Unexpected W09 fixture version probe');
-    });
-    return {grant, guard: async () => false, steamStamp: 'a'.repeat(64)};
-  }
   protected override async loadPolicy(signal: AbortSignal): Promise<Readonly<RuntimeCohort>> {
     await marker('runtime-policy-started');
     while (await mode('policy-mode') === 'stall') await delay(50, undefined, {signal});
@@ -115,7 +118,7 @@ export class ProductionDownloads extends EventEmitter {
     })};
   }
   async installAndActivate(game: string) {
-    if (game !== fixturePath('game-a')) throw Error('W09 unexpected server pack target');
+    if (game !== gamePath('a')) throw Error('W09 unexpected server pack target');
     const operation = new AbortController();
     this.operation = operation;
     this.value.phase = 'downloading';
@@ -152,16 +155,15 @@ export class GraphicsPackService extends EventEmitter {
 
 export const fixtureWindows = {
   gameRunning: async () => false,
-  steamRoots: async () => [],
+  steamRoots: async () => [fixturePath('a')],
   fileVersion: async (file: string) => path.basename(file) === 'SkyrimSE.exe' ? '1.6.1170.0' : '0.2.2.6',
   startSkse: async (exe: string, cwd: string) => {
-    if (cwd !== fixturePath('game-a') || exe !== fixturePath('game-a', 'skse64_loader.exe')) throw Error('W09 unexpected launch path');
+    if (cwd !== gamePath('a') || exe !== path.join(gamePath('a'), 'skse64_loader.exe')) throw Error('W09 unexpected launch path');
     await marker('inert-skse');
   },
   authenticode: async () => undefined,
 };
 
-export const fixtureDiscovery = {discoverSteam: async () => [fixturePath('game-a')]};
 export const fixtureClientRepair = {clientRequirementForScan: async (f: any) => f, nativeRequirementForScan: async (f: any) => f,
   planClientForWholePlay: async () => ({writes:[]})};
 export const fixtureGraphicsSourcePlan = {loadGraphicsSourcePlan: async () => ({version:'1.0.20',files:[]}), graphicsSourceDirectories: async () => []};

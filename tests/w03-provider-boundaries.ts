@@ -42,7 +42,7 @@ interface Boundary {
   game: string;
   helper: string;
   storage: string;
-  version: () => Promise<string>;
+  version: (file: string) => Promise<string>;
   invoke: (child: InertHelper, args: string[], cwd: string) => Promise<void>;
   faults: unknown[];
 }
@@ -67,9 +67,10 @@ export async function gameRunning() { fixture(); return false; }
 
 export async function fileVersion(file: string) {
   const boundary = fixture();
-  assert.equal(file, path.join(boundary.game, 'SkyrimSE.exe'));
+  assert.ok(file===path.join(boundary.game,'SkyrimSE.exe')||
+    (contained(boundary.storage,file)&&path.basename(path.dirname(file))==='runtime-staging'&&/^[a-f0-9]{64}$/.test(path.basename(file))));
   await noLinks(file);
-  return boundary.version();
+  return boundary.version(file);
 }
 
 export async function ensureDepotHelper(storage: string) {

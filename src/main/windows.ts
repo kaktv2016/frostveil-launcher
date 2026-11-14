@@ -6,21 +6,28 @@ const execute=promisify(execFile);
 const powershell=path.join(process.env.SystemRoot??'C:\\Windows','System32/WindowsPowerShell/v1.0/powershell.exe');
 const versionCache=new Map<string,string>();
 async function query(script:string,env?:NodeJS.ProcessEnv):Promise<string>{const result=await execute(powershell,['-NoProfile','-NonInteractive','-Command',script],{windowsHide:true,timeout:15000,maxBuffer:1024*1024,env:{...process.env,...env}});return result.stdout.trim().replace(/^\uFEFF/,'');}
-export async function fileVersion(file:string):Promise<string>{
- try{
-  const st=await fs.stat(file);
-  const key=`${file}:${st.size}:${st.mtimeMs}`;
-  const cached=versionCache.get(key);
-  if(cached!==undefined)return cached;
+export async function fileVersion(file:string,fresh=false):Promise<string>{
+ if(fresh){
+  // Admission uses the fixed numeric PE resource rather than the localized display string.
+  const text=await query("$v=[Diagnostics.FileVersionInfo]::GetVersionInfo($env:SKYRIM_RP_INSPECT_FILE); @($v.FileMajorPart,$v.FileMinorPart,$v.FileBuildPart,$v.FilePrivatePart) | ConvertTo-Json -Compress",{SKYRIM_RP_INSPECT_FILE:file});
+  const parts:unknown=JSON.parse(text||'null');
+  return Array.isArray(parts)&&parts.length===4&&parts.every(n=>Number.isInteger(n)&&n>=0&&n<=65535)?parts.join('.'):'';
+ }
+ const read=async()=>{
   // The path is data in a child-only environment variable, never shell source.
   const text=await query('[Diagnostics.FileVersionInfo]::GetVersionInfo($env:SKYRIM_RP_INSPECT_FILE).FileVersion | ConvertTo-Json -Compress',{SKYRIM_RP_INSPECT_FILE:file});
-  const parsed=JSON.parse(text||'null')??'';
-  versionCache.set(key,parsed);
-  return parsed;
- }catch{
-  const text=await query('[Diagnostics.FileVersionInfo]::GetVersionInfo($env:SKYRIM_RP_INSPECT_FILE).FileVersion | ConvertTo-Json -Compress',{SKYRIM_RP_INSPECT_FILE:file});
-  return JSON.parse(text||'null')??'';
- }
+  const value:unknown=JSON.parse(text||'null');
+  return typeof value==='string'?value:'';
+ };
+ const key=await fs.stat(file,{bigint:true})
+  .then(stat=>[file,stat.dev,stat.ino,stat.size,stat.mtimeNs,stat.ctimeNs].join(':'))
+  .catch(()=>undefined);
+ if(!key)return read();
+ const cached=versionCache.get(key);
+ if(cached!==undefined)return cached;
+ const value=await read();
+ versionCache.set(key,value);
+ return value;
 }
 export async function steamRoots():Promise<string[]>{
  const text=await query("@((Get-ItemProperty -LiteralPath 'HKCU:\\Software\\Valve\\Steam' -ErrorAction SilentlyContinue).SteamPath, (Get-ItemProperty -LiteralPath 'HKLM:\\SOFTWARE\\WOW6432Node\\Valve\\Steam' -ErrorAction SilentlyContinue).InstallPath) | Where-Object { $_ -is [string] } | ConvertTo-Json -Compress");

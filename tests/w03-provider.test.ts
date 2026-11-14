@@ -65,7 +65,7 @@ async function entries(directory: string) {
   }
 }
 
-async function fixture(t: TestContext, start: 'cold' | 'warm' = 'cold') {
+async function fixture(t: TestContext, start: 'cold' | 'warm' | 'missing-profile' = 'cold') {
   const root = await fs.realpath(await fs.mkdtemp(path.join(await canonicalTemporaryRoot(), 'fv-w03-')));
   t.after(() => fs.rm(root, {recursive: true, force: true}));
   const steamRoot = path.join(root, 'Steam');
@@ -90,7 +90,7 @@ async function fixture(t: TestContext, start: 'cold' | 'warm' = 'cold') {
     acquisition: {verified: true, receiptSha256: sha('W03 synthetic receipt')}
   };
   const writeBundled = (value: unknown) => fs.writeFile(bundled, JSON.stringify(value));
-  for (const dir of [path.join(steamRoot, 'steamapps'), path.join(game, 'Data'), path.join(otherGame, 'Data'), config, storage]) {
+  for (const dir of [path.join(steamRoot, 'steamapps'), path.join(game, 'Data'), path.join(otherGame, 'Data'), storage]) {
     await fs.mkdir(dir, {recursive: true});
   }
   const libraryVdf = path.join(steamRoot, 'steamapps', 'libraryfolders.vdf');
@@ -100,7 +100,10 @@ async function fixture(t: TestContext, start: 'cold' | 'warm' = 'cold') {
   const targetPaths = payloads.map(f => path.join(game, f.path));
   for (const [i, f] of payloads.entries()) await fs.writeFile(targetPaths[i]!, start === 'warm' ? f.target : f.original);
   const pluginFile = path.join(config, 'plugins.txt');
-  await fs.writeFile(pluginFile, '# W03 original profile\r\n');
+  if(start!=='missing-profile'){
+    await fs.mkdir(config);
+    await fs.writeFile(pluginFile, '# W03 original profile\r\n');
+  }
   await fs.writeFile(helper, helperBytes);
   await writeBundled(envelope(policy));
 
@@ -110,7 +113,7 @@ async function fixture(t: TestContext, start: 'cold' | 'warm' = 'cold') {
   const requests: string[] = [], targetWrites: string[] = [], faults: unknown[] = [];
   const states: RuntimePreparationState[] = [];
   const invocations: {ids: string[]; manifests: string[]; requested: string[]; challenges: number}[] = [];
-  const versionChecks: {phase: RuntimePreparationState['phase']; bytes: Buffer[]}[] = [];
+  const versionChecks: {phase: RuntimePreparationState['phase']; bytes: Buffer[]; file:string; image:Buffer}[] = [];
   t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
     assert.equal(String(input), policyUrl);
     assert.equal(init?.redirect, 'error');
@@ -127,8 +130,8 @@ async function fixture(t: TestContext, start: 'cold' | 'warm' = 'cold') {
   const service = new RuntimePreparation(storage, bundled);
   t.after(service.subscribe(s => states.push(s)));
   t.after(bindFixture({root, steamRoot, game, storage, helper, faults,
-    version: async () => {
-      versionChecks.push({phase: service.snapshot().phase, bytes: await Promise.all(targetPaths.map(file => fs.readFile(file)))});
+    version: async file => {
+      versionChecks.push({phase: service.snapshot().phase, bytes: await Promise.all(targetPaths.map(file => fs.readFile(file))), file, image:await fs.readFile(file)});
       return version;
     },
     invoke: async (child, args, cwd) => {
@@ -154,7 +157,7 @@ async function fixture(t: TestContext, start: 'cold' | 'warm' = 'cold') {
   }));
 
   return {
-    service, game, otherGame, steamRoot, storage, root, libraryVdf, selectedAcf: acf(library), policy, bundled, states, invocations, versionChecks, faults, requests, targetWrites,
+    service, game, otherGame, steamRoot, storage, config, root, directory:dir, libraryVdf, selectedAcf: acf(library), policy, bundled, states, invocations, versionChecks, faults, requests, targetWrites,
     prepare: (selected = game) => {
       assert.ok(selected !== root && contained(root, selected), 'W03 refuses targets outside its disposable root');
       return service.prepare(selected, config);
@@ -223,7 +226,7 @@ test('W03 selects the explicit canonical Steam library and refuses invalid targe
   const acf = await identity(f.selectedAcf);
   await f.inspect();
   assert.equal(f.service.snapshot().changedFiles, 0);
-  assert.deepEqual(f.versionChecks, [], 'Inspect does not probe the Windows version boundary');
+  assert.equal(f.versionChecks.length, 0, 'Inspect does not probe the Windows version boundary');
   f.setVersion('1.6.640.0');
   await assert.rejects(f.prepare(), /Final runtime version verification failed/);
   assert.equal(f.service.snapshot().phase, 'blocked');
@@ -232,7 +235,80 @@ test('W03 selects the explicit canonical Steam library and refuses invalid targe
   assert.equal(await f.journal(), null);
   assert.deepEqual(f.invocations, []);
   assert.deepEqual(f.targetWrites, []);
-  assert.deepEqual(f.versionChecks, [{phase: 'checking', bytes: payloads.map(p => p.target)}]);
+  assert.equal(f.versionChecks.length,1);
+  assert.equal(f.versionChecks[0]!.file,path.join(f.game,'SkyrimSE.exe'));
+  assert.deepEqual(f.versionChecks[0]!.bytes,payloads.map(p=>p.target));
+});
+
+test('W03 rejects a cold signed executable with a wrong version before target or journal writes', async t => {
+  const f=await fixture(t);
+  f.setVersion('1.6.640.0');
+  const before=await f.targets();
+  await assert.rejects(f.prepare(),/version/i);
+  assert.deepEqual(await f.targets(),before);
+  assert.equal(await f.journal(),null);
+  assert.deepEqual(f.targetWrites,[]);
+  const exe=payloads.find(file=>file.path==='SkyrimSE.exe')!;
+  assert.equal(path.basename(f.versionChecks[0]!.file),sha(exe.target));
+  assert.deepEqual(f.versionChecks[0]!.image,exe.target);
+  assert.deepEqual(f.versionChecks[0]!.bytes,payloads.map(p=>p.original));
+});
+
+test('W03 missing profile stays absent on wrong version and reuses one acquisition on retry', async t => {
+  const f=await fixture(t,'missing-profile');
+  f.setVersion('1.6.640.0');
+  const before=await f.targets();
+  await assert.rejects(f.prepare(),/version/i);
+  await assert.rejects(fs.lstat(f.config),{code:'ENOENT'});
+  assert.equal(await f.journal(),null);
+  assert.deepEqual(await f.targets(),before);
+  assert.deepEqual(f.targetWrites,[]);
+  assert.equal(f.invocations.length,1);
+  assertHelper(f,0,payloads.map(file=>file.path));
+  const raw=await f.rawFiles();
+  assert.deepEqual(raw.map(file=>file?.sha256),files.map(file=>file.sha256));
+
+  f.setVersion('1.6.1170.0');
+  await f.prepare();
+  assert.equal(f.service.snapshot().phase,'ready');
+  assert.equal(f.invocations.length,1);
+  assert.deepEqual(await f.rawFiles(),raw);
+  assert.ok((await fs.lstat(f.config)).isDirectory());
+  assert.equal((await f.readJournal()).state,'active');
+});
+
+test('W03 profile bootstrap only recovers a verified dead owner lease',async t=>{
+  const f=await fixture(t,'missing-profile');
+  await fs.mkdir(f.directory,{recursive:true});
+  const lock=path.join(f.directory,'profile-bootstrap.lock');
+  const name='profile-bootstrap-00000000-0000-0000-0000-000000000000.lock';
+  const temp=path.join(f.directory,name);
+  const deadPid=2147483646;
+  const kill=process.kill;
+  t.mock.method(process,'kill',((pid:number,signal?:number|string)=>{
+    assert.equal(signal,0);
+    if(pid===deadPid)throw Object.assign(Error('fixture prior process exited'),{code:'ESRCH'});
+    assert.equal(pid,process.pid);
+    return true;
+  }) as typeof kill);
+  await fs.writeFile(lock,'corrupt');
+  await assert.rejects(f.prepare());
+  assert.equal(await fs.readFile(lock,'utf8'),'corrupt');
+  assert.equal(f.invocations.length,0);
+  const live=JSON.stringify({pid:process.pid,temp:name});
+  await fs.writeFile(lock,live);
+  await assert.rejects(f.prepare(),/provisioning operation is active/);
+  assert.equal(await fs.readFile(lock,'utf8'),live);
+  assert.equal(f.invocations.length,0);
+  const stale=JSON.stringify({pid:deadPid,temp:name});
+  await fs.writeFile(lock,stale);
+  // Simulate process termination immediately after atomic lock publication.
+  await fs.link(lock,temp);
+  await f.prepare();
+  await assert.rejects(fs.stat(lock),{code:'ENOENT'});
+  await assert.rejects(fs.stat(temp),{code:'ENOENT'});
+  assert.equal(f.service.snapshot().phase,'ready');
+  assert.equal(f.invocations.length,1);
 });
 
 test('W03 cold trio verifies before Ready and two warm runs plus staged reuse need no new helper', async t => {
@@ -242,7 +318,11 @@ test('W03 cold trio verifies before Ready and two warm runs plus staged reuse ne
   await f.prepare();
   assert.equal(f.service.snapshot().phase, 'ready');
   assert.equal(f.service.snapshot().changedFiles, 0);
-  assert.deepEqual(f.versionChecks, [{phase: 'applying', bytes: payloads.map(p => p.target)}], 'the cold version probe happens after target Apply');
+  const exe=payloads.find(file=>file.path==='SkyrimSE.exe')!;
+  assert.ok(f.versionChecks.some(check=>path.basename(check.file)===sha(exe.target)&&check.image.equals(exe.target)&&
+    check.bytes.every((bytes,index)=>bytes.equals(payloads[index]!.original))), 'the signed staged executable is probed before target Apply');
+  assert.ok(f.versionChecks.some(check=>check.file===path.join(f.game,'SkyrimSE.exe')&&check.image.equals(exe.target)&&
+    check.bytes.every((bytes,index)=>bytes.equals(payloads[index]!.target))), 'the final installed executable is also verified');
   assert.equal(f.invocations.length, 1);
   assertHelper(f, 0, payloads.map(p => p.path));
   const challenges = f.states.filter(s => s.authQr);

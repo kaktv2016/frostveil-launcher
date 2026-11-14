@@ -28,13 +28,13 @@ const preparationFiles=[
  {depot:'489832',manifest:'8042843504692938467',path:'SkyrimSELauncher.exe',before:'original launcher',target:'fixture launcher'},
  {depot:'489833',manifest:'1914580699073641964',path:'SkyrimSE.exe',before:'original runtime',target:'fixture runtime'}
 ];
-async function preparationFixture(t:TestContext,mode:'success'|'version-failure'|'corrupt'){
+async function preparationFixture(t:TestContext,mode:'success'|'version-failure'|'wrong-version'|'unreadable-version'|'probe-drift'|'corrupt'){
  const grant=await createManagedFixture();
  t.after(()=>fs.rm(grant.directory,{recursive:true,force:true}));
  const game=grant.installation,config=grant.configDirectory!;
  const depots=preparationFiles.map(f=>({id:f.depot,manifest:f.manifest}));
  const files=preparationFiles.map(f=>({path:f.path,depot:f.depot,size:Buffer.byteLength(f.target),sha256:sha(f.target)}));
- const envelope=cohort({depots,files});
+ const envelope=cohort({depots,files}),signed=authenticateRuntimeCohort(envelope,trust,{fixture:true});
  const cache=path.join(grant.payloads,'steam-depots',sha(JSON.stringify({depots,files})));
  const source=path.join(cache,'cohort');
  const store=await MetadataStore.create(grant);
@@ -51,13 +51,16 @@ async function preparationFixture(t:TestContext,mode:'success'|'version-failure'
   }
  }));
  let rawBeforeApply:Awaited<ReturnType<typeof rawIdentities>>|undefined;
- let acquisitions=0,version=mode==='version-failure'?'1.6.640.0':'1.6.1170.0';
+ const probes:string[]=[];
+ const installedExecutable=path.join(game,'SkyrimSE.exe');
+ const stagedExecutable=path.join(grant.payloads,'runtime-staging',files.at(-1)!.sha256);
+ let acquisitions=0,version=mode==='version-failure'||mode==='wrong-version'?'1.6.640.0':'1.6.1170.0';
  class FixturePreparation extends RuntimePreparation {
   protected override async runtimeTarget(selectedGame:string,selectedConfig:string){
    assert.equal(selectedGame,game);assert.equal(selectedConfig,config);
    return {grant,guard:async()=>false,steamStamp:sha('synthetic Steam depot stamp')};
   }
-  protected override async loadPolicy(){return authenticateRuntimeCohort(envelope,trust,{fixture:true});}
+  protected override async loadPolicy(){return signed;}
   protected override async acquire(policy:Readonly<RuntimeCohort>,destination:string,signal:AbortSignal,requested:readonly string[]){
    signal.throwIfAborted();acquisitions++;
    assert.equal(destination,cache);
@@ -72,8 +75,12 @@ async function preparationFixture(t:TestContext,mode:'success'|'version-failure'
    return source;
   }
   protected override async runtimeVersion(file:string){
-   assert.equal(file,path.join(game,'SkyrimSE.exe'));
+   assert.ok([installedExecutable,stagedExecutable].includes(file));
    assert.equal(await fs.readFile(file,'utf8'),'fixture runtime');
+   probes.push(file);
+   if(mode==='unreadable-version')throw Error('fixture version resource unreadable');
+   if(mode==='probe-drift')await fs.writeFile(file,'changed runtime');
+   if(mode==='version-failure'&&file===stagedExecutable)return '1.6.1170.0';
    return version;
   }
  }
@@ -83,7 +90,7 @@ async function preparationFixture(t:TestContext,mode:'success'|'version-failure'
  t.after(service.subscribe(state=>states.push(state)));
  const prepare=()=>service.prepare(game,config);
  return {
-  service,prepare,readJournal,restore:()=>service.restore(game,config),
+  service,prepare,readJournal,restore:()=>service.restore(game,config),grant,probes,source,signed,store,installedExecutable,stagedExecutable,
   setTargetVersion:()=>{version='1.6.1170.0';},
   assertTargets:async(image:'before'|'target')=>{
    for(const f of preparationFiles)assert.deepEqual(await fs.readFile(path.join(game,f.path)),Buffer.from(f[image]));
@@ -123,6 +130,17 @@ test('service keeps all three raw depot copies after Ready and skips acquisition
  await f.assertPrepareWithoutAcquisition();
  await f.assertRawRetained();
 });
+for(const mode of ['wrong-version','unreadable-version','probe-drift'] as const){
+ test('W03 admission standalone refuses '+mode+' before creating the Apply journal or changing targets',async t=>{
+  const f=await preparationFixture(t,mode);
+  await assert.rejects(f.prepare(),/runtime (?:version|executable)/i);
+  await f.assertTargets('before');
+  await assert.rejects(f.readJournal(),{code:'ENOENT'});
+  assert.deepEqual(f.probes,[f.stagedExecutable]);
+  assert.equal(f.service.snapshot().canRestore,false);
+  await f.assertRawRetained();
+ });
+}
 test('service keeps all three raw depot copies after post-Apply verification fails, restores originals and reuses staged bytes',async t=>{
  const f=await preparationFixture(t,'version-failure');
  await assert.rejects(f.prepare(),/Final runtime version verification failed/);
@@ -299,11 +317,46 @@ test('interrupted Restore checks pending space before recovery and skips already
  assert.equal(await f.state(),'restored');
 });
 test('interruption after write is recoverable with authenticated journal and no second write',async()=>{const f=await fixture();try{
- let once=true;const tx=await RuntimeTransaction.open(f.grant,policy(),async()=>false,{checkpoint:async(stage)=>{if(stage==='file-applied'&&once){once=false;throw Error('simulated power loss');}}});
+ const original=policy();let once=true;const tx=await RuntimeTransaction.open(f.grant,original,async()=>false,{checkpoint:async(stage)=>{if(stage==='file-applied'&&once){once=false;throw Error('simulated power loss');}}});
  await assert.rejects(tx.apply(f.source),/power loss/);
- const recovered=await RuntimeTransaction.open(f.grant,policy(),async()=>false);await recovered.recover();await recovered.restore();
+ const recovered=await RuntimeTransaction.open(f.grant,original,async()=>false);await recovered.recover();await recovered.restore();
  assert.equal(await fs.readFile(path.join(f.grant.installation,'SkyrimSE.exe'),'utf8'),'before');
 }finally{await f.clean();}});
+test('W03 admission legacy forward resume rejects missing, different and wrong-version authority while retaining offline Restore',async t=>{
+ const f=await fixture();t.after(f.clean);
+ const original=policy();
+ const tx=await RuntimeTransaction.open(f.grant,original,async()=>false,{runtimeVersion:async()=>original.runtime,
+  checkpoint:async(stage)=>{if(stage==='prepared')throw Error('fixture interruption before write');}});
+ await assert.rejects(tx.apply(f.source),/fixture interruption/);
+ const journalPath=path.join(f.grant.metadata,'runtime-preparation','journal.json');
+ const pending=await fs.readFile(journalPath);
+ const game=path.join(f.grant.installation,'SkyrimSE.exe');
+ const before=await fs.stat(game,{bigint:true});
+ const recovery=await RuntimeTransaction.forRecovery(f.grant,async()=>false);
+ await assert.rejects(recovery.recover(),/original signed policy/);
+ const different=authenticateRuntimeCohort(cohort({acquisition:{verified:true,receiptSha256:sha('different')}}),trust,{fixture:true});
+ await assert.rejects((await RuntimeTransaction.open(f.grant,different,async()=>false)).recover(),/original signed policy/);
+ const backup=path.join(f.grant.payloads,'runtime-backups',sha('before'));
+ await fs.writeFile(backup,'broken');
+ await assert.rejects((await RuntimeTransaction.open(f.grant,original,async()=>false)).recover(),/blob integrity failure/);
+ assert.deepEqual(await fs.readFile(journalPath),pending);
+ assert.equal((await fs.stat(game,{bigint:true})).ino,before.ino);
+ await fs.writeFile(backup,'before');
+ const expected=original.files[0]!;
+ const probes:string[]=[];
+ const wrong=await RuntimeTransaction.open(f.grant,original,async()=>false,{runtimeVersion:async file=>{
+  probes.push(file);
+  return '1.6.640.0';
+ }});
+ await assert.rejects(wrong.recover(),/runtime version/i);
+ assert.deepEqual(probes,[path.join(f.grant.payloads,'runtime-staging',expected.sha256)]);
+ assert.deepEqual(await fs.readFile(journalPath),pending);
+ assert.equal(await fs.readFile(game,'utf8'),'before');
+ assert.equal((await fs.stat(game,{bigint:true})).ino,before.ino);
+ await recovery.restore();
+ assert.equal(await fs.readFile(game,'utf8'),'before');
+ assert.equal((await fs.stat(game,{bigint:true})).ino,before.ino);
+});
 test('creation isolation handles implicit CCC, preserves baseline, and refuses unknown loose assets',async()=>{const f=await fixture();try{
  await fs.writeFile(path.join(f.grant.installation,'Skyrim.ccc'),'ccBase.esm\r\nccPaid.esl\r\n');
  await fs.writeFile(path.join(f.grant.configDirectory!,'plugins.txt'),'*ccPaid.esl\n');

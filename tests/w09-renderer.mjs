@@ -18,11 +18,20 @@ const testsDir = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(testsDir, '..');
 await fs.mkdir(appRoot, {recursive: true});
 await fs.mkdir(fixtureRoot, {recursive: true});
-for (const dir of ['game-a/Data', 'game-b/Data', 'depot/Data', 'documents', 'appdata', 'local/Skyrim Special Edition']) {
-  await fs.mkdir(path.join(fixtureRoot, dir), {recursive: true});
+const install = library => path.join(fixtureRoot,library,'steamapps','common','Skyrim Special Edition');
+const gameA = install('a');
+const gameB = install('b');
+for (const dir of [path.join(gameA,'Data'),path.join(gameB,'Data'),...['depot/Data','documents','appdata','local/Skyrim Special Edition'].map(dir=>path.join(fixtureRoot,dir))]) {
+  await fs.mkdir(dir, {recursive: true});
 }
-const gameA = path.join(fixtureRoot, 'game-a');
-const gameB = path.join(fixtureRoot, 'game-b');
+const acf = (library, language='english', state='4', appId='489830') => fs.writeFile(
+  path.join(fixtureRoot,library,'steamapps','appmanifest_489830.acf'),
+  `"AppState" { "appid" "${appId}" "installdir" "Skyrim Special Edition" "StateFlags" "${state}" ${language===null?'':`"UserConfig" { "language" "${language}" }`} }`,
+);
+await fs.writeFile(path.join(fixtureRoot,'a','steamapps','libraryfolders.vdf'),
+  `"libraryfolders" { "0" { "path" ${JSON.stringify(path.join(fixtureRoot,'b'))} } }`);
+await acf('a','english','2');
+await acf('b','french');
 const config = path.join(fixtureRoot, 'local/Skyrim Special Edition');
 const originalRuntime = Buffer.from('original runtime bytes');
 const changedRuntime = Buffer.from('prepared runtime bytes');
@@ -44,6 +53,7 @@ await setMode('provider','stall');
 await setMode('inspection','ok');
 await setMode('policy','fail');
 await setMode('apply','ok');
+await setMode('version','ok');
 for (const game of [gameA, gameB]) await fs.writeFile(path.join(game, 'SkyrimSE.exe'), originalRuntime);
 await fs.writeFile(path.join(gameA, 'SkyrimSE.exe'), changedRuntime);
 
@@ -62,7 +72,6 @@ const imports = {
   './management/downloads': `export { ProductionDownloads } from ${JSON.stringify(fixtureModule)};`,
   './management/graphics-pack': `export { GraphicsPackService } from ${JSON.stringify(fixtureModule)};`,
   './windows': `import {fixtureWindows as w} from ${JSON.stringify(fixtureModule)}; export const {gameRunning,steamRoots,fileVersion,startSkse,authenticode}=w;`,
-  './discovery': `import {fixtureDiscovery as d} from ${JSON.stringify(fixtureModule)}; export const {discoverSteam}=d;`,
   './client-repair': `import {fixtureClientRepair as c} from ${JSON.stringify(fixtureModule)}; export const {clientRequirementForScan,nativeRequirementForScan,planClientForWholePlay}=c;`,
   './graphics-source-plan': `import {fixtureGraphicsSourcePlan as g} from ${JSON.stringify(fixtureModule)}; export const {loadGraphicsSourcePlan,graphicsSourceDirectories}=g;`,
   './update-bootstrap': `export { createUpdater } from ${JSON.stringify(fixtureModule)};`,
@@ -71,7 +80,7 @@ const mainFile = path.join(appRoot, 'main.cjs');
 const mainBuild = await build({entryPoints:[path.join(repo,'src/main/index.ts')],outfile:mainFile,bundle:true,platform:'node',format:'cjs',target:'node22',packages:'external',plugins:[{
   name:'w09-importer-scoped-inert-adapters',
   setup(builder){
-    builder.onResolve({filter:/^\.\/runtime\/service$|^\.\/management\/downloads$|^\.\/management\/graphics-pack$|^\.\/windows$|^\.\/discovery$|^\.\/client-repair$|^\.\/graphics-source-plan$|^\.\/update-bootstrap$/}, args=>{
+    builder.onResolve({filter:/^\.\/runtime\/service$|^\.\/management\/downloads$|^\.\/management\/graphics-pack$|^\.\/windows$|^\.\/client-repair$|^\.\/graphics-source-plan$|^\.\/update-bootstrap$/}, args=>{
       if (path.basename(args.importer)!=='index.ts') return;
       const contents=imports[args.path];
       if (!contents) throw Error('Unexpected W09 importer alias '+args.path);
@@ -82,7 +91,7 @@ const mainBuild = await build({entryPoints:[path.join(repo,'src/main/index.ts')]
       if (!['managed-target.ts','service.ts'].includes(path.basename(args.importer))) return;
       return {path:'./windows',namespace:'w09-runtime-windows'};
     });
-    builder.onLoad({filter:/.*/,namespace:'w09-runtime-windows'},()=>({contents:`export const gameRunning=async()=>false; export const steamRoots=async()=>[]; export const fileVersion=async()=> '1.6.1170.0';`,loader:'js'}));
+    builder.onLoad({filter:/.*/,namespace:'w09-runtime-windows'},()=>({contents:`import path from 'node:path'; export const gameRunning=async()=>false; export const steamRoots=async()=>[path.join(process.env.FROSTVEIL_W09_FIXTURE,'a')]; export const fileVersion=async()=> '1.6.1170.0';`,loader:'js'}));
   }
 }]});
 assert.ok(mainBuild.errors.length===0);
@@ -132,11 +141,38 @@ try {
   const markers=async name=>(await readMarkers(fixtureRoot)).filter(x=>x.name===name).length;
   const waitMarker=(name,count)=>expect.poll(()=>markers(name),{timeout:15000}).toBe(count);
   await expect(panel).toBeVisible({timeout:45000});
+  const noSelection=async()=>{
+    await expect(page.getByRole('button',{name:'Re-scan',exact:true})).toBeEnabled();
+    await expect(page.getByRole('button',{name:/^PLAY SKYRIM RP/})).toBeDisabled();
+    assert.equal((await page.evaluate(()=>window.launcher.status())).settings.directory,'');
+    assert.equal(JSON.parse(await fs.readFile(path.join(storage,'settings.json'),'utf8')).directory,'');
+  };
+  await noSelection();
+  observed.noValidCandidateLeavesSettingsUnselected=true;
+  await acf('a');
+  await acf('b');
+  await page.getByRole('button',{name:'Re-scan',exact:true}).click();
+  await noSelection();
+  await expect(page.getByTestId('steam-ambiguous-selection')).toBeVisible();
+  assert.equal(await markers('provider-baseline-started'),0);
+  observed.ambiguousRealDiscoveryRequiresExplicitSelection=true;
+  const keep=await hashFile(seeded.journal);
+  await fs.writeFile(path.join(fixtureRoot,'selection.txt'),gameB);
+  await acf('b','french');
+  await page.getByTestId('steam-ambiguous-selection').getByRole('button',{name:'Select folder'}).click();
+  await expect(page.getByRole('alert')).toContainText('โฟลเดอร์นี้ไม่ใช่ Skyrim Special Edition');
+  assert.equal((await page.evaluate(()=>window.launcher.status())).settings.directory,'');
+  assert.equal(await hashFile(seeded.journal),keep);
+  assert.equal(await markers('provider-baseline-started'),0);
+  observed.invalidExplicitSteamSelectionLeavesSettingsAndJournalIntact=true;
+  await page.getByRole('button',{name:'Re-scan',exact:true}).click();
   await expect(restoreButton()).toBeEnabled({timeout:15000});
   await waitMarker('provider-baseline-started',1);
   const initialJournalHash=await hashFile(seeded.journal);
   assert.equal(JSON.parse(await fs.readFile(path.join(storage,'settings.json'),'utf8')).directory,gameA);
   observed.discoverBindsRecoveryWhileStartupVerificationStalls=true;
+  await acf('b');
+  assert.equal((await page.evaluate(()=>window.launcher.status())).settings.directory,gameA);
   // Select away and back while the first metadata provider remains unresolved.
   await page.getByRole('button',{name:/^Installation/}).click();
   const choose=page.getByRole('button',{name:'Select folder',exact:true});
@@ -152,11 +188,27 @@ try {
   assert.equal(await markers('provider-inspection-started'),0);
   assert.equal(await hashFile(seeded.journal),initialJournalHash);
   observed.selectBackRestoresSelectedTargetsRecovery=true;
+  await acf('a','french');
+  await restoreButton().click();
+  await expect(page.getByRole('alert')).toBeVisible();
+  await expect(restoreButton()).toBeEnabled();
+  assert.equal(await hashFile(seeded.journal),initialJournalHash);
+  assert.deepEqual(await fs.readFile(path.join(gameA,'SkyrimSE.exe')),changedRuntime);
+  await acf('a',null);
+  await page.getByRole('button',{name:/^Dashboard/}).click();
+  await page.getByRole('button',{name:/^PLAY SKYRIM RP/}).click();
+  await expect(page.getByRole('alert')).toBeVisible();
+  await expect(restoreButton()).toBeEnabled();
+  assert.equal(await hashFile(seeded.journal),initialJournalHash);
+  assert.equal(await markers('runtime-policy-started'),0);
+  observed.strictSteamAdmissionPreservesPendingJournal=true;
   await restoreButton().click();
   await journalIs('restored');
   await expect(restoreButton()).toBeDisabled();
   assert.deepEqual(await fs.readFile(path.join(gameA,'SkyrimSE.exe')),originalRuntime);
   observed.actualRestoreIpcRestoredOriginalRuntime=true;
+  observed.authenticatedOfflineRestoreAllowsHistoricalMissingLanguage=true;
+  await acf('a');
   await setMode('provider','ok');
   await page.getByRole('button',{name:/^Dashboard/}).click();
   await expect(page.getByRole('button',{name:'Re-scan',exact:true})).toBeEnabled();
@@ -203,6 +255,20 @@ try {
   await expect(downloadButton).toBeEnabled();
   observed.serverDownloadCancelReachesActiveMainOperation=true;
   await page.getByRole('button',{name:/^Dashboard/}).click();
+
+  const beforeWrongVersion=await hashFile(seeded.journal);
+  await setMode('version','wrong');
+  const wrongBefore=await markers('fixture-staged-version');
+  await playButton().click();
+  await waitMarker('fixture-staged-version',wrongBefore+1);
+  await expect(alert()).toContainText('ตรวจเวอร์ชัน SkyrimSE.exe ไม่ผ่าน');
+  await expect(playButton()).toBeEnabled();
+  assert.deepEqual(await fs.readFile(path.join(gameA,'SkyrimSE.exe')),originalRuntime);
+  assert.equal(await hashFile(seeded.journal),beforeWrongVersion);
+  assert.equal(await markers('inert-skse'),0);
+  await expect(restoreButton()).toBeDisabled();
+  observed.wholePlayRejectsWrongStagedVersionBeforeWrites=true;
+  await setMode('version','ok');
 
   await prepareButton().click();
   await expect(panel.getByRole('status')).toContainText('ผ่านตรวจแล้ว',{timeout:15000});
@@ -314,7 +380,7 @@ globalThis.fetch=async()=>{throw Error('W09 global network blocked');};for(const
 for(const module of ['node:http','node:https'])for(const name of ['request','get'])require(module)[name]=()=>{throw Error('W09 HTTP blocked');};
 e.app.setPath('documents',path.join(fixture,'documents'));
 e.app.on('browser-window-created',(_event,w)=>{w.webContents.session.webRequest.onBeforeRequest({urls:['<all_urls>']},(d,done)=>done({cancel:!d.url.startsWith('app://launcher/')&&!(d.url.startsWith('file:')&&within(renderer,fileURLToPath(d.url)))}));w.webContents.setWindowOpenHandler(()=>({action:'deny'}));w.webContents.on('will-navigate',event=>event.preventDefault());});
-e.dialog.showOpenDialog=async()=>{const selected=fs.readFileSync(process.env.FROSTVEIL_W09_SELECTION_FILE,'utf8').trim();if(![path.join(fixture,'game-a'),path.join(fixture,'game-b')].includes(selected))throw Error('W09 invalid selection');return{canceled:false,filePaths:[selected]};};
+e.dialog.showOpenDialog=async()=>{const selected=fs.readFileSync(process.env.FROSTVEIL_W09_SELECTION_FILE,'utf8').trim();if(!['a','b'].some(library=>path.join(fixture,library,'steamapps','common','Skyrim Special Edition')===selected))throw Error('W09 invalid selection');return{canceled:false,filePaths:[selected]};};
 e.shell.openExternal=async()=>{throw Error('W09 external navigation blocked');};e.shell.openPath=async()=>{throw Error('W09 external path blocked');};
 process.env.NODE_PATH=process.env.FROSTVEIL_W09_MODULES;require('node:module').Module._initPaths();
 require(path.join(__dirname,'main.cjs'));`}
