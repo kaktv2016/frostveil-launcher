@@ -2,7 +2,13 @@ import fs from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 import {build} from 'esbuild';
 import {build as viteBuild} from 'vite';
-const args=process.argv.slice(2);
+const allArgs=process.argv.slice(2);
+const folderArgs=allArgs.filter(arg=>arg.startsWith('--w14-update-folder='));
+const w14Folder=folderArgs[0]?.slice('--w14-update-folder='.length);
+if(folderArgs.length>1||(w14Folder!==undefined&&!/^[A-Za-z]:[\\/][^\\/]/.test(w14Folder))){
+  throw Error('W14 update folder must be one absolute local Windows path');
+}
+const args=allArgs.filter(arg=>!arg.startsWith('--w14-update-folder='));
 const revision=args[0]===undefined?undefined:Number(args[0].match(/^--p0-cache-policy-revision=([1-9][0-9]*)$/)?.[1]);
 const policyFile=args[1]?.match(/^--p0-cache-policy-file=(.+)$/)?.[1];
 if ((revision!==undefined&&!Number.isSafeInteger(revision)) || (args.length>1&&!policyFile) || args.length>2) {
@@ -16,6 +22,6 @@ if (policyFile) {
   cachePin.sha256=createHash('sha256').update(cachePin.bytes).digest('hex');
 }
 await build({entryPoints:['src/main/index.ts'],outfile:'dist/main.cjs',bundle:true,platform:'node',format:'cjs',target:'node22',packages:'external',
-  define:{FROSTVEIL_PACKAGED_CACHE_POLICY:JSON.stringify(cachePin)}});
+  define:{FROSTVEIL_PACKAGED_CACHE_POLICY:JSON.stringify(cachePin),FROSTVEIL_W14_UPDATE_FOLDER:JSON.stringify(w14Folder)??'undefined'}});
 await build({entryPoints:['src/preload/index.ts'],outfile:'dist/preload.cjs',bundle:true,platform:'node',format:'cjs',target:'node22',external:['electron']});
 await viteBuild();

@@ -25,6 +25,7 @@ import {contained,relativePath,safeDirectory,safeFile,noLinks,checkExistingAnces
 import {updateState} from './updates';
 import {selectInstallation} from './session-state';
 import {createUpdater} from './update-bootstrap';
+import {packagedW14UpdateFolder} from './update-folder';
 import {InstallerSandboxDemo} from './installer/demo';
 import {durableWrite} from './installer/metadata';
 import {ModpackVerifier,mandatoryPackPolicy} from './modpack/service';
@@ -33,7 +34,8 @@ import type {Dashboard,Profile,Settings} from '../shared/contracts';
 const smoke=process.argv.includes('--smoke');
 const fixture=smoke?process.env.SKYRIM_LAUNCHER_FIXTURE:undefined;
 if(smoke&&!fixture)throw Error('Smoke mode requires a synthetic fixture directory');
-const storage=fixture?path.join(fixture,'app-data'):path.join(process.env.LOCALAPPDATA??app.getPath('userData'),'SkyrimRPLauncher');
+const storage=fixture?path.join(fixture,'app-data'):path.join(process.env.LOCALAPPDATA??app.getPath('userData'),
+ packagedW14UpdateFolder===undefined?'SkyrimRPLauncher':'SkyrimRPLauncher-W14Pilot');
 checkExistingAncestors(storage);
 app.setPath('userData',path.join(storage,'user-data'));
 protocol.registerSchemesAsPrivileged([{scheme:'app',privileges:{standard:true,secure:true,supportFetchAPI:true}}]);

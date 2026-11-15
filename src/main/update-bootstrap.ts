@@ -11,9 +11,13 @@ import {
  hasActiveLauncherUpdateKey,
  productionLauncherUpdateSource,
  validateLauncherUpdateTestProfile,
+ w14PilotLauncherUpdateSource,
+ type LauncherUpdateFeed,
  type LauncherUpdateSource
 } from './update-integrity';
+import {FolderLauncherUpdateTransport,packagedW14UpdateFolder} from './update-folder';
 import {authenticode,gameRunning} from './windows';
+declare const FROSTVEIL_W14_UPDATE_TEST:boolean|undefined;
 // Public signer subjects may be pinned here if Authenticode is ever used in addition to Ed25519 manifests.
 export const trustedPublisherNames:readonly string[]=[];
 class FixtureEngine extends EventEmitter implements UpdateEngine {
@@ -32,18 +36,20 @@ async function hasNsisUninstaller(dir:string):Promise<boolean>{
 }
 export async function createUpdater(fixture:boolean):Promise<LauncherUpdateService>{
  if(fixture)return new LauncherUpdateService(new FixtureEngine(),{version:app.getVersion(),checkEnabled:true,downloadTrusted:true,installed:false,gameRunning:async()=>false});
- let source:LauncherUpdateSource=productionLauncherUpdateSource;
- let transport:LauncherUpdateTransport|undefined;
+ const pilot=packagedW14UpdateFolder!==undefined;
+ let source:LauncherUpdateSource=pilot?w14PilotLauncherUpdateSource:productionLauncherUpdateSource;
+ let transport:LauncherUpdateFeed|undefined=pilot?new FolderLauncherUpdateTransport(packagedW14UpdateFolder!):undefined;
  let installDirectory:string|undefined;
  const testIndex=process.argv.indexOf('--launcher-update-test-profile');
  const testProfileArg=testIndex>=0?process.argv[testIndex+1]:undefined;
- if(process.argv.includes('--launcher-update-test')&&typeof testProfileArg==='string'&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1'){
+ const pilotTest=typeof FROSTVEIL_W14_UPDATE_TEST!=='undefined'&&FROSTVEIL_W14_UPDATE_TEST;
+ if((!pilot||pilotTest)&&process.argv.includes('--launcher-update-test')&&typeof testProfileArg==='string'&&process.env.FROSTVEIL_DISPOSABLE_UPDATE_TEST==='1'){
   const profile=validateLauncherUpdateTestProfile(JSON.parse(await fs.readFile(path.resolve(testProfileArg),'utf8')));
   source={
    mode:'disposable-test',
    owner:'kaktv2016',
    repo:'frostveil-launcher',
-   channel:'stable',
+   channel:source.channel,
    keys:{
     [profile.keyId]:{
      publicKey:profile.publicKey,
@@ -53,12 +59,17 @@ export async function createUpdater(fixture:boolean):Promise<LauncherUpdateServi
     }
    }
   };
-  transport=LauncherUpdateTransport.loopback(profile.loopbackOrigin,source.mode);
+  if(!pilot)transport=LauncherUpdateTransport.loopback(profile.loopbackOrigin,source.mode);
   installDirectory=profile.installDirectory;
  }
  let configured=false,trust=false,installed=false;
  const ed25519Trust=hasActiveLauncherUpdateKey(source);
  try{
+  if(pilot){
+   trust=ed25519Trust;
+   configured=trust;
+   installed=app.isPackaged&&trust&&await hasNsisUninstaller(path.dirname(process.execPath));
+  }else{
   const metadata=load(await fs.readFile(path.join(process.resourcesPath,'app-update.yml'),'utf8')) as Record<string,unknown>;
   configured=metadata.provider==='github'&&metadata.owner==='kaktv2016'&&metadata.repo==='frostveil-launcher'&&metadata.private!==true;
   const publishers=Array.isArray(metadata.publisherName)?metadata.publisherName:typeof metadata.publisherName==='string'?[metadata.publisherName]:[];
@@ -71,6 +82,7 @@ export async function createUpdater(fixture:boolean):Promise<LauncherUpdateServi
    const signature=await authenticode(process.execPath);
    installed=app.isPackaged&&trust&&signature.valid&&trustedPublisherNames.includes(signature.subject)&&uninstallerPresent;
   }
+  }
  }catch{/* Missing metadata/certificate/NSIS marker is an explicit safe capability limit. */}
  const userData=app.getPath('userData');
  return new LauncherUpdateService(
@@ -81,6 +93,6 @@ export async function createUpdater(fixture:boolean):Promise<LauncherUpdateServi
    installedVersion:app.getVersion(),
    installDirectory
   }),
-  {version:app.getVersion(),checkEnabled:app.isPackaged&&configured,downloadTrusted:trust,installed,gameRunning}
+  {version:app.getVersion(),checkEnabled:app.isPackaged&&configured,downloadTrusted:trust,installed,gameRunning,w14Pilot:pilot}
  );
 }

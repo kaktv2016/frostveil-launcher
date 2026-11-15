@@ -9,7 +9,7 @@ import {OFFICIAL} from '../src/main/modpack/plugins';
 import {helperPin} from '../src/main/runtime/depot';
 import {authenticateRuntimeCohort} from '../src/main/runtime/policy';
 import {
- LAUNCHER_MANIFEST_ASSET,authenticateLauncherUpdate,productionLauncherUpdateSource,verifyDownloadedInstaller,
+ LAUNCHER_MANIFEST_ASSET,authenticateLauncherUpdate,w14PilotLauncherUpdateSource,verifyDownloadedInstaller,
  type LauncherUpdateSource
 } from '../src/main/update-integrity';
 
@@ -75,7 +75,7 @@ async function openIntake(root:string,indexSha256:string,windowEnd:string,verifi
 
 export async function verifyW14PilotIntake(
  root:string,indexSha256:string,windowEnd:string,
- source:LauncherUpdateSource=productionLauncherUpdateSource,now:()=>number=Date.now
+ source:LauncherUpdateSource=w14PilotLauncherUpdateSource,now:()=>number=Date.now
 ){
  const verifiedAt=now();
  const {index,candidate,indexDigest,end,intakeFile,artifacts}=await openIntake(root,indexSha256,windowEnd,verifiedAt);

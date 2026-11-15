@@ -8,10 +8,12 @@ import {spawn} from 'node:child_process';
 import {createHash,generateKeyPairSync} from 'node:crypto';
 import {extractFile,listPackage} from '@electron/asar';
 import {_electron as electron} from '@playwright/test';
+import {build} from 'esbuild';
 import {InstallerSandboxDemo} from '../src/main/installer/demo';
 import {MetadataStore} from '../src/main/installer/metadata';
 import {LauncherUpdateService} from '../src/main/launcher-update-service';
 import {NsisEngine} from '../src/main/updater-engine';
+import {FolderLauncherUpdateTransport} from '../src/main/update-folder';
 import {
  LAUNCHER_MANIFEST_ASSET,
  LauncherUpdateTransport,
@@ -21,6 +23,7 @@ import {
 } from '../src/main/update-integrity';
 
 import {removeLockedTree} from './helpers/locked-tree';
+const folderRun=process.env.FROSTVEIL_W14_FOLDER_FIXTURE==='1';
 
 function runProcess(command:string,args:string[],cwd:string):Promise<{code:number|null;stdout:string;stderr:string}>{
  return new Promise((resolve,reject)=>{
@@ -33,7 +36,34 @@ function runProcess(command:string,args:string[],cwd:string):Promise<{code:numbe
  });
 }
 
-interface DisposableBoot {localData:string;temp:string;documents:string;profile:string;events:string;closeRequest:string;}
+async function restrictFixtureFeed(directory:string,tempRoot:string){
+ const resolved=await fs.realpath(directory);
+ assert.equal(path.dirname(resolved),await fs.realpath(tempRoot));
+ const powershell=path.join(process.env.SystemRoot??'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
+ const script=`
+  $ErrorActionPreference = 'Stop'
+  $folder = '${resolved.replaceAll("'","''")}'
+  $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User
+  $trusted = @($owner.Value, 'S-1-5-18', 'S-1-5-32-544')
+  $acl = Get-Acl -LiteralPath $folder
+  if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $owner.Value) { throw 'Unexpected fixture owner' }
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($value in $trusted) {
+    $sid = [Security.Principal.SecurityIdentifier]::new($value)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    $acl.SetAccessRule($rule)
+  }
+  Set-Acl -LiteralPath $folder -AclObject $acl
+  $check = Get-Acl -LiteralPath $folder
+  $permits = @($check.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object AccessControlType -eq Allow)
+  if (!$check.AreAccessRulesProtected -or @($permits | Where-Object {$_.IdentityReference.Value -notin $trusted}).Count -or
+      @($permits.IdentityReference.Value | Select-Object -Unique).Count -ne 3) { throw 'Restricted fixture ACL readback failed' }
+ `;
+ const result=await runProcess(powershell,['-NoProfile','-NonInteractive','-Command',script],tempRoot);
+ assert.equal(result.code,0,'Restricted fixture ACL verification failed');
+}
+
+interface DisposableBoot {localData:string;temp:string;documents:string;profile:string;events:string;closeRequest:string;mainBundle:string;}
 async function buildDisposableNsisInstaller(projectRoot:string,outDir:string,version:string,boot:DisposableBoot):Promise<string>{
  await fs.mkdir(outDir,{recursive:true});
  const injected=path.join(outDir,'disposable-entry');await fs.mkdir(injected);
@@ -57,7 +87,7 @@ __fvApp.on('browser-window-created',(_event,win)=>win.webContents.once('did-fini
 __fvApp.on('before-quit',()=>__fvEvent('quit'));
 setInterval(()=>{if(__fvFs.existsSync(__fvBoot.closeRequest))__fvApp.quit();},100).unref();
 `;
- await fs.writeFile(path.join(injected,'main.cjs'),prelude+await fs.readFile(path.join(projectRoot,'dist/main.cjs'),'utf8'));
+ await fs.writeFile(path.join(injected,'main.cjs'),prelude+await fs.readFile(boot.mainBundle,'utf8'));
  const configPath=path.join(outDir,`builder-${version}.json`);
  const config={
   appId:'dev.skyrimrp.launcher.disposable-test',
@@ -108,7 +138,8 @@ setInterval(()=>{if(__fvFs.existsSync(__fvBoot.closeRequest))__fvApp.quit();},10
  return path.join(outDir,`FrostveilDisposable-${version}-x64.exe`);
 }
 
-test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to signed 0.1.6 NSIS build in isolated temp directory while preserving user settings and ownership',{timeout:300000},async()=>{
+test(folderRun?'Real Windows W14 Folder Update: installed 0.1.5 Pilot reads the folder and upgrades to 0.1.6':
+ 'Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to signed 0.1.6 NSIS build in isolated temp directory while preserving user settings and ownership',{timeout:300000},async()=>{
  const projectRoot=path.resolve('.');
  // Measured: two real packages ~112-117s, installation/update ~55s, Windows cleanup ~3s.
  // 300s includes build time; individual ready waits remain bounded at 30/90s.
@@ -122,10 +153,13 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
 
  const tempRoot=await fs.mkdtemp(path.join(os.tmpdir(),'frostveil-real-nsis-'));
  const installDir=path.join(tempRoot,'installed-app');
- const isolatedLocalData=path.join(tempRoot,'isolated-local-app-data'),storage=path.join(isolatedLocalData,'SkyrimRPLauncher');
+ const isolatedLocalData=path.join(tempRoot,'isolated-local-app-data');
+ const storage=path.join(isolatedLocalData,folderRun?'SkyrimRPLauncher-W14Pilot':'SkyrimRPLauncher');
  const userDataDir=path.join(storage,'user-data');
  const documents=path.join(tempRoot,'documents');
- const boot:DisposableBoot={localData:isolatedLocalData,temp:os.tmpdir(),documents,profile:path.join(tempRoot,'update-test-profile.json'),events:path.join(tempRoot,'boot-events.jsonl'),closeRequest:path.join(tempRoot,'close-request')};
+ const feedPath=path.join(tempRoot,'restricted-feed');
+ const mainBundle=folderRun?path.join(tempRoot,'w14-main.cjs'):path.join(projectRoot,'dist/main.cjs');
+ const boot:DisposableBoot={localData:isolatedLocalData,temp:os.tmpdir(),documents,profile:path.join(tempRoot,'update-test-profile.json'),events:path.join(tempRoot,'boot-events.jsonl'),closeRequest:path.join(tempRoot,'close-request'),mainBundle};
  await fs.mkdir(installDir,{recursive:true});
  await fs.mkdir(userDataDir,{recursive:true});
  await fs.mkdir(documents);
@@ -134,14 +168,16 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
  const realUserInstallDir=path.join(process.env.LOCALAPPDATA??'','Programs','Skyrim RP Launcher');
  let realExeShaBefore:string|null=null;
  try{
-  const realExe=await fs.readFile(path.join(realUserInstallDir,'Skyrim RP Launcher.exe'));
-  realExeShaBefore=createHash('sha256').update(realExe).digest('hex');
+  if(!folderRun){
+   const realExe=await fs.readFile(path.join(realUserInstallDir,'Skyrim RP Launcher.exe'));
+   realExeShaBefore=createHash('sha256').update(realExe).digest('hex');
+  }
  }catch{/* Not present on machine */}
 
  // Seed user settings and Modpack ownership data that must survive Launcher update
  const settingsFile=path.join(storage,'settings.json');
  const ownershipFile=path.join(userDataDir,'ownership.json');
- const settingsContent=JSON.stringify({directory:'C:\\Games\\Skyrim Special Edition',channel:'stable'},null,2);
+ const settingsContent=JSON.stringify({directory:path.join(tempRoot,'synthetic-game-not-installed'),channel:'stable'},null,2);
  const ownershipContent=JSON.stringify({schemaVersion:1,packId:'frostveil',packVersion:'1.0.0',files:['Data/Frostveil/settings.json']},null,2);
  await fs.writeFile(settingsFile,settingsContent);
  await fs.writeFile(ownershipFile,ownershipContent);
@@ -166,6 +202,13 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
 
  let httpServer:http.Server|undefined;
  try{
+  if(folderRun){
+   await fs.mkdir(feedPath);
+   await timed('restricted-folder-acl',()=>restrictFixtureFeed(feedPath,tempRoot));
+   await fs.mkdir(path.join(feedPath,'assets'));
+   await build({entryPoints:['src/main/index.ts'],outfile:mainBundle,bundle:true,platform:'node',format:'cjs',target:'node22',packages:'external',
+    define:{FROSTVEIL_W14_UPDATE_FOLDER:JSON.stringify(feedPath),FROSTVEIL_W14_UPDATE_TEST:'true'}});
+  }
   const installer015=await timed('package-015',()=>buildDisposableNsisInstaller(projectRoot,path.join(tempRoot,'build-015'),'0.1.5',boot));
   const installer016=await timed('package-016',()=>buildDisposableNsisInstaller(projectRoot,path.join(tempRoot,'build-016'),'0.1.6',boot));
 
@@ -195,7 +238,8 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
    repo:'frostveil-launcher',
    tag:'v0.1.6',
    version:'0.1.6',
-   channel:'stable',
+   channel:folderRun?'w14-pilot':'stable',
+   ...(folderRun?{releaseId:6000}:{}),
    minimumLauncherVersion:'0.1.5',
    publishedAt:nowIso,
    expiresAt,
@@ -235,7 +279,13 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
    ]
   };
 
-  httpServer=http.createServer((req,res)=>{
+  let origin='http://127.0.0.1:1/';
+  if(folderRun){
+   await fs.writeFile(path.join(feedPath,'assets','6001'),installer016Bytes,{flag:'wx'});
+   await fs.writeFile(path.join(feedPath,'assets','6002'),envelopeBytes,{flag:'wx'});
+   await fs.writeFile(path.join(feedPath,'latest.json'),JSON.stringify(release),{flag:'wx'});
+  }else{
+   httpServer=http.createServer((req,res)=>{
    if(req.url==='/repos/kaktv2016/frostveil-launcher/releases/latest'){
     res.writeHead(200,{'content-type':'application/json'});
     res.end(JSON.stringify(release));
@@ -254,14 +304,15 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
    res.writeHead(404).end();
   });
   await new Promise<void>(r=>httpServer!.listen(0,'127.0.0.1',()=>r()));
-  const port=(httpServer.address() as {port:number}).port;
-  const origin=`http://127.0.0.1:${port}/`;
+   const port=(httpServer.address() as {port:number}).port;
+   origin=`http://127.0.0.1:${port}/`;
+  }
 
   const source:LauncherUpdateSource={
    mode:'disposable-test',
    owner:'kaktv2016',
    repo:'frostveil-launcher',
-   channel:'stable',
+   channel:folderRun?'w14-pilot':'stable',
    keys:{
     [keyId]:{
      publicKey,
@@ -284,6 +335,10 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
    const state=await page.evaluate(()=>window.launcher.status());
    assert.equal(state.version,'0.1.5');assert.equal(state.launcherUpdate?.publisherTrust,'verified');
    assert.equal(state.launcherUpdate?.keyId,keyId);assert.equal(state.launcherUpdate?.canDownload,true);
+   if(folderRun){
+    assert.equal(state.launcherUpdate?.channel,'w14-pilot');
+    assert.equal(state.launcherUpdate?.source,'W14 Pilot update folder');
+   }
    assert.deepEqual(state.settings,JSON.parse(settingsContent));
    await timed('download-verify',()=>page.evaluate(()=>window.launcher.downloadUpdate()));
    assert.equal((await page.evaluate(()=>window.launcher.status())).launcherUpdate?.verification,'installer-verified');
@@ -303,7 +358,7 @@ test('Real Windows NSIS Update: older installed 0.1.5 NSIS build upgrades to sig
 
   const engine=new NsisEngine([],{
    source,
-   transport:LauncherUpdateTransport.loopback(origin,'disposable-test'),
+   transport:folderRun?new FolderLauncherUpdateTransport(feedPath):LauncherUpdateTransport.loopback(origin,'disposable-test'),
    storageDir:userDataDir,
    installedVersion:'0.1.5',
    installDirectory:installDir,

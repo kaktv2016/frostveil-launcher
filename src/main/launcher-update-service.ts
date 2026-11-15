@@ -5,7 +5,7 @@ export interface UpdateEngine {
  removeListener(event:string,listener:(value:any)=>void):unknown;
  check():Promise<unknown>;download():Promise<void>;install(beforeSpawn:()=>Promise<void>):void|Promise<void>;cancel():void;
 }
-interface Options {version:string;checkEnabled:boolean;downloadTrusted:boolean;installed:boolean;now?:()=>number;gameRunning:()=>Promise<boolean>;sourceUrl?:string;}
+interface Options {version:string;checkEnabled:boolean;downloadTrusted:boolean;installed:boolean;now?:()=>number;gameRunning:()=>Promise<boolean>;sourceUrl?:string;w14Pilot?:boolean;}
 const DEFAULT_SOURCE='https://github.com/kaktv2016/frostveil-launcher/releases';
 const DEFAULT_FALLBACK='Manual recovery: download and run the latest verified NSIS installer from https://github.com/kaktv2016/frostveil-launcher/releases';
 export class LauncherUpdateService {
@@ -19,13 +19,15 @@ export class LauncherUpdateService {
   this.value={
    state:options.checkEnabled?'idle':'unsupported',
    installedVersion:options.version,
-   message:options.checkEnabled?'Ready to check stable releases':'Development/fixture mode: real self-update disabled',
+   message:options.w14Pilot?(options.checkEnabled?'Ready to check the W14 Pilot update folder':'This W14 Pilot build cannot check for updates'):
+    (options.checkEnabled?'Ready to check stable releases':'Development/fixture mode: real self-update disabled'),
    canDownload:false,
    canInstall:false,
-   source:options.sourceUrl??DEFAULT_SOURCE,
+   source:options.w14Pilot?'W14 Pilot update folder':options.sourceUrl??DEFAULT_SOURCE,
+   ...(options.w14Pilot?{channel:'w14-pilot' as const}:{}),
    publisherTrust:options.downloadTrusted?'verified':'unconfigured',
    verification:options.downloadTrusted?'pending':'unconfigured',
-   recoveryFallback:DEFAULT_FALLBACK
+   recoveryFallback:options.w14Pilot?'Manual recovery: use the verified prior W14 Pilot installer and approved recovery procedure':DEFAULT_FALLBACK
   };
   this.listeners=[
    ['progress',p=>{
@@ -59,7 +61,8 @@ export class LauncherUpdateService {
  private fail(error:unknown){
   const code=String((error as {code?:unknown})?.code??'');
   let message='Update failed; retry after a short wait';
-  if(/NO_PUBLISHED|404/.test(code))message='No public launcher release is available';
+  if(/FOLDER_/.test(code))message='The W14 Pilot update folder is unavailable or contains an unsafe file';
+  else if(/NO_PUBLISHED|404/.test(code))message='No public launcher release is available';
   else if(/UNSIGNED_METADATA/.test(code))message='Unsigned update metadata rejected; signed Ed25519 manifest required';
   else if(/CHANNEL_FILE/.test(code))message='Release update metadata is unavailable';
   else if(/DOWNGRADE/.test(code))message='Update rejected: version downgrade blocked';
@@ -76,7 +79,7 @@ export class LauncherUpdateService {
  }
  async check():Promise<void>{
   if(this.disposed||!this.options.checkEnabled||this.lock||['downloaded','deferred','installing'].includes(this.value.state)||this.now()-this.lastCheck<30000)return;
-  this.lock=true;this.lastCheck=this.now();this.set({state:'checking',message:'Checking stable public GitHub releases',canDownload:false,canInstall:false,progress:undefined,availableVersion:undefined,releaseNotes:undefined});
+  this.lock=true;this.lastCheck=this.now();this.set({state:'checking',message:this.options.w14Pilot?'Checking the W14 Pilot update folder':'Checking stable public GitHub releases',canDownload:false,canInstall:false,progress:undefined,availableVersion:undefined,releaseNotes:undefined});
   try{
    const info=await this.engine.check() as {version?:unknown;files?:unknown;releaseNotes?:unknown;keyId?:unknown;minimumLauncherVersion?:unknown}|null;
    if(this.disposed)return;
@@ -88,7 +91,7 @@ export class LauncherUpdateService {
     throw Object.assign(Error('Manual reinstall required for this update'),{code:'ERR_UPDATER_MINIMUM_VERSION'});
    }
    if(!semver.gt(info.version,this.options.version)){
-    this.set({state:'up-to-date',message:'No newer compatible stable release',availableVersion:info.version,keyId,minimumLauncherVersion,publisherTrust:this.options.downloadTrusted?'verified':'unconfigured',verification:this.options.downloadTrusted?'manifest-verified':'unconfigured'});
+    this.set({state:'up-to-date',message:this.options.w14Pilot?'No newer compatible W14 Pilot release':'No newer compatible stable release',availableVersion:info.version,keyId,minimumLauncherVersion,publisherTrust:this.options.downloadTrusted?'verified':'unconfigured',verification:this.options.downloadTrusted?'manifest-verified':'unconfigured'});
     return;
    }
    const notes=typeof info.releaseNotes==='string'?info.releaseNotes:Array.isArray(info.releaseNotes)?info.releaseNotes.map(n=>typeof n.note==='string'?n.note:'').join('\n'):'';
@@ -100,7 +103,7 @@ export class LauncherUpdateService {
     minimumLauncherVersion,
     publisherTrust:this.options.downloadTrusted?'verified':'unconfigured',
     verification:this.options.downloadTrusted?'manifest-verified':'unconfigured',
-    message:this.options.downloadTrusted?'A newer stable release is available':'A release exists; download BLOCKED BY SIGNING configuration',
+    message:this.options.downloadTrusted?(this.options.w14Pilot?'A newer W14 Pilot release is available':'A newer stable release is available'):'A release exists; download BLOCKED BY SIGNING configuration',
     canDownload:this.options.downloadTrusted
    });
   }catch(error){this.fail(error);}finally{this.lock=false;}

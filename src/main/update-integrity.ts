@@ -16,6 +16,7 @@ export const LAUNCHER_UPDATE_REPOSITORY='kaktv2016/frostveil-launcher';
 export const LAUNCHER_UPDATE_API='https://api.github.com/repos/'+LAUNCHER_UPDATE_REPOSITORY;
 export const LAUNCHER_MANIFEST_ASSET='frostveil-launcher-update.json';
 export const MAX_INSTALLER_BYTES=300*1024*1024;
+export type LauncherUpdateChannel='stable'|'w14-pilot';
 
 export interface LauncherUpdateKey {
  publicKey:string;
@@ -28,7 +29,7 @@ export interface LauncherUpdateSource {
  mode:'production'|'disposable-test';
  owner:'kaktv2016';
  repo:'frostveil-launcher';
- channel:'stable';
+ channel:LauncherUpdateChannel;
  keys:Readonly<Record<string,LauncherUpdateKey>>;
 }
 
@@ -43,6 +44,7 @@ export const productionLauncherUpdateSource:LauncherUpdateSource={
   environment:'production',revoked:false,expiresAt:'2027-10-16T00:00:00.000Z'
  }}
 };
+export const w14PilotLauncherUpdateSource:LauncherUpdateSource={...productionLauncherUpdateSource,channel:'w14-pilot'};
 
 export interface LauncherUpdateManifest {
  schemaVersion:1;
@@ -51,7 +53,8 @@ export interface LauncherUpdateManifest {
  repo:'frostveil-launcher';
  tag:string;
  version:string;
- channel:'stable';
+ channel:LauncherUpdateChannel;
+ releaseId?:number;
  minimumLauncherVersion:string;
  publishedAt:string;
  expiresAt:string;
@@ -105,7 +108,7 @@ export interface LauncherUpdateTestProfile {
  revoked:false;
 }
 
-function updateError(message:string,code:string):Error{
+export function updateError(message:string,code:string):Error{
  return Object.assign(Error(message),{code});
 }
 
@@ -120,8 +123,13 @@ export function activeLauncherUpdateKeyId(source:LauncherUpdateSource=production
 }
 
 export function validateLauncherUpdateManifest(raw:unknown):LauncherUpdateManifest{
- const m=object(raw,['schemaVersion','keyId','owner','repo','tag','version','channel','minimumLauncherVersion','publishedAt','expiresAt','releaseNotes','installer']);
- if(m.schemaVersion!==1||m.owner!=='kaktv2016'||m.repo!=='frostveil-launcher'||m.channel!=='stable')throw updateError('Invalid launcher update manifest scope','ERR_UPDATER_INVALID_MANIFEST');
+ const fields=['schemaVersion','keyId','owner','repo','tag','version','channel','minimumLauncherVersion','publishedAt','expiresAt','releaseNotes','installer'];
+ const m=object(raw,[...fields,'releaseId'],fields);
+ if(m.schemaVersion!==1||m.owner!=='kaktv2016'||m.repo!=='frostveil-launcher'||(m.channel!=='stable'&&m.channel!=='w14-pilot'))throw updateError('Invalid launcher update manifest scope','ERR_UPDATER_INVALID_MANIFEST');
+ if(m.channel==='w14-pilot'){
+  size(m.releaseId,Number.MAX_SAFE_INTEGER);
+  if(m.releaseId<1)throw updateError('Invalid W14 release identity','ERR_UPDATER_INVALID_MANIFEST');
+ }else if(Object.hasOwn(m,'releaseId'))throw updateError('Unexpected release ID in Stable manifest','ERR_UPDATER_INVALID_MANIFEST');
  identifier(m.keyId);
  version(m.version);
  version(m.minimumLauncherVersion);
@@ -175,7 +183,7 @@ export function parseLauncherRelease(raw:unknown,now:()=>number=Date.now):Launch
 
 export function authenticateLauncherUpdate(envelope:unknown,source:LauncherUpdateSource,rawRelease:unknown,installedVersion:string,now:()=>number=Date.now){
  version(installedVersion);
- if(source.owner!=='kaktv2016'||source.repo!=='frostveil-launcher'||source.channel!=='stable')throw updateError('Untrusted launcher update source configuration','ERR_UPDATER_INVALID_SOURCE');
+ if(source.owner!=='kaktv2016'||source.repo!=='frostveil-launcher'||(source.channel!=='stable'&&source.channel!=='w14-pilot'))throw updateError('Untrusted launcher update source configuration','ERR_UPDATER_INVALID_SOURCE');
  let e:Record<string,any>;
  try{
   e=object(envelope,['keyId','payloadBase64','signatureBase64']);
@@ -200,11 +208,15 @@ export function authenticateLauncherUpdate(envelope:unknown,source:LauncherUpdat
  if(manifest.keyId!==e.keyId||manifest.owner!==source.owner||manifest.repo!==source.repo||manifest.channel!==source.channel)throw updateError('Signed launcher update manifest identity mismatch','ERR_UPDATER_INVALID_MANIFEST');
  if(Date.parse(manifest.publishedAt)>now()+300000||Date.parse(manifest.expiresAt)<=now())throw updateError('Signed launcher update manifest is expired or not yet valid','ERR_UPDATER_EXPIRED_KEY');
  const release=parseLauncherRelease(rawRelease,now);
- if(release.draft||release.prerelease||release.tag_name!==manifest.tag)throw updateError('GitHub release tag/channel does not match signed launcher manifest','ERR_UPDATER_WRONG_RELEASE');
+ if(release.draft||release.prerelease||release.tag_name!==manifest.tag||
+    (manifest.channel==='w14-pilot'&&(release.id!==manifest.releaseId||release.published_at!==manifest.publishedAt))){
+  throw updateError('Release identity does not match signed launcher manifest','ERR_UPDATER_WRONG_RELEASE');
+ }
  const manifestAsset=release.assets.find(a=>a.name===LAUNCHER_MANIFEST_ASSET);
  if(!manifestAsset)throw updateError('Signed launcher update manifest asset missing from release','ERR_UPDATER_UNSIGNED_METADATA');
  const installerAsset=release.assets.find(a=>a.id===manifest.installer.assetId);
  if(!installerAsset||installerAsset.name!==manifest.installer.assetName||installerAsset.size!==manifest.installer.size||installerAsset.digest!==null&&installerAsset.digest!=='sha256:'+manifest.installer.sha256)throw updateError('GitHub release installer asset does not match signed launcher manifest','ERR_UPDATER_WRONG_RELEASE');
+ if(manifest.channel==='w14-pilot'&&(!manifestAsset.digest||!installerAsset.digest))throw updateError('W14 release asset digest is missing','ERR_UPDATER_WRONG_RELEASE');
  if(semver.lt(manifest.version,installedVersion))throw updateError('Launcher update downgrade rejected','ERR_UPDATER_DOWNGRADE');
  if(semver.lt(installedVersion,manifest.minimumLauncherVersion))throw updateError('Installed launcher is older than minimumLauncherVersion; manual bootstrap update required','ERR_UPDATER_MINIMUM_VERSION');
  const manifestHash=createHash('sha256').update(payloadBytes).digest('hex');
@@ -219,7 +231,7 @@ export function authenticateLauncherUpdate(envelope:unknown,source:LauncherUpdat
 export type AuthenticatedLauncherUpdate=ReturnType<typeof authenticateLauncherUpdate>;
 
 export interface LauncherVersionRecord {
- channel:'stable';
+ channel:LauncherUpdateChannel;
  version:string;
  manifestHash:string;
  sha512:string;
@@ -228,14 +240,17 @@ export interface LauncherVersionRecord {
 }
 
 export class LauncherUpdateLedger {
- constructor(private readonly root:string){}
+ private readonly fileName:string;
+ constructor(private readonly root:string,private readonly channel:LauncherUpdateChannel='stable'){
+  this.fileName=channel==='w14-pilot'?'launcher-update-history-w14-pilot.json':'launcher-update-history.json';
+ }
  private async read():Promise<LauncherVersionRecord|null>{
   try{
-   const file=await safeFile(this.root,'launcher-update-history.json');
+   const file=await safeFile(this.root,this.fileName);
    const stat=await fs.stat(file);
    if(stat.nlink!==1||stat.size>16384)throw updateError('Unsafe launcher update version ledger','ERR_UPDATER_LEDGER_INVALID');
    const raw=object(JSON.parse(await fs.readFile(file,'utf8')),['channel','version','manifestHash','sha512','sha256','size']);
-   if(raw.channel!=='stable')throw Error('Invalid channel');
+   if(raw.channel!==this.channel)throw Error('Invalid channel');
    version(raw.version);
    hash(raw.manifestHash);
    hash(raw.sha256);
@@ -248,6 +263,7 @@ export class LauncherUpdateLedger {
   }
  }
  async check(update:AuthenticatedLauncherUpdate):Promise<void>{
+  if(update.manifest.channel!==this.channel)throw updateError('Launcher update ledger channel mismatch','ERR_UPDATER_LEDGER_INVALID');
   const current=await this.read();
   if(!current)return;
   if(semver.lt(update.manifest.version,current.version))throw updateError('Launcher update downgrade rejected by version ledger','ERR_UPDATER_DOWNGRADE');
@@ -257,18 +273,25 @@ export class LauncherUpdateLedger {
   await this.check(update);
   await safeDirectory(this.root);
   const record:LauncherVersionRecord={
-   channel:'stable',
+   channel:this.channel,
    version:update.manifest.version,
    manifestHash:update.manifestHash,
    sha512:update.manifest.installer.sha512,
    sha256:update.manifest.installer.sha256,
    size:update.manifest.installer.size
   };
-  await durableWrite(path.join(this.root,'launcher-update-history.json'),Buffer.from(JSON.stringify(record,null,2)));
+  await durableWrite(path.join(this.root,this.fileName),Buffer.from(JSON.stringify(record,null,2)));
  }
 }
 
+export interface LauncherUpdateFeed {
+ readonly channel:LauncherUpdateChannel;
+ json(suffix:string,signal?:AbortSignal,max?:number,expectedSize?:number,expectedDigest?:string):Promise<unknown>;
+ installer(assetId:number,signal?:AbortSignal):Promise<{status:number;headers:Headers;body:ReadableStream<Uint8Array>|null}>;
+}
+
 export class LauncherUpdateTransport {
+ readonly channel='stable' as const;
  private constructor(readonly base:string,readonly testOnly:boolean,private readonly timeoutMs:number,private readonly installerTimeoutMs:number){
   for(const timeout of [timeoutMs,installerTimeoutMs])if(!Number.isSafeInteger(timeout)||timeout<=0||timeout>30*60*1000)throw Error('Invalid bounded update transport timeout');
  }

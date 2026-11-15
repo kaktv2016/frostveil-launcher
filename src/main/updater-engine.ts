@@ -23,12 +23,13 @@ import {
  verifyDownloadedInstaller,
  type AuthenticatedLauncherUpdate,
  type Ed25519InstallerBinding,
+ type LauncherUpdateFeed,
  type LauncherUpdateSource
 } from './update-integrity';
 
 export interface NsisEngineOptions {
  source?:LauncherUpdateSource;
- transport?:LauncherUpdateTransport;
+ transport?:LauncherUpdateFeed;
  storageDir?:string;
  installedVersion?:string;
  installDirectory?:string;
@@ -66,7 +67,7 @@ export class NsisEngine extends EventEmitter implements UpdateEngine {
  private verifiedFile?:string;
  private verifiedBinding?:{sha512:string;binding:Ed25519InstallerBinding};
  private readonly source:LauncherUpdateSource;
- private readonly transport:LauncherUpdateTransport;
+ private readonly transport:LauncherUpdateFeed;
  private readonly storageDir:string;
  private readonly installedVersion:string;
  private readonly now:()=>number;
@@ -76,10 +77,11 @@ export class NsisEngine extends EventEmitter implements UpdateEngine {
   super();
   this.source=options.source??productionLauncherUpdateSource;
   this.transport=options.transport??LauncherUpdateTransport.github();
+  if(this.transport.channel!==this.source.channel)throw Error('Launcher update feed channel does not match trust source');
   this.storageDir=options.storageDir??path.join(process.env.LOCALAPPDATA??os.tmpdir(),'SkyrimRPLauncher');
   this.installedVersion=options.installedVersion??'0.1.6';
   this.now=options.now??Date.now;
-  this.ledger=new LauncherUpdateLedger(this.storageDir);
+  this.ledger=new LauncherUpdateLedger(this.storageDir,this.source.channel);
   this.updater=createNsisUpdater(this.installedVersion,this.storageDir);
   const u=this.updater;
   u.autoDownload=false;
@@ -123,7 +125,9 @@ export class NsisEngine extends EventEmitter implements UpdateEngine {
    const release=parseLauncherRelease(rawRelease,this.now);
    const manifestAsset=release.assets.find(a=>a.name===LAUNCHER_MANIFEST_ASSET);
    if(!manifestAsset)throw Object.assign(Error('Release is missing signed launcher update manifest'),{code:'ERR_UPDATER_UNSIGNED_METADATA'});
-   const envelope=await this.transport.json('/releases/assets/'+manifestAsset.id,this.controller.signal,manifestAsset.size,manifestAsset.size);
+   const pilotDigest=this.source.channel==='w14-pilot'?manifestAsset.digest:undefined;
+   if(pilotDigest===null)throw Object.assign(Error('W14 manifest asset digest is missing'),{code:'ERR_UPDATER_INVALID_MANIFEST'});
+   const envelope=await this.transport.json('/releases/assets/'+manifestAsset.id,this.controller.signal,manifestAsset.size,manifestAsset.size,pilotDigest);
    if(Object.keys(this.source.keys).length>0){
     const authenticated=authenticateLauncherUpdate(envelope,this.source,rawRelease,this.installedVersion,this.now);
     await this.ledger.check(authenticated);
