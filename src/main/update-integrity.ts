@@ -208,8 +208,10 @@ export function authenticateLauncherUpdate(envelope:unknown,source:LauncherUpdat
  if(manifest.keyId!==e.keyId||manifest.owner!==source.owner||manifest.repo!==source.repo||manifest.channel!==source.channel)throw updateError('Signed launcher update manifest identity mismatch','ERR_UPDATER_INVALID_MANIFEST');
  if(Date.parse(manifest.publishedAt)>now()+300000||Date.parse(manifest.expiresAt)<=now())throw updateError('Signed launcher update manifest is expired or not yet valid','ERR_UPDATER_EXPIRED_KEY');
  const release=parseLauncherRelease(rawRelease,now);
- if(release.draft||release.prerelease||release.tag_name!==manifest.tag||
-    (manifest.channel==='w14-pilot'&&(release.id!==manifest.releaseId||release.published_at!==manifest.publishedAt))){
+ if(release.draft||release.prerelease||release.tag_name!==manifest.tag){
+  throw updateError('GitHub release tag/channel does not match signed launcher manifest','ERR_UPDATER_WRONG_RELEASE');
+ }
+ if(manifest.channel==='w14-pilot'&&(release.id!==manifest.releaseId||release.published_at!==manifest.publishedAt)){
   throw updateError('Release identity does not match signed launcher manifest','ERR_UPDATER_WRONG_RELEASE');
  }
  const manifestAsset=release.assets.find(a=>a.name===LAUNCHER_MANIFEST_ASSET);
