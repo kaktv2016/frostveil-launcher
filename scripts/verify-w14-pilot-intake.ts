@@ -3,6 +3,11 @@ import path from 'node:path';
 import {createHash} from 'node:crypto';
 import semver from 'semver';
 import {safeFile} from '../src/main/files';
+import {authenticateRelease,productionSource,type DistributionSource} from '../src/main/distribution/policy';
+import {assertSharedPluginCompatibility} from '../src/main/modpack/compatibility';
+import {OFFICIAL} from '../src/main/modpack/plugins';
+import {helperPin} from '../src/main/runtime/depot';
+import {authenticateRuntimeCohort} from '../src/main/runtime/policy';
 import {
  LAUNCHER_MANIFEST_ASSET,authenticateLauncherUpdate,productionLauncherUpdateSource,verifyDownloadedInstaller,
  type LauncherUpdateSource
@@ -41,12 +46,8 @@ async function readPinnedJson(file:string,expected:unknown,maxBytes:number){
  return {value:JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)) as unknown,sha256,bytes:bytes.length};
 }
 
-export async function verifyW14PilotIntake(
- root:string,indexSha256:string,windowEnd:string,
- source:LauncherUpdateSource=productionLauncherUpdateSource,now:()=>number=Date.now
-){
+async function openIntake(root:string,indexSha256:string,windowEnd:string,verifiedAt:number){
  if(!path.isAbsolute(root)||process.platform==='win32'&&!/^[A-Za-z]:[\\/]/.test(root))throw Error('Absolute local intake root required');
- const verifiedAt=now();
  const end=Date.parse(windowEnd);
  if(!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/.test(windowEnd)||!Number.isFinite(end)||end<=verifiedAt||
     new Date(end).toISOString()!==(windowEnd.length===20?windowEnd.slice(0,-1)+'.000Z':windowEnd)){
@@ -64,15 +65,25 @@ export async function verifyW14PilotIntake(
   return file;
  }
  const indexFile=await readPinnedJson(await intakeFile('candidate-index.json'),indexSha256,1024*1024);
- const index=record(indexFile.value),candidate=record(index.candidate),rollback=record(index.rollback);
+ const index=record(indexFile.value),candidate=record(index.candidate);
  if(index.classification!=='SEALED_CANDIDATE'||candidate.platform!=='windows-x64'||
     !matches(candidate.id,/^[A-Za-z0-9_-]{1,100}$/)||!matches(candidate.producerGit,/^[a-f0-9]{40}$/)||
     !matches(candidate.version,/^\d+\.\d+\.\d+$/)||!semver.valid(candidate.version))throw Error('Invalid sealed candidate identity');
+ return {index,candidate:{id:candidate.id,producerGit:candidate.producerGit,version:candidate.version},
+  indexDigest:indexFile.sha256,end,intakeFile,artifacts:record(index.artifacts)};
+}
+
+export async function verifyW14PilotIntake(
+ root:string,indexSha256:string,windowEnd:string,
+ source:LauncherUpdateSource=productionLauncherUpdateSource,now:()=>number=Date.now
+){
+ const verifiedAt=now();
+ const {index,candidate,indexDigest,end,intakeFile,artifacts}=await openIntake(root,indexSha256,windowEnd,verifiedAt);
+ const rollback=record(index.rollback);
  if(rollback.mode!=='isolated-reset-or-reviewed-manual-reinstall')throw Error('Invalid rollback policy');
  if(!matches(rollback.version,/^\d+\.\d+\.\d+$/)||!semver.valid(rollback.version)||!semver.lt(rollback.version,candidate.version)){
   throw Error('Invalid rollback version');
  }
- const artifacts=record(index.artifacts);
 
  async function verifyRelease(installer:RecordData,reference:RecordData,version:string,installedVersion:string){
   const envelope=await readPinnedJson(await intakeFile(reference.signedEnvelopeRef),reference.envelopeSha256,512*1024);
@@ -111,6 +122,66 @@ export async function verifyW14PilotIntake(
   throw Error('Candidate and rollback must bind distinct release assets');
  }
  return {status:'LOCAL_ED25519_INSTALLER_BINDINGS_MATCH',qualification:'NOT_RUN',route:'NOT_VERIFIED',
-  trustMode:source.mode,candidateIndexSha256:indexFile.sha256,candidateId:candidate.id,producerGit:candidate.producerGit,
+  trustMode:source.mode,candidateIndexSha256:indexDigest,candidateId:candidate.id,producerGit:candidate.producerGit,
   verifiedAt:new Date(verifiedAt).toISOString(),testWindowEnd:new Date(end).toISOString(),releases:[current,prior]};
+}
+
+export async function verifyW14PilotContent(root:string,indexSha256:string,windowEnd:string,source:DistributionSource=productionSource){
+ const verifiedAt=Date.now();
+ const {index,candidate,indexDigest,end,intakeFile,artifacts}=await openIntake(root,indexSha256,windowEnd,verifiedAt);
+ const runtimeRef=record(artifacts.runtime),packRef=record(artifacts.pack);
+ const runtimeEnvelope=await readPinnedJson(await intakeFile(runtimeRef.signedEnvelopeRef),runtimeRef.sha256,8*1024*1024);
+ const packEnvelope=await readPinnedJson(await intakeFile(packRef.signedEnvelopeRef),packRef.sha256,6*1024*1024);
+ const metadata=await readPinnedJson(await intakeFile(packRef.releaseMetadataRef),packRef.releaseMetadataSha256,1024*1024);
+ const runtime=authenticateRuntimeCohort(runtimeEnvelope.value,source.keys,{fixture:source.mode==='sandbox-test'});
+ const {manifest,server,packages,release,manifestHash}=authenticateRelease(packEnvelope.value,source,metadata.value);
+ const profile=record(index.profile),compatibility=record(artifacts.compatibility);
+ if(profile.steamApp!==runtime.appId||profile.language!==runtime.language||profile.runtime!==runtime.runtime||
+    manifest.requiredSkyrimRuntime!==runtime.runtime||profile.skse!=='2.2.6'||manifest.requiredSKSEVersion!=='0.2.2.6'||
+    profile.endpointPort!==7777||compatibility.serverGit!==server.engineCommit||semver.lt(candidate.version,manifest.minimumLauncherVersion)){
+  throw Error('Signed content does not bind the sealed profile');
+ }
+ const runtimeKeyId=record(runtimeEnvelope.value).keyId as string;
+ const packKeyId=manifest.signing.keyId;
+ if([runtime.createdAt,manifest.generatedAt,server.generatedAt,release.published_at].some(value=>Date.parse(value)>verifiedAt)){
+  throw Error('Signed content is not yet valid at the test window start');
+ }
+ const expiries=[runtime.expiresAt,server.expiresAt,source.keys[runtimeKeyId]?.expiresAt,source.keys[packKeyId]?.expiresAt];
+ if(expiries.some(value=>!value||!Number.isFinite(Date.parse(value))||Date.parse(value)<=end)||
+    Date.parse(runtime.createdAt)>=Date.parse(runtime.expiresAt))throw Error('Signed content or publisher key expires within the test window');
+ if(runtimeRef.publicKeyId!==runtimeKeyId||runtimeRef.expiresAtUtc!==runtime.expiresAt||
+    packRef.publicKeyId!==packKeyId||packRef.expiresAtUtc!==server.expiresAt)throw Error('Signed content disagrees with index publisher or expiry');
+ if(runtime.depots.length!==3||runtime.helper.version!==helperPin.version||
+    runtime.helper.size!==helperPin.size||runtime.helper.sha256!==helperPin.sha256)throw Error('Signed helper or depot set differs from the Launcher pins');
+ const envelopeAsset=release.assets.find(asset=>asset.name==='frostveil-manifest.json');
+ const assetsById=new Map(release.assets.map(asset=>[asset.id,asset]));
+ if(!release.immutable||release.id!==packRef.releaseId||!envelopeAsset||envelopeAsset.id!==packRef.envelopeAssetId||
+    envelopeAsset.size!==packEnvelope.bytes||envelopeAsset.digest!==`sha256:${packEnvelope.sha256}`||
+    packages.some(pkg=>assetsById.get(pkg.assetId)?.digest!==`sha256:${pkg.sha256}`))throw Error('Intake does not match immutable pack release assets');
+ assertSharedPluginCompatibility(manifest,server);
+ const managed=new Set(runtime.managedFiles.map(file=>file.path.toLowerCase()));
+ if(manifest.skyMPClientRequirements.nativeFiles.some(file=>!managed.has(file.toLowerCase()))){
+  throw Error('Signed runtime lacks a required native client inventory entry');
+ }
+ const runtimeFiles=new Map([...runtime.files,...runtime.managedFiles].map(file=>[file.path.toLowerCase(),file]));
+ let commonRequiredFiles=0;
+ for(const file of manifest.files){
+  const peer=runtimeFiles.get(file.path.toLowerCase());
+  if(!file.required||!peer)continue;
+  if(peer.sha256!==file.sha256||peer.size!==file.size)throw Error('Signed runtime and pack file length or SHA-256 conflict');
+  commonRequiredFiles++;
+ }
+ const implicitMasters=OFFICIAL.filter(name=>runtimeFiles.has(('Data/'+name).toLowerCase()));
+ const declaredOrder=[...new Set([...implicitMasters,...runtime.creations,...runtime.pluginOrder].map(name=>name.toLowerCase()))];
+ const declaredSharedSlots=server.plugins.map(plugin=>declaredOrder.indexOf(plugin.filename.toLowerCase()));
+ if(!declaredSharedSlots.length||declaredSharedSlots.some((slot,i)=>slot<0||(i>0&&slot<declaredSharedSlots[i-1]!))){
+  throw Error('Signed runtime and server plugin order conflict');
+ }
+ return {status:'LOCAL_ED25519_CONTENT_BINDINGS_MATCH',qualification:'NOT_RUN',installedBytes:'NOT_VERIFIED',
+  packagePayloadBytes:'NOT_VERIFIED',nativePairing:'NOT_VERIFIED',
+  trustMode:source.mode,candidateIndexSha256:indexDigest,candidateId:candidate.id,producerGit:candidate.producerGit,
+  checkedAt:new Date(verifiedAt).toISOString(),testWindowEnd:new Date(end).toISOString(),commonRequiredFiles,
+  runtime:{envelopeSha256:runtimeEnvelope.sha256,keyId:runtimeKeyId,expiresAt:runtime.expiresAt,depots:runtime.depots,helper:runtime.helper},
+  pack:{envelopeSha256:packEnvelope.sha256,keyId:packKeyId,expiresAt:server.expiresAt,releaseId:release.id,
+   envelopeAssetId:envelopeAsset.id,releaseMetadataSha256:metadata.sha256,manifestHash,serverEngineCommit:server.engineCommit}};
 }
