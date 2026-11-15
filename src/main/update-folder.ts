@@ -4,6 +4,7 @@ import {createHash} from 'node:crypto';
 import {Readable} from 'node:stream';
 import {relativePath,safeFile} from './files';
 import {MAX_INSTALLER_BYTES,updateError,type LauncherUpdateFeed} from './update-integrity';
+import {verifyW14UpdateAcl} from './windows';
 
 declare const FROSTVEIL_W14_UPDATE_FOLDER:string|undefined;
 export const packagedW14UpdateFolder=typeof FROSTVEIL_W14_UPDATE_FOLDER==='undefined'?undefined:FROSTVEIL_W14_UPDATE_FOLDER;
@@ -25,6 +26,10 @@ export class FolderLauncherUpdateTransport implements LauncherUpdateFeed {
    const file=await safeFile(this.root,reference);
    const before=await fs.lstat(file,{bigint:true});
    if(!before.isFile()||before.nlink!==1n||before.size<1n||before.size>BigInt(max))throw Error('Unsafe or linked update payload');
+   if(!await verifyW14UpdateAcl(this.root,path.dirname(file),file)){
+    throw updateError('Private update folder permissions failed verification','ERR_UPDATER_FOLDER_PERMISSIONS');
+   }
+   signal?.throwIfAborted();
    handle=await fs.open(file,'r');
    const opened=await handle.stat({bigint:true});
    if(await safeFile(this.root,reference)!==file||(await fs.realpath(file)).toLowerCase()!==file.toLowerCase()){
@@ -41,7 +46,9 @@ export class FolderLauncherUpdateTransport implements LauncherUpdateFeed {
   }catch(error){
    await handle?.close().catch(()=>{});
    signal?.throwIfAborted();
-   if((error as NodeJS.ErrnoException).code==='ENOENT')throw updateError('Private update folder or file is unavailable','ERR_UPDATER_FOLDER_UNAVAILABLE');
+   const code=(error as NodeJS.ErrnoException).code;
+   if(code==='ERR_UPDATER_FOLDER_PERMISSIONS')throw error;
+   if(code==='ENOENT')throw updateError('Private update folder or file is unavailable','ERR_UPDATER_FOLDER_UNAVAILABLE');
    throw updateError('Private update folder contains an unsafe or inaccessible file','ERR_UPDATER_FOLDER_UNSAFE');
   }
  }

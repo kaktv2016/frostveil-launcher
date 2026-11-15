@@ -34,6 +34,36 @@ export async function steamRoots():Promise<string[]>{
  const roots=JSON.parse(text||'[]');return [...new Set((Array.isArray(roots)?roots:[roots]).filter((v:unknown)=>typeof v==='string'))] as string[];
 }
 export async function gameRunning():Promise<boolean>{return (await query("[bool](Get-Process -Name SkyrimSE,skse64_loader -ErrorAction SilentlyContinue) | ConvertTo-Json -Compress"))==='true';}
+export async function verifyW14UpdateAcl(root:string,parent:string,file:string):Promise<boolean>{
+ try{
+  const result=await query(`
+   $ErrorActionPreference = 'Stop'
+   $allowed = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544')
+   $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($env:FROSTVEIL_FEED_ROOT))
+   if ($drive.DriveType -notin 'Fixed','Removable','Ram') { throw 'Expected local volume' }
+   $paths = @($env:FROSTVEIL_FEED_ROOT, $env:FROSTVEIL_FEED_PARENT, $env:FROSTVEIL_FEED_FILE) | Select-Object -Unique
+   foreach ($source in $paths) {
+     $attrs = [IO.File]::GetAttributes($source)
+     if ($attrs -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse point' }
+     $acl = if ($attrs -band [IO.FileAttributes]::Directory) {
+       [IO.Directory]::GetAccessControl($source)
+     } else {
+       [IO.File]::GetAccessControl($source)
+     }
+     if (($source -eq $env:FROSTVEIL_FEED_ROOT -and !$acl.AreAccessRulesProtected) -or
+         $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin $allowed) { throw 'Untrusted descriptor' }
+     $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+     if ($null -eq $raw.DiscretionaryAcl) { throw 'Missing DACL' }
+     foreach ($ace in $raw.DiscretionaryAcl) {
+       if ($ace.AceType -notin 'AccessAllowed','AccessDenied' -or
+           ($ace.AceType -eq 'AccessAllowed' -and $ace.SecurityIdentifier.Value -notin $allowed)) { throw 'Untrusted ACE' }
+     }
+   }
+   'true'
+  `,{FROSTVEIL_FEED_ROOT:root,FROSTVEIL_FEED_PARENT:parent,FROSTVEIL_FEED_FILE:file});
+  return result==='true';
+ }catch{return false;}
+}
 export async function authenticode(file:string):Promise<{valid:boolean;subject:string}>{
  try{const result=JSON.parse(await query("$s=Get-AuthenticodeSignature -LiteralPath $env:FROSTVEIL_SIGNATURE_FILE; @{valid=($s.Status -eq 'Valid');subject=$s.SignerCertificate.Subject} | ConvertTo-Json -Compress",{FROSTVEIL_SIGNATURE_FILE:file}));return{valid:result.valid===true,subject:typeof result.subject==='string'?result.subject:''};}catch{return{valid:false,subject:''};}
 }

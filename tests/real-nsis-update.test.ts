@@ -23,6 +23,7 @@ import {
 } from '../src/main/update-integrity';
 
 import {removeLockedTree} from './helpers/locked-tree';
+import {restrictFixtureFeed} from './helpers/restricted-update-folder';
 const folderRun=process.env.FROSTVEIL_W14_FOLDER_FIXTURE==='1';
 
 function runProcess(command:string,args:string[],cwd:string):Promise<{code:number|null;stdout:string;stderr:string}>{
@@ -34,33 +35,6 @@ function runProcess(command:string,args:string[],cwd:string):Promise<{code:numbe
   child.once('error',reject);
   child.once('close',code=>resolve({code,stdout,stderr}));
  });
-}
-
-async function restrictFixtureFeed(directory:string,tempRoot:string){
- const resolved=await fs.realpath(directory);
- assert.equal(path.dirname(resolved),await fs.realpath(tempRoot));
- const powershell=path.join(process.env.SystemRoot??'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
- const script=`
-  $ErrorActionPreference = 'Stop'
-  $folder = '${resolved.replaceAll("'","''")}'
-  $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User
-  $trusted = @($owner.Value, 'S-1-5-18', 'S-1-5-32-544')
-  $acl = Get-Acl -LiteralPath $folder
-  if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $owner.Value) { throw 'Unexpected fixture owner' }
-  $acl.SetAccessRuleProtection($true, $false)
-  foreach ($value in $trusted) {
-    $sid = [Security.Principal.SecurityIdentifier]::new($value)
-    $rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-    $acl.SetAccessRule($rule)
-  }
-  Set-Acl -LiteralPath $folder -AclObject $acl
-  $check = Get-Acl -LiteralPath $folder
-  $permits = @($check.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object AccessControlType -eq Allow)
-  if (!$check.AreAccessRulesProtected -or @($permits | Where-Object {$_.IdentityReference.Value -notin $trusted}).Count -or
-      @($permits.IdentityReference.Value | Select-Object -Unique).Count -ne 3) { throw 'Restricted fixture ACL readback failed' }
- `;
- const result=await runProcess(powershell,['-NoProfile','-NonInteractive','-Command',script],tempRoot);
- assert.equal(result.code,0,'Restricted fixture ACL verification failed');
 }
 
 interface DisposableBoot {localData:string;temp:string;documents:string;profile:string;events:string;closeRequest:string;mainBundle:string;}
@@ -219,6 +193,11 @@ test(folderRun?'Real Windows W14 Folder Update: installed 0.1.5 Pilot reads the 
   const asarPath=path.join(installDir,'resources','app.asar');
   const pkgBefore=JSON.parse(extractFile(asarPath,'package.json').toString('utf8'));
   assert.equal(pkgBefore.version,'0.1.5');
+  const asarHash=async(file:string)=>createHash('sha256').update(await fs.readFile(file)).digest('hex');
+  const expectedBefore=await asarHash(path.join(tempRoot,'build-015','win-unpacked','resources','app.asar'));
+  const expectedAfter=await asarHash(path.join(tempRoot,'build-016','win-unpacked','resources','app.asar'));
+  assert.notEqual(expectedBefore,expectedAfter);
+  assert.equal(await asarHash(asarPath),expectedBefore);
 
   // Sign 0.1.6 installer with disposable Ed25519 launcher update key
   const keyPair=generateKeyPairSync('ed25519');
@@ -346,6 +325,7 @@ test(folderRun?'Real Windows W14 Folder Update: installed 0.1.5 Pilot reads the 
    // handoff -> spawn (--updated /S --force-run /D) -> installed app restart.
    await timed('handoff-install',()=>page.evaluate(()=>window.launcher.installUpdate()));
    await timed('new-app-ready',()=>until(async()=> (await events()).some(e=>e.kind==='ready'&&e.version==='0.1.6'),'installed application restart'));
+   assert.equal(await asarHash(asarPath),expectedAfter,'NSIS installed the exact candidate ASAR');
    const history=await events();
    assert.ok(history.some(e=>e.kind==='quit'&&e.version==='0.1.5'),'Old installed application exited through its normal quit event');
    assert.ok(history.some(e=>e.kind==='start'&&e.version==='0.1.6'&&e.argv.includes('--updated')),'NSIS force-run restarted the installed new version');

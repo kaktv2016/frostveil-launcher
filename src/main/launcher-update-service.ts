@@ -61,7 +61,8 @@ export class LauncherUpdateService {
  private fail(error:unknown){
   const code=String((error as {code?:unknown})?.code??'');
   let message='Update failed; retry after a short wait';
-  if(/FOLDER_/.test(code))message='The W14 Pilot update folder is unavailable or contains an unsafe file';
+  if(/FOLDER_PERMISSIONS/.test(code))message='The W14 Pilot update folder permissions could not be verified';
+  else if(/FOLDER_/.test(code))message='The W14 Pilot update folder is unavailable or contains an unsafe file';
   else if(/NO_PUBLISHED|404/.test(code))message='No public launcher release is available';
   else if(/UNSIGNED_METADATA/.test(code))message='Unsigned update metadata rejected; signed Ed25519 manifest required';
   else if(/CHANNEL_FILE/.test(code))message='Release update metadata is unavailable';

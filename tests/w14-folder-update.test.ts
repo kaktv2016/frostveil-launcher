@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test,{type TestContext} from 'node:test';
+import {restrictFixtureFeed} from './helpers/restricted-update-folder';
 import {FolderLauncherUpdateTransport} from '../src/main/update-folder';
 import {NsisEngine} from '../src/main/updater-engine';
 import {
@@ -20,7 +21,9 @@ async function fixture(t:TestContext){
   await fs.rm(root,{recursive:true,force:true});
  });
  const feed=path.join(root,'feed'),assets=path.join(feed,'assets'),storageDir=path.join(root,'launcher');
- await fs.mkdir(assets,{recursive:true});
+ await fs.mkdir(feed);
+ await restrictFixtureFeed(feed,root);
+ await fs.mkdir(assets);
  const key=generateKeyPairSync('ed25519');
  const keyId='w14-folder-fixture';
  const now=Date.now(),publishedAt=new Date(now-1000).toISOString(),expiresAt=new Date(now+60000).toISOString();
@@ -93,6 +96,7 @@ test('W14 refuses junctions in the asset path and a signed downgrade',async t=>{
  await assert.rejects(newer.check(),/downgrade/i);
  const linkedRoot=path.join(f.root,'other-feed');
  await fs.mkdir(linkedRoot);
+ await restrictFixtureFeed(linkedRoot,f.root);
  await fs.writeFile(path.join(linkedRoot,'latest.json'),JSON.stringify(f.release));
  const junction=path.join(linkedRoot,'assets');
  await fs.symlink(f.assets,junction,'junction');
@@ -101,4 +105,12 @@ test('W14 refuses junctions in the asset path and a signed downgrade',async t=>{
   const engine=new NsisEngine([],{source:f.source,transport:linkedFeed,storageDir:f.storageDir,installedVersion:'0.1.0',now:()=>f.now});
   await assert.rejects(engine.check(),/unsafe or inaccessible/i);
  }finally{await fs.unlink(junction);}
+});
+
+test('W14 rejects a folder whose ACL still inherits from its parent',async t=>{
+ const f=await fixture(t);
+ const unprotected=path.join(f.root,'inherited');
+ await fs.mkdir(unprotected);
+ await fs.writeFile(path.join(unprotected,'latest.json'),JSON.stringify(f.release));
+ await assert.rejects(new FolderLauncherUpdateTransport(unprotected).json('/releases/latest'),/folder permissions/i);
 });
