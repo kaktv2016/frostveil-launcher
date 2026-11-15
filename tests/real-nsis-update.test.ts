@@ -310,8 +310,17 @@ test(folderRun?'Real Windows W14 Folder Update: installed 0.1.5 Pilot reads the 
   const installedApp=await timed('launch-installed',()=>electron.launch({executablePath:path.join(installDir,'Frostveil Disposable Test.exe'),args:['--launcher-update-test','--launcher-update-test-profile',updateProfile],env,timeout:30000}));
   try{
    const page=await timed('first-window',()=>installedApp.firstWindow());
-   await timed('update-check-available',()=>page.waitForFunction(async()=> (await window.launcher.status()).launcherUpdate?.state==='available',undefined,{timeout:30000}));
-   const state=await page.evaluate(()=>window.launcher.status());
+   const available=await timed('update-check-available',()=>page.waitForFunction(async()=>{
+    const snapshot=await window.launcher.status();
+    return snapshot.launcherUpdate?.state==='available'?snapshot:null;
+   },undefined,{timeout:30000}));
+   const state=await available.jsonValue();
+   if(!state)throw Error('Available update snapshot is missing');
+   await available.dispose();
+   await stage('verified-predecessor','done',{
+    version:state.version,availableVersion:state.launcherUpdate?.availableVersion,
+    trust:state.launcherUpdate?.publisherTrust,keyId:state.launcherUpdate?.keyId,channel:state.launcherUpdate?.channel
+   });
    assert.equal(state.version,'0.1.5');assert.equal(state.launcherUpdate?.publisherTrust,'verified');
    assert.equal(state.launcherUpdate?.keyId,keyId);assert.equal(state.launcherUpdate?.canDownload,true);
    if(folderRun){
