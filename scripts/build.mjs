@@ -22,6 +22,7 @@ if (policyFile) {
   cachePin.sha256=createHash('sha256').update(cachePin.bytes).digest('hex');
 }
 await build({entryPoints:['src/main/index.ts'],outfile:'dist/main.cjs',bundle:true,platform:'node',format:'cjs',target:'node22',packages:'external',
-  define:{FROSTVEIL_PACKAGED_CACHE_POLICY:JSON.stringify(cachePin),FROSTVEIL_W14_UPDATE_FOLDER:JSON.stringify(w14Folder)??'undefined'}});
+  define:{FROSTVEIL_PACKAGED_CACHE_POLICY:JSON.stringify(cachePin),FROSTVEIL_W14_UPDATE_FOLDER:JSON.stringify(w14Folder)??'undefined',
+   FROSTVEIL_W14_UPDATE_TEST:'false'}});
 await build({entryPoints:['src/preload/index.ts'],outfile:'dist/preload.cjs',bundle:true,platform:'node',format:'cjs',target:'node22',external:['electron']});
 await viteBuild();
