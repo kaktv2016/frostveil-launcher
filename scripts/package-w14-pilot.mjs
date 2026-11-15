@@ -80,9 +80,10 @@ async function hashFile(file){
 
 async function requireUnsignedInstaller(file){
  const powershell=path.win32.join(process.env.SystemRoot??'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
+ const modules=path.win32.join(path.win32.dirname(powershell),'Modules');
  const {stdout}=await execute(powershell,['-NoProfile','-NonInteractive','-Command',
-  '$ErrorActionPreference="Stop"; $signature=Get-AuthenticodeSignature -LiteralPath $env:FROSTVEIL_W14_INSTALLER; [string]$signature.Status'],{
-  env:{...process.env,FROSTVEIL_W14_INSTALLER:file},windowsHide:true,timeout:15000,maxBuffer:16384});
+  '$ErrorActionPreference="Stop"; Import-Module (Join-Path $PSHOME "Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1"); (Get-AuthenticodeSignature -LiteralPath $env:FROSTVEIL_W14_INSTALLER).Status.ToString()'],{
+  env:{...process.env,PSModulePath:modules,FROSTVEIL_W14_INSTALLER:file},windowsHide:true,timeout:15000,maxBuffer:16384});
  const status=stdout.trim();
  if(status!=='NotSigned')throw Error('W14 offline packaging requires confirmed NotSigned Authenticode status');
  return status;
