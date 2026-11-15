@@ -14,6 +14,7 @@ import {MetadataStore} from '../src/main/installer/metadata';
 import {LauncherUpdateService} from '../src/main/launcher-update-service';
 import {NsisEngine} from '../src/main/updater-engine';
 import {FolderLauncherUpdateTransport} from '../src/main/update-folder';
+import type {Dashboard} from '../src/shared/contracts';
 import {
  LAUNCHER_MANIFEST_ASSET,
  LauncherUpdateTransport,
@@ -166,7 +167,7 @@ test(folderRun?'Real Windows W14 Folder Update: installed 0.1.5 Pilot reads the 
  }
  const metadataBefore=await snapshotMetadata(),receiptBefore=await fixtureStore.read('ownership.json');
  async function events(){try{return(await fs.readFile(boot.events,'utf8')).trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return[];throw e;}}
- async function until(check:()=>Promise<boolean>,label:string){const deadline=Date.now()+90000;while(!await check()){if(Date.now()>deadline){
+ async function until(check:()=>Promise<boolean>,label:string,timeoutMs=90000){const deadline=Date.now()+timeoutMs;while(!await check()){if(Date.now()>deadline){
   const installedVersion=await fs.readFile(path.join(installDir,'resources/app.asar')).then(()=>JSON.parse(extractFile(path.join(installDir,'resources/app.asar'),'package.json').toString()).version).catch(()=>null);
   const diagnostics={label,events:await events(),installedVersion,tempRoot,canonicalTempRoot:await fs.realpath(tempRoot)};
   console.error('Disposable NSIS diagnostics:',JSON.stringify(diagnostics));
@@ -310,13 +311,16 @@ test(folderRun?'Real Windows W14 Folder Update: installed 0.1.5 Pilot reads the 
   const installedApp=await timed('launch-installed',()=>electron.launch({executablePath:path.join(installDir,'Frostveil Disposable Test.exe'),args:['--launcher-update-test','--launcher-update-test-profile',updateProfile],env,timeout:30000}));
   try{
    const page=await timed('first-window',()=>installedApp.firstWindow());
-   const available=await timed('update-check-available',()=>page.waitForFunction(async()=>{
-    const snapshot=await window.launcher.status();
-    return snapshot.launcherUpdate?.state==='available'?snapshot:null;
-   },undefined,{timeout:30000}));
-   const state=await available.jsonValue();
+   const observed:{snapshot?:Dashboard}={};
+   await timed('update-check-available',()=>until(async()=>{
+    const snapshot=await page.evaluate(()=>window.launcher.status());
+    if(snapshot.launcherUpdate?.state==='error')throw Error(snapshot.launcherUpdate.message);
+    if(snapshot.launcherUpdate?.state!=='available')return false;
+    observed.snapshot=snapshot;
+    return true;
+   },'verified predecessor update check',30000));
+   const state=observed.snapshot;
    if(!state)throw Error('Available update snapshot is missing');
-   await available.dispose();
    await stage('verified-predecessor','done',{
     version:state.version,availableVersion:state.launcherUpdate?.availableVersion,
     trust:state.launcherUpdate?.publisherTrust,keyId:state.launcherUpdate?.keyId,channel:state.launcherUpdate?.channel
