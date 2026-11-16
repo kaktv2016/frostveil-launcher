@@ -86,8 +86,15 @@ try{
  await assert.rejects(()=>window.evaluate(()=>window.launcher.installUpdate()));
  await window.screenshot({path:'.local/updates.png'});
  await window.getByRole('button',{name:/^Dashboard/}).click();
- await window.getByRole('button',{name:/PLAY SKYRIM RP/}).click();
- await window.getByRole('alert').filter({hasText:'Real game launch blocked in fixture smoke'}).waitFor();
+ const playRefusals=()=>window.evaluate(async()=>(await window.launcher.status()).events.filter(event=>event.endsWith(' Runtime operation refused: play')).length);
+ async function expectPlayRefusal(isReady){
+  const before=await playRefusals();
+  assert.equal((await window.evaluate(()=>window.launcher.status())).scan.ready,isReady);
+  await window.getByRole('button',{name:/PLAY SKYRIM RP/}).click();
+  await window.getByRole('alert').filter({hasText:'ตรวจ installation ที่เลือก แล้วลองตรวจหรือเตรียมเกมอีกครั้ง'}).waitFor();
+  await expect.poll(playRefusals).toBe(before+1);
+ }
+ await expectPlayRefusal(true);
  assert.equal(errors.length,0);
  for(const entry of entries){assert.equal(createHash('sha256').update(await fs.readFile(path.join(fixture,'game',entry.path))).digest('hex'),entry.sha256);}
  // Exercise the incompatible Dashboard using fixture files, never real game files.
@@ -95,8 +102,7 @@ try{
  await window.getByRole('button',{name:'Re-scan',exact:true}).click();
  await window.getByText('NOT READY — scan or select your existing installation',{exact:true}).waitFor();
  assert.equal(await window.getByRole('button',{name:/PLAY SKYRIM RP/}).isEnabled(),true);
- await window.getByRole('button',{name:/PLAY SKYRIM RP/}).click();
- await window.getByRole('alert').filter({hasText:'Installation is incompatible or unverified'}).waitFor();
+ await expectPlayRefusal(false);
  const security=await app.evaluate(({BrowserWindow})=>{const w=BrowserWindow.getAllWindows()[0];const p=w.webContents.getLastWebPreferences();return{contextIsolation:p.contextIsolation,nodeIntegration:p.nodeIntegration,sandbox:p.sandbox,webSecurity:p.webSecurity};});
  assert.deepEqual(security,{contextIsolation:true,nodeIntegration:false,sandbox:true,webSecurity:true});
  await fs.writeFile('.local/smoke-report.json',JSON.stringify({status:'PASSED',fixtureOnly:true,realGameLaunch:false,security,checks:['ready and incompatible dashboards','no Node/raw IPC exposure','verified fixture backup','directory selection','channel validation','Play safely blocked in smoke','fixture game unchanged before intentional missing-file scenario','no renderer errors']},null,2));
