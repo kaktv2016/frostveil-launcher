@@ -9,10 +9,11 @@ import {censusRawCache, listCacheDirectory, measureCacheFiles, measureCacheRoots
 const windows = process.platform === 'win32';
 
 async function fixture(t: test.TestContext) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fv-w02-census-'));
+  const temp = await fs.realpath(os.tmpdir());
+  const root = await fs.mkdtemp(path.join(temp, 'fv-w02-census-'));
   t.after(async () => {
     // Keep all fixture removals literal and confined to this verified temp child.
-    assert.equal(path.dirname(root), os.tmpdir());
+    assert.equal(path.dirname(root), temp);
     await fs.rm(root, {recursive: true, force: true});
   });
   return root;

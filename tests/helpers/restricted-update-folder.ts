@@ -15,7 +15,8 @@ export async function restrictFixtureFeed(directory:string,tempRoot:string){
   $owner = [Security.Principal.WindowsIdentity]::GetCurrent().User
   $trusted = @($owner.Value, 'S-1-5-18', 'S-1-5-32-544')
   $acl = Get-Acl -LiteralPath $folder
-  if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $owner.Value) { throw 'Unexpected fixture owner' }
+  $fixtureOwner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+  if ($fixtureOwner -notin $trusted) { throw 'Unexpected fixture owner' }
   $acl.SetAccessRuleProtection($true, $false)
   foreach ($value in $trusted) {
     $sid = [Security.Principal.SecurityIdentifier]::new($value)
@@ -25,7 +26,8 @@ export async function restrictFixtureFeed(directory:string,tempRoot:string){
   Set-Acl -LiteralPath $folder -AclObject $acl
   $check = Get-Acl -LiteralPath $folder
   $permits = @($check.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]) | Where-Object AccessControlType -eq Allow)
-  if (!$check.AreAccessRulesProtected -or @($permits | Where-Object {$_.IdentityReference.Value -notin $trusted}).Count -or
+  if ($check.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $fixtureOwner -or
+      !$check.AreAccessRulesProtected -or @($permits | Where-Object {$_.IdentityReference.Value -notin $trusted}).Count -or
       @($permits.IdentityReference.Value | Select-Object -Unique).Count -ne 3) { throw 'Restricted fixture ACL readback failed' }
  `;
  await execute('pwsh.exe',['-NoProfile','-NonInteractive','-Command',script],{

@@ -25,7 +25,7 @@ function input(change: Partial<CacheReservationInput> = {}): CacheReservationInp
 }
 
 async function temp(t: TestContext) {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'fv-w02-cache-ledger-'));
+  const directory = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), 'fv-w02-cache-ledger-'));
   t.after(() => fs.rm(directory, {recursive: true, force: true}));
   return directory;
 }

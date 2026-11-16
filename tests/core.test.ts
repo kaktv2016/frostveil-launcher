@@ -19,7 +19,7 @@ import type {ChildProcess} from 'node:child_process';
 import {observeStartup} from '../src/main/windows';
 
 async function fixture(){
- const base=await fs.mkdtemp(path.join(os.tmpdir(),'skyrim-launcher-fixture-'));const game=path.join(base,'game');await fs.mkdir(game);
+ const base=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'skyrim-launcher-fixture-'));const game=path.join(base,'game');await fs.mkdir(game);
  const files=['SkyrimSE.exe','skse64_loader.exe','skse64_1_6_1170.dll','Data/Platform/Plugins/skymp5-client.js'];
  for(const file of files){await fs.mkdir(path.dirname(path.join(game,file)),{recursive:true});await fs.writeFile(path.join(game,file),'fixture:'+file);}
  const profile:Profile={id:'fixture',runtime:'1.6.1170.0',skseVersion:'0.2.2.6',skseDll:files[2]!,evidence:'synthetic only',files:await Promise.all(files.map(async(file,i)=>{const b=await fs.readFile(path.join(game,file));return{path:file,size:b.length,sha256:createHash('sha256').update(b).digest('hex'),component:i===0?'game':i===3?'client':'skse'} as Profile['files'][number];})),backupFiles:[files[3]!]};

@@ -54,7 +54,7 @@ test('W14 plan rejects malformed or non-canonical content pins',()=>{
 });
 
 test('W14 content pin reader rejects linked files and preserves the exact validated folder pin',async t=>{
- const root=await fs.mkdtemp(path.join(os.tmpdir(),'w14-content-pin-'));
+ const root=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'w14-content-pin-'));
  t.after(async()=>{
   assert.equal(path.dirname(await fs.realpath(root)),await fs.realpath(os.tmpdir()));
   await fs.rm(root,{recursive:true,force:true});
