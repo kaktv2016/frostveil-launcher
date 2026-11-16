@@ -7,7 +7,7 @@ import {lt} from 'semver';
 import {safeDirectory,safeFile,hashFile,noLinks,relativePath,checkExistingAncestors} from '../files';
 import {createInstallerSandbox,checkRoots,PAYLOAD_LIMIT,type SandboxGrant} from '../installer/sandbox';
 import {MetadataStore,durableWrite} from '../installer/metadata';
-import {GitHubDistributionProvider} from '../distribution/github';
+import {GitHubDistributionProvider,type PackDistributionProvider} from '../distribution/github';
 import {PackageDownloader} from '../distribution/download';
 import {productionSource,authenticateRelease,VersionLedger,type AuthenticatedRelease,type DistributionSource} from '../distribution/policy';
 import type {PackFile,PackageReference} from '../../shared/modpack-contracts';
@@ -117,7 +117,7 @@ export class ProductionDownloads {
  private preparing=false;
  private cancellation=0;
  private checkCancellation(version:number){if(this.disposed||this.cancellation!==version)throw Error('Server file preparation cancelled');}
- constructor(private storage:string,private version:string,private source:DistributionSource=productionSource,private providerFactory?:()=>GitHubDistributionProvider,private running:()=>Promise<boolean>=async()=>false){
+ constructor(private storage:string,private version:string,private source:DistributionSource=productionSource,private providerFactory?:()=>PackDistributionProvider,private running:()=>Promise<boolean>=async()=>false){
   if(!this.providerFactory){this.isDefaultProvider=true;this.providerFactory=()=>new GitHubDistributionProvider();}
  }
  snapshot():ProductionDownloadState{return structuredClone(this.state);}
@@ -198,7 +198,7 @@ export class ProductionDownloads {
   finally{this.controller=undefined;}
  }
  setInstalled(installed:boolean){if(this.state.installed!==installed)this.update({installed,...(installed&&this.state.phase==='idle'?{message:'Server files & mods (SkyUI) are installed and active.'}:{})});}
- private async resolveBundle(provider:GitHubDistributionProvider,signal?:AbortSignal){
+ private async resolveBundle(provider:PackDistributionProvider,signal?:AbortSignal){
   const release=await provider.resolve(this.source.channel,undefined,signal);
    const bundle=authenticateRelease(await provider.envelope(release,signal),this.source,release);
    assertSharedPluginCompatibility(bundle.manifest,bundle.server);

@@ -96,7 +96,8 @@ export class RuntimePreparation {
  private selection?:Selection;
  private recoveryRead=0;
  private prepared?:{game:string;config:string;tx:RuntimeTransaction};
- constructor(private storage:string,private bundledPolicy:string,private iniDirectory?:string){}
+ constructor(private storage:string,private bundledPolicy:string,private iniDirectory?:string,
+  private readonly pinnedPolicy?:(signal:AbortSignal)=>Promise<Readonly<RuntimeCohort>>){}
  snapshot(){return structuredClone(this.state);}
  subscribe(fn:(s:RuntimePreparationState)=>void){this.listeners.add(fn);return()=>{this.listeners.delete(fn);};}
  private update(patch:Partial<RuntimePreparationState>){
@@ -162,6 +163,7 @@ export class RuntimePreparation {
   try{const settings=await safeFile(game,'Data/Platform/Plugins/skymp5-client-settings.txt'),s=await fs.stat(settings);if(s.size>1024*1024||s.nlink!==1)throw Error('Client settings exceed bound or use a hard link');const text=await fs.readFile(settings,'utf8');if(/17777/.test(text))throw Error('NPC development endpoint 17777 is active; revert the development profile first');}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
  }
  protected async loadPolicy(signal:AbortSignal):Promise<Readonly<RuntimeCohort>>{
+  if(this.pinnedPolicy)return this.pinnedPolicy(signal);
   // No unsigned local compatibility-profile or renderer-supplied source is used.
   const response=await fetch(policyUrl,{redirect:'error',signal:AbortSignal.any([signal,AbortSignal.timeout(30000)])});let bytes:Buffer;
   if(response.ok&&response.body){const parts:Buffer[]=[];let size=0;for await(const part of response.body){size+=part.length;if(size>4*1024*1024)throw Error('Runtime metadata exceeds bound');parts.push(Buffer.from(part));}bytes=Buffer.concat(parts);}

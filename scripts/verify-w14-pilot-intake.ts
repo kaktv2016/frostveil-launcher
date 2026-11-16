@@ -4,9 +4,7 @@ import {createHash} from 'node:crypto';
 import semver from 'semver';
 import {safeFile} from '../src/main/files';
 import {authenticateRelease,productionSource,type DistributionSource} from '../src/main/distribution/policy';
-import {assertSharedPluginCompatibility} from '../src/main/modpack/compatibility';
-import {OFFICIAL} from '../src/main/modpack/plugins';
-import {helperPin} from '../src/main/runtime/depot';
+import {assertW14ContentPairing} from '../src/main/distribution/w14-content-compatibility';
 import {authenticateRuntimeCohort} from '../src/main/runtime/policy';
 import {
  LAUNCHER_MANIFEST_ASSET,authenticateLauncherUpdate,w14PilotLauncherUpdateSource,verifyDownloadedInstaller,
@@ -134,7 +132,8 @@ export async function verifyW14PilotContent(root:string,indexSha256:string,windo
  const packEnvelope=await readPinnedJson(await intakeFile(packRef.signedEnvelopeRef),packRef.sha256,6*1024*1024);
  const metadata=await readPinnedJson(await intakeFile(packRef.releaseMetadataRef),packRef.releaseMetadataSha256,1024*1024);
  const runtime=authenticateRuntimeCohort(runtimeEnvelope.value,source.keys,{fixture:source.mode==='sandbox-test'});
- const {manifest,server,packages,release,manifestHash}=authenticateRelease(packEnvelope.value,source,metadata.value);
+ const verified=authenticateRelease(packEnvelope.value,source,metadata.value);
+ const {manifest,server,packages,release,manifestHash}=verified;
  const profile=record(index.profile),compatibility=record(artifacts.compatibility);
  if(profile.steamApp!==runtime.appId||profile.language!==runtime.language||profile.runtime!==runtime.runtime||
     manifest.requiredSkyrimRuntime!==runtime.runtime||profile.skse!=='2.2.6'||manifest.requiredSKSEVersion!=='0.2.2.6'||
@@ -151,32 +150,12 @@ export async function verifyW14PilotContent(root:string,indexSha256:string,windo
     Date.parse(runtime.createdAt)>=Date.parse(runtime.expiresAt))throw Error('Signed content or publisher key expires within the test window');
  if(runtimeRef.publicKeyId!==runtimeKeyId||runtimeRef.expiresAtUtc!==runtime.expiresAt||
     packRef.publicKeyId!==packKeyId||packRef.expiresAtUtc!==server.expiresAt)throw Error('Signed content disagrees with index publisher or expiry');
- if(runtime.depots.length!==3||runtime.helper.version!==helperPin.version||
-    runtime.helper.size!==helperPin.size||runtime.helper.sha256!==helperPin.sha256)throw Error('Signed helper or depot set differs from the Launcher pins');
  const envelopeAsset=release.assets.find(asset=>asset.name==='frostveil-manifest.json');
  const assetsById=new Map(release.assets.map(asset=>[asset.id,asset]));
  if(!release.immutable||release.id!==packRef.releaseId||!envelopeAsset||envelopeAsset.id!==packRef.envelopeAssetId||
     envelopeAsset.size!==packEnvelope.bytes||envelopeAsset.digest!==`sha256:${packEnvelope.sha256}`||
     packages.some(pkg=>assetsById.get(pkg.assetId)?.digest!==`sha256:${pkg.sha256}`))throw Error('Intake does not match immutable pack release assets');
- assertSharedPluginCompatibility(manifest,server);
- const managed=new Set(runtime.managedFiles.map(file=>file.path.toLowerCase()));
- if(manifest.skyMPClientRequirements.nativeFiles.some(file=>!managed.has(file.toLowerCase()))){
-  throw Error('Signed runtime lacks a required native client inventory entry');
- }
- const runtimeFiles=new Map([...runtime.files,...runtime.managedFiles].map(file=>[file.path.toLowerCase(),file]));
- let commonRequiredFiles=0;
- for(const file of manifest.files){
-  const peer=runtimeFiles.get(file.path.toLowerCase());
-  if(!file.required||!peer)continue;
-  if(peer.sha256!==file.sha256||peer.size!==file.size)throw Error('Signed runtime and pack file length or SHA-256 conflict');
-  commonRequiredFiles++;
- }
- const implicitMasters=OFFICIAL.filter(name=>runtimeFiles.has(('Data/'+name).toLowerCase()));
- const declaredOrder=[...new Set([...implicitMasters,...runtime.creations,...runtime.pluginOrder].map(name=>name.toLowerCase()))];
- const declaredSharedSlots=server.plugins.map(plugin=>declaredOrder.indexOf(plugin.filename.toLowerCase()));
- if(!declaredSharedSlots.length||declaredSharedSlots.some((slot,i)=>slot<0||(i>0&&slot<declaredSharedSlots[i-1]!))){
-  throw Error('Signed runtime and server plugin order conflict');
- }
+ const commonRequiredFiles=assertW14ContentPairing(runtime,verified);
  return {status:'LOCAL_ED25519_CONTENT_BINDINGS_MATCH',qualification:'NOT_RUN',installedBytes:'NOT_VERIFIED',
   packagePayloadBytes:'NOT_VERIFIED',nativePairing:'NOT_VERIFIED',
   trustMode:source.mode,candidateIndexSha256:indexDigest,candidateId:candidate.id,producerGit:candidate.producerGit,

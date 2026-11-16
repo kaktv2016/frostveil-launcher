@@ -31,7 +31,7 @@ function cacheConflict(){
 export class PackageDownloader {
  private busy=false;
 
- constructor(private grant:SandboxGrant,private transport:DistributionTransport,private options:Options={}){
+ constructor(private grant:SandboxGrant,private transport:Pick<DistributionTransport,'request'|'testOnly'>,private options:Options={}){
   if(!transport.testOnly&&options.writeChunk)throw Error('Production acquisition cannot override filesystem writes');
  }
 

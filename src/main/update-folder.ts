@@ -1,10 +1,7 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {Readable} from 'node:stream';
-import {relativePath,safeFile} from './files';
 import {MAX_INSTALLER_BYTES,updateError,type LauncherUpdateFeed} from './update-integrity';
-import {verifyW14UpdateAcl} from './windows';
+import {localW14Folder,openProtectedW14File} from './protected-w14-folder';
 
 declare const FROSTVEIL_W14_UPDATE_FOLDER:string|undefined;
 export const packagedW14UpdateFolder=typeof FROSTVEIL_W14_UPDATE_FOLDER==='undefined'?undefined:FROSTVEIL_W14_UPDATE_FOLDER;
@@ -13,41 +10,13 @@ export class FolderLauncherUpdateTransport implements LauncherUpdateFeed {
  readonly channel='w14-pilot' as const;
  private readonly root:string;
 
- constructor(root:string){
-  if(process.platform!=='win32'||!/^[A-Za-z]:[\\/].+/.test(root))throw Error('An absolute local Windows update folder is required');
-  relativePath(root.slice(3).replace(/\\/g,'/'));
-  this.root=path.normalize(root);
- }
+ constructor(root:string){this.root=localW14Folder(root);}
 
  private async open(reference:string,max:number,signal?:AbortSignal){
-  let handle:fs.FileHandle|undefined;
-  try{
-   signal?.throwIfAborted();
-   const file=await safeFile(this.root,reference);
-   const before=await fs.lstat(file,{bigint:true});
-   if(!before.isFile()||before.nlink!==1n||before.size<1n||before.size>BigInt(max))throw Error('Unsafe or linked update payload');
-   if(!await verifyW14UpdateAcl(this.root,path.dirname(file),file)){
-    throw updateError('Private update folder permissions failed verification','ERR_UPDATER_FOLDER_PERMISSIONS');
-   }
-   signal?.throwIfAborted();
-   handle=await fs.open(file,'r');
-   const opened=await handle.stat({bigint:true});
-   if(await safeFile(this.root,reference)!==file||(await fs.realpath(file)).toLowerCase()!==file.toLowerCase()){
-    throw Error('Update payload path changed at open');
-   }
-   const after=await fs.lstat(file,{bigint:true});
-   if(!opened.isFile()||opened.nlink!==1n||[before,after].some(stat=>
-    !stat.isFile()||stat.nlink!==1n||stat.dev!==opened.dev||stat.ino!==opened.ino||
-    stat.size!==opened.size||stat.mtimeNs!==opened.mtimeNs||stat.ctimeNs!==opened.ctimeNs)){
-    throw Error('Update payload changed at open');
-   }
-   signal?.throwIfAborted();
-   return {handle,opened};
-  }catch(error){
-   await handle?.close().catch(()=>{});
+  try{return await openProtectedW14File(this.root,reference,max,signal);}catch(error){
    signal?.throwIfAborted();
    const code=(error as NodeJS.ErrnoException).code;
-   if(code==='ERR_UPDATER_FOLDER_PERMISSIONS')throw error;
+   if(code==='ERR_W14_FOLDER_PERMISSIONS')throw updateError('Private update folder permissions failed verification','ERR_UPDATER_FOLDER_PERMISSIONS');
    if(code==='ENOENT')throw updateError('Private update folder or file is unavailable','ERR_UPDATER_FOLDER_UNAVAILABLE');
    throw updateError('Private update folder contains an unsafe or inaccessible file','ERR_UPDATER_FOLDER_UNSAFE');
   }

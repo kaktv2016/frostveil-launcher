@@ -26,6 +26,7 @@ import {updateState} from './updates';
 import {selectInstallation} from './session-state';
 import {createUpdater} from './update-bootstrap';
 import {packagedW14UpdateFolder} from './update-folder';
+import {packagedW14ContentPin,W14ContentFolder} from './distribution/w14-content-folder';
 import {InstallerSandboxDemo} from './installer/demo';
 import {durableWrite} from './installer/metadata';
 import {ModpackVerifier,mandatoryPackPolicy} from './modpack/service';
@@ -50,8 +51,11 @@ async function start(){
  let settings:Settings={directory:fixture?path.join(fixture,'game'):'',channel:'stable'};
  try{settings=validateSettings(JSON.parse(await fs.readFile(settingsPath,'utf8')));}catch{/* first start or invalid local settings: safe defaults */}
  const state:Dashboard={version:app.getVersion(),settings,scan:null,backup:null,updates:updateState(settings.channel),server:'NOT TESTED',events:[]};
- const runtimePreparation=new RuntimePreparation(storage,path.join(__dirname,'../assets/runtime-1170.json'),path.join(app.getPath('documents'),'My Games','Skyrim Special Edition'));state.runtimePreparation=runtimePreparation.snapshot();
- const downloads=new ProductionDownloads(storage,app.getVersion(),undefined,undefined,fixture?async()=>false:gameRunning);state.productionDownloads=downloads.snapshot();
+ const pilotContent=packagedW14UpdateFolder===undefined?undefined:new W14ContentFolder(packagedW14ContentPin,undefined,app.getVersion());
+ const packProvider=pilotContent?()=>pilotContent:undefined;
+ const runtimePreparation=new RuntimePreparation(storage,path.join(__dirname,'../assets/runtime-1170.json'),path.join(app.getPath('documents'),'My Games','Skyrim Special Edition'),
+  pilotContent?signal=>pilotContent.runtime(signal):undefined);state.runtimePreparation=runtimePreparation.snapshot();
+ const downloads=new ProductionDownloads(storage,app.getVersion(),undefined,packProvider,fixture?async()=>false:gameRunning);state.productionDownloads=downloads.snapshot();
  const graphicsPack=new GraphicsPackService(storage);state.graphicsPack=graphicsPack.snapshot();
  const writeLocal=async(file:string,data:unknown)=>{try{await noLinks(file);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}await fs.writeFile(file,JSON.stringify(data,null,2));};
  const log=async(message:string)=>{state.events.unshift(new Date().toISOString()+' '+message);state.events=state.events.slice(0,60);await writeLocal(path.join(storage,'diagnostics.json'),state.events);};
@@ -203,7 +207,7 @@ async function start(){
  const modpack=new ModpackVerifier(fixture??storage,app.getVersion(),fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition'),version);
  const levelBEnabled=process.argv.includes('--distribution-level-b'),profileIndex=process.argv.indexOf('--level-b-profile'),levelBProfileFile=levelBEnabled&&profileIndex>=0?process.argv[profileIndex+1]:undefined;if(levelBEnabled&&(!levelBProfileFile||!path.isAbsolute(levelBProfileFile)))throw Error('Explicit absolute public test profile required');const levelBProfile=levelBProfileFile?await readTestProfile(levelBProfileFile):undefined;
  const distribution=new DistributionService(storage,levelBProfile);await distribution.initialize();state.distribution=distribution.snapshot();
- const management=new ManagementService(storage,app.getVersion(),()=>({directory:settings.directory,orderDirectory:fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition'),runtime:state.scan,channel:settings.channel,iniDirectory:fixture?path.join(fixture,'ini'):path.join(app.getPath('documents'),'My Games','Skyrim Special Edition')}),async(plan,hash)=>{if(smoke)return false;const answer=await dialog.showMessageBox(window,{type:'warning',title:'Review exact Skyrim modpack plan',message:'Authorize this exact installation transaction?',detail:hash+'\n'+JSON.stringify(plan,null,2),buttons:['Cancel','Authorize this plan'],defaultId:0,cancelId:0,noLink:true});return answer.response===1;},version,undefined,undefined,(grant,ref,signal)=>downloads.stage(grant,ref,signal));await management.initialize();state.management=management.snapshot();
+ const management=new ManagementService(storage,app.getVersion(),()=>({directory:settings.directory,orderDirectory:fixture?path.join(fixture,'order'):path.join(process.env.LOCALAPPDATA??'','Skyrim Special Edition'),runtime:state.scan,channel:settings.channel,iniDirectory:fixture?path.join(fixture,'ini'):path.join(app.getPath('documents'),'My Games','Skyrim Special Edition')}),async(plan,hash)=>{if(smoke)return false;const answer=await dialog.showMessageBox(window,{type:'warning',title:'Review exact Skyrim modpack plan',message:'Authorize this exact installation transaction?',detail:hash+'\n'+JSON.stringify(plan,null,2),buttons:['Cancel','Authorize this plan'],defaultId:0,cancelId:0,noLink:true});return answer.response===1;},version,undefined,packProvider,(grant,ref,signal)=>downloads.stage(grant,ref,signal));await management.initialize();state.management=management.snapshot();
  const installer=new InstallerSandboxDemo(storage);await installer.initialize();state.installer=installer.snapshot();
  state.modpack=modpack.snapshot();
  state.launcherUpdate=updater.snapshot();
@@ -316,7 +320,7 @@ async function start(){
  handler('defer-update',async arg=>{noArgument(arg);updater.defer();state.launcherUpdate=updater.snapshot();});
  handler('scan-modpack',async arg=>{noArgument(arg);if(!settings.directory)throw Error('Select a game installation first');await scan();await modpack.scan(settings.directory,settings.channel,state.scan);});
  handler('level-b-sandbox',async arg=>{noArgument(arg);if(!levelBProfileFile)throw Error('TEST DISTRIBUTION disabled in ordinary mode');await distribution.runGitHubTest(await readTestProfile(levelBProfileFile));});
- handler('check-distribution',async arg=>{noArgument(arg);await distribution.check();});
+ handler('check-distribution',async arg=>{noArgument(arg);if(pilotContent)throw Error('Use the pinned Pilot pack check in Manage or Prepare');await distribution.check();});
  handler('preview-distribution',async arg=>{noArgument(arg);state.distribution=distribution.snapshot();});
  handler('distribution-sandbox',async arg=>{noArgument(arg);await distribution.runLocal();});
  handler('cancel-distribution',async arg=>{noArgument(arg);distribution.cancel();});

@@ -8,6 +8,7 @@ import {extractFile} from '@electron/asar';
 import {verifyW14UpdateAcl} from '../src/main/windows.ts';
 import {admitPackagedCachePolicy} from '../src/main/runtime/cache-policy.ts';
 import {assertProductionTrust} from './production-trust-audit.mjs';
+import {encodeW14ContentBuildPin,readW14ContentBuildPin,validateW14ContentPin} from './w14-content-build-pin.mjs';
 
 export const W14_PRIVATE_ROOT=path.win32.join(os.homedir(),'AppData','Local','FrostveilWorkflow','private-candidates','launcher-v2-p0');
 const VERSION=/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
@@ -23,10 +24,13 @@ export function validateFolderPin(value){
 }
 
 export function createW14PilotPlan({repo,privateRoot=W14_PRIVATE_ROOT,release,version,updateFolder,outputDir,
- cachePolicyRevision,cachePolicyFile,outputExists=false}){
+ cachePolicyRevision,cachePolicyFile,contentPinFile,contentPin,outputExists=false}){
  if(!['prior','candidate'].includes(release))throw Error('W14 release must be prior or candidate');
  if(typeof version!=='string'||!VERSION.test(version))throw Error('W14 package version must be an explicit stable x.y.z version');
  const folder=validateFolderPin(updateFolder);
+ if(!contentPinFile||!contentPin)throw Error('A W14 content pin file and validated content pin are required');
+ const contentFile=validateFolderPin(contentPinFile);
+ const pinnedContent=validateW14ContentPin(contentPin);
  const root=validateFolderPin(privateRoot),output=validateFolderPin(outputDir??path.win32.join(root,`w14-${release}-${version}`));
  const rootPrefix=root.endsWith('\\')?root:root+'\\';
  if(!output.toLowerCase().startsWith(rootPrefix.toLowerCase()))throw Error('W14 output must be under the approved private output root');
@@ -36,12 +40,14 @@ export function createW14PilotPlan({repo,privateRoot=W14_PRIVATE_ROOT,release,ve
  if(cachePolicyRevision!==undefined&&(!Number.isSafeInteger(cachePolicyRevision)||cachePolicyRevision<1))
   throw Error('W14 cache policy arguments are invalid');
  const buildCommand=['node','scripts/build.mjs',`--w14-update-folder=${folder}`];
+ buildCommand.push(`--w14-content-pin=${contentFile}`);
  if(cachePolicyRevision!==undefined)buildCommand.push(`--p0-cache-policy-revision=${cachePolicyRevision}`,`--p0-cache-policy-file=${validateFolderPin(cachePolicyFile)}`);
  const artifactName=`FrostveilLauncher-W14Pilot-${version}-x64.exe`;
  const packageCommand=['node','node_modules/electron-builder/cli.js','--win','nsis','--x64','--publish','never',
   `-c.appId=dev.skyrimrp.launcher.w14-pilot`,`-c.productName=Frostveil Launcher W14 Pilot`,
   `-c.directories.output=${output}`,`-c.extraMetadata.version=${version}`,`-c.win.artifactName=${artifactName}`];
- return {repo,privateRoot:root,release,version,updateFolder:folder,outputDir:output,artifactName,buildCommand,packageCommand};
+ return {repo,privateRoot:root,release,version,updateFolder:folder,contentPinFile:contentFile,contentPin:pinnedContent,
+  outputDir:output,artifactName,buildCommand,packageCommand};
 }
 
 async function assertSafeOutput(plan){
@@ -101,14 +107,15 @@ async function gitSnapshot(repo){
 async function main(argv){
  const options=Object.create(null);
  for(const arg of argv){const match=/^--([a-z-]+)=(.*)$/.exec(arg);if(!match||Object.hasOwn(options,match[1]))throw Error(`Invalid or duplicate argument: ${arg}`);options[match[1]]=match[2];}
- const allowed=new Set(['release','version','update-folder','output-parent','output','cache-policy-revision','cache-policy-file','dry-run']);
+ const allowed=new Set(['release','version','update-folder','content-pin','output-parent','output','cache-policy-revision','cache-policy-file','dry-run']);
  for(const key of Object.keys(options))if(!allowed.has(key))throw Error(`Unknown argument: --${key}`);
- for(const key of ['release','version','update-folder'])if(!options[key])throw Error(`Missing required argument: --${key}=...`);
+ for(const key of ['release','version','update-folder','content-pin'])if(!options[key])throw Error(`Missing required argument: --${key}=...`);
  if(process.platform!=='win32')throw Error('W14 NSIS packaging requires Windows');
  const repo=process.cwd(),privateRoot=options['output-parent']??W14_PRIVATE_ROOT;
  const policyRevision=options['cache-policy-revision']===undefined?undefined:Number(options['cache-policy-revision']);
+ const contentPin=await readW14ContentBuildPin(options['content-pin']);
  const plan=createW14PilotPlan({repo,privateRoot,release:options.release,version:options.version,updateFolder:options['update-folder'],outputDir:options.output,
-  cachePolicyRevision:policyRevision,cachePolicyFile:options['cache-policy-file']});
+  contentPinFile:options['content-pin'],contentPin,cachePolicyRevision:policyRevision,cachePolicyFile:options['cache-policy-file']});
  await assertSafeOutput(plan);
  if(options['dry-run']==='true'){process.stdout.write(JSON.stringify(plan,null,2)+'\n');return;}
  if(options['dry-run']!==undefined)throw Error('--dry-run accepts only true');
@@ -130,8 +137,9 @@ async function main(argv){
  const main=await fs.readFile(path.join(repo,'dist','main.cjs'));
  const text=main.toString('utf8');
  assertProductionTrust(text);
- if(!text.includes(JSON.stringify(plan.updateFolder))||text.includes('FROSTVEIL_W14_UPDATE_TEST')||
-    (cachePolicySha256&&!text.includes(JSON.stringify(cachePolicySha256))))throw Error('W14 compiled folder or cache policy pin mismatch');
+ const encodedContentPin=encodeW14ContentBuildPin(plan.contentPin);
+ if(!text.includes(JSON.stringify(plan.updateFolder))||!text.includes(JSON.stringify(encodedContentPin))||text.includes('FROSTVEIL_W14_UPDATE_TEST')||
+    (cachePolicySha256&&!text.includes(JSON.stringify(cachePolicySha256))))throw Error('W14 compiled folder, content or cache policy pin mismatch');
  const artifact=path.join(plan.outputDir,plan.artifactName);
  const buildEnv={...process.env,CSC_IDENTITY_AUTO_DISCOVERY:'false'};
  for(const key of ['CSC_LINK','CSC_KEY_PASSWORD','WIN_CSC_LINK','WIN_CSC_KEY_PASSWORD'])delete buildEnv[key];
@@ -145,7 +153,7 @@ async function main(argv){
  const authenticodeStatus=await requireUnsignedInstaller(artifact);
  const identity=await hashFile(artifact);
  const receipt={schemaVersion:1,kind:'frostveil-w14-pilot-package',release:plan.release,version:plan.version,architecture:'x64',target:'nsis',
-  publish:'never',appId:'dev.skyrimrp.launcher.w14-pilot',productName:'Frostveil Launcher W14 Pilot',updateFolder:plan.updateFolder,
+  publish:'never',appId:'dev.skyrimrp.launcher.w14-pilot',productName:'Frostveil Launcher W14 Pilot',updateFolder:plan.updateFolder,contentPin:plan.contentPin,
   qualification:'NOT_RUN',sourceCommit:source.commit,sourceClean:source.clean,cachePolicyRevision:policyRevision,cachePolicySha256,
   mainSha256:createHash('sha256').update(main).digest('hex'),artifact:{name:plan.artifactName,authenticodeStatus,...identity},createdAt:new Date().toISOString()};
  const receiptPath=path.join(plan.outputDir,`w14-package-receipt-${plan.release}-${plan.version}.json`);

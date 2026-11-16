@@ -4,7 +4,7 @@ import {lt} from 'semver';
 import {contained,safeFile,safeDirectory,noLinks} from '../files';
 import {fileVersion,gameRunning} from '../windows';
 import {scanInstallation} from '../installation';
-import {GitHubDistributionProvider} from '../distribution/github';
+import {GitHubDistributionProvider,type PackDistributionProvider} from '../distribution/github';
 import {PackageDownloader} from '../distribution/download';
 import {authenticateRelease,productionSource,VersionLedger,type AuthenticatedRelease,type DistributionSource} from '../distribution/policy';
 import {MetadataStore,durableWrite} from '../installer/metadata';
@@ -55,7 +55,7 @@ export class ManagementService {
   confirm:(plan:unknown,hash:string)=>Promise<boolean>,
   private readonly versionReader=fileVersion,
   private readonly source:DistributionSource=productionSource,
-  private readonly providerFactory:()=>GitHubDistributionProvider=()=>new GitHubDistributionProvider(),
+  private readonly providerFactory:()=>PackDistributionProvider=()=>new GitHubDistributionProvider(),
   private readonly stageDownload?:(grant:SandboxGrant,reference:PackageReference,signal?:AbortSignal)=>Promise<string>
  ){
   this.authorizer=new PlanAuthorizer(confirm);

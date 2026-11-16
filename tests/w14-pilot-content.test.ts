@@ -9,6 +9,11 @@ import type {DistributionSource} from '../src/main/distribution/policy';
 import {helperPin} from '../src/main/runtime/depot';
 import type {RuntimeCohort} from '../src/main/runtime/policy';
 import {envelope,fixture,keyId,publicKey,testKey} from './distribution-fixture';
+import {W14ContentFolder} from '../src/main/distribution/w14-content-folder';
+import {PackageDownloader} from '../src/main/distribution/download';
+import {restrictFixtureFeed} from './helpers/restricted-update-folder';
+import {ProductionDownloads} from '../src/main/management/downloads';
+import {RuntimePreparation} from '../src/main/runtime/service';
 
 const sha=(bytes:Buffer|string)=>createHash('sha256').update(bytes).digest('hex');
 
@@ -45,7 +50,7 @@ async function contentFixture(t:TestContext){
   await fs.writeFile(path.join(root,name),bytes);
   return {sha256:sha(bytes),size:bytes.length};
  }
- async function run({windowEnd=end,digestOffset=false,useProduction=false}: {windowEnd?:string;digestOffset?:boolean;useProduction?:boolean}={}){
+ async function prepare(digestOffset=false){
   const payload=Buffer.from(JSON.stringify(runtime));
   index.artifacts.runtime.sha256=(await write('runtime.json',{
    keyId,payloadBase64:payload.toString('base64'),signatureBase64:sign(null,payload,testKey).toString('base64')
@@ -56,11 +61,99 @@ async function contentFixture(t:TestContext){
   manifestAsset.size=pack.size;
   manifestAsset.digest='sha256:'+(digestOffset?'0'.repeat(64):pack.sha256);
   index.artifacts.pack.releaseMetadataSha256=(await write('pack-release.json',f.metadata)).sha256;
-  const {sha256}=await write('candidate-index.json',index);
-  return verifyW14PilotContent(root,sha256,windowEnd,useProduction?undefined:source);
+  return (await write('candidate-index.json',index)).sha256;
  }
- return {f,index,runtime,expiry,run};
+ async function run({windowEnd=end,digestOffset=false,useProduction=false}: {windowEnd?:string;digestOffset?:boolean;useProduction?:boolean}={}){
+  return verifyW14PilotContent(root,await prepare(digestOffset),windowEnd,useProduction?undefined:source);
+ }
+ async function folder(protectedAcl=true){
+  await prepare();
+  const folder=path.join(root,'w14-content'),assets=path.join(folder,'assets');
+  await fs.mkdir(folder);
+  if(protectedAcl)await restrictFixtureFeed(folder,root);
+  await fs.mkdir(assets);
+  await Promise.all(['runtime.json','pack-release.json'].map(name=>fs.copyFile(path.join(root,name),path.join(folder,name))));
+  await fs.copyFile(path.join(root,'pack.json'),path.join(assets,'100'));
+  await Promise.all([...f.payloads].map(([id,bytes])=>fs.writeFile(path.join(assets,String(id)),bytes)));
+  return {folder,runtimeSha256:index.artifacts.runtime.sha256,packReleaseSha256:index.artifacts.pack.releaseMetadataSha256,packEnvelopeSha256:index.artifacts.pack.sha256};
+ }
+ return {f,index,runtime,expiry,run,folder,source};
 }
+
+class RuntimePolicyProbe extends RuntimePreparation {
+ read(signal:AbortSignal){return this.loadPolicy(signal);}
+}
+
+test('W14 protected folder binds signed runtime, pack, and verified redistribution bytes',async t=>{
+ const f=await contentFixture(t),pin=await f.folder();
+ const local=new W14ContentFolder(pin,f.source);
+ await assert.rejects(local.transport.request('/releases/assets/101'),/not authorized/i);
+ assert.equal((await local.runtime(new AbortController().signal)).runtime,'1.6.1170.0');
+ const release=await local.resolve('stable');
+ assert.equal(release.tag_name,f.f.metadata.tag_name);
+ assert.equal((await local.envelope(release)).keyId,keyId);
+ await assert.rejects(local.resolve('beta'),/W14.*channel/i);
+ await assert.rejects(local.transport.request('/releases/assets/999'),/not authorized/i);
+ const packageRef=f.f.manifest.files.find(file=>file.package)!.package!;
+ const partial=await local.transport.request('/releases/assets/'+packageRef.assetId,undefined,{
+  Range:'bytes=1-','If-Range':'"'+packageRef.sha256+'"'
+ });
+ assert.equal(partial.status,206);
+ assert.deepEqual(Buffer.from(await partial.arrayBuffer()),f.f.payloads.get(packageRef.assetId)!.subarray(1));
+ await fs.unlink(path.join(f.f.grant.payloads,packageRef.sha256+'.bin'));
+ const target=await new PackageDownloader(f.f.grant,local.transport).acquire(packageRef);
+ assert.deepEqual(await fs.readFile(target),f.f.payloads.get(packageRef.assetId));
+ await assert.rejects(new W14ContentFolder(pin).runtime(new AbortController().signal),/Untrusted runtime publisher/i);
+});
+
+test('W14 runtime and Whole Play pack admission keep their pinned source when metadata vanishes',async t=>{
+ const f=await contentFixture(t),pin=await f.folder();
+ const local=new W14ContentFolder(pin,f.source,'0.2.0');
+ const root=f.f.grant.directory,signal=new AbortController().signal;
+ const runtime=new RuntimePolicyProbe(root,path.join(root,'unused-public-fallback.json'),undefined,s=>local.runtime(s));
+ const downloads=new ProductionDownloads(path.join(root,'launcher-storage'),'0.2.0',f.source,()=>local);
+ const attempted:string[]=[];
+ t.mock.method(globalThis,'fetch',async (url:unknown)=>{
+  attempted.push(String(url));
+  throw Error('Unexpected public request');
+ });
+ assert.equal((await runtime.read(signal)).runtime,'1.6.1170.0');
+ const admission=await downloads.wholePlayAdmission(signal);
+ assert.equal(admission.packagedTargets.size,f.f.payloads.size);
+ await fs.unlink(path.join(pin.folder,'runtime.json'));
+ await assert.rejects(runtime.read(signal),/pinned W14 content file is missing/);
+ await assert.rejects(downloads.wholePlayAdmission(signal),/pinned W14 content file is missing/);
+ assert.deepEqual(attempted,[]);
+});
+
+test('W14 content refuses a hardlinked manifest and PackageDownloader rejects altered local bytes',async t=>{
+ const f=await contentFixture(t),pin=await f.folder(),local=new W14ContentFolder(pin,f.source);
+ const packageRef=f.f.manifest.files.find(file=>file.package)!.package!;
+ await local.resolve('stable');
+ await fs.unlink(path.join(f.f.grant.payloads,packageRef.sha256+'.bin'));
+ const file=path.join(pin.folder,'assets',String(packageRef.assetId));
+ await fs.writeFile(file,Buffer.alloc(packageRef.size,0x20));
+ await assert.rejects(new PackageDownloader(f.f.grant,local.transport,{attempts:1}).acquire(packageRef),/Final SHA256 mismatch/);
+ await fs.link(path.join(pin.folder,'assets','100'),path.join(pin.folder,'duplicate-manifest'));
+ await assert.rejects(local.resolve('stable'),/unsafe or invalid file/i);
+});
+
+test('W14 requires a protected Windows ACL on the actual content root',async t=>{
+ const f=await contentFixture(t),pin=await f.folder(false);
+ await assert.rejects(new W14ContentFolder(pin,f.source).resolve('stable'),/folder permissions failed verification/);
+});
+
+test('W14 protected folder rejects absent pins, content drift and individually signed conflicts',async t=>{
+ const f=await contentFixture(t);
+ f.runtime.files[0]!.sha256='0'.repeat(64);
+ const pin=await f.folder();
+ const local=new W14ContentFolder(pin,f.source);
+ await assert.rejects(local.runtime(new AbortController().signal),/signed runtime and pack file/i);
+ await assert.rejects(local.resolve('stable'),/signed runtime and pack file/i);
+ await fs.appendFile(path.join(pin.folder,'runtime.json'),' ');
+ await assert.rejects(local.resolve('stable'),/content.*digest/i);
+ await assert.rejects(new W14ContentFolder(undefined).resolve('stable'),/content.*pin/i);
+});
 
 test('W14 binds fresh signed runtime and pack metadata to one candidate without attesting installed bytes or server',async t=>{
  const f=await contentFixture(t),result=await f.run();
