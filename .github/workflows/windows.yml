@@ -15,6 +15,24 @@ jobs:
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
       - run: npm run typecheck
+      - name: Stage verified Play test fixtures
+        shell: pwsh
+        run: |
+          $release = 'https://github.com/kaktv2016/frostveil-distribution/releases/download/pack-v1.0.9'
+          $fixtures = @(
+            @{ Name = 'FrostveilCourierNavigation.esp'; Path = 'Data/FrostveilCourierNavigation.esp'; Bytes = 49789; Sha256 = '9a4a546f9fae714251dde91955b27a3b01cb79cabcbe4e1ab80fff9bcd549930' }
+            @{ Name = 'CourierQuestTint.swf'; Path = 'Data/Interface/Frostveil/CourierQuestTint.swf'; Bytes = 4648; Sha256 = '019620db0fb13ff8803a528e1ba7e9f2a06a404f2b0016c9d047ac81f97c61f6' }
+          )
+          $root = Join-Path (Split-Path -Parent $env:GITHUB_WORKSPACE) 'mod-work/frostveil-courier-navigation/payload'
+          foreach ($fixture in $fixtures) {
+            $file = Join-Path $root $fixture.Path
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $file) | Out-Null
+            curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-redirs 2 --max-time 30 --max-filesize $fixture.Bytes --output $file "$release/$($fixture.Name)"
+            if ($LASTEXITCODE -ne 0) { throw "Fixture download failed for $($fixture.Name)" }
+            if ((Get-Item -LiteralPath $file).Length -ne $fixture.Bytes -or (Get-FileHash -LiteralPath $file).Hash -ne $fixture.Sha256) {
+              throw "Pinned fixture identity mismatch for $($fixture.Name)"
+            }
+          }
       - name: L1-L4-C regressions, signed updater, isolated NSIS upgrade and recovery
         run: npm test
       - name: Disposable NSIS failure diagnostics
