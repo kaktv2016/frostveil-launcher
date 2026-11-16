@@ -67,6 +67,8 @@ setInterval(()=>{if(__fvFs.existsSync(__fvBoot.closeRequest))__fvApp.quit();},10
  const config={
   appId:'dev.skyrimrp.launcher.disposable-test',
   productName:'Frostveil Disposable Test',
+  // Skip compression work for this disposable installer. The upgrade still verifies its exact bytes.
+  compression:'store',
   npmRebuild:false,
   directories:{
    output:outDir
