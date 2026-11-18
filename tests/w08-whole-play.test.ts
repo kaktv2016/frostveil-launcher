@@ -43,7 +43,7 @@ const graphicMasters=[
 ];
 const graphicActivations=[
  'Skyrim.esm','Update.esm','Dawnguard.esm','HearthFires.esm','Dragonborn.esm','ccBGSSSE001-Fish.esm',
- 'ccQDRSSE001-SurvivalMode.esl','ccBGSSSE037-Curios.esl','ccBGSSSE025-AdvDSGS.esm','_ResourcePack.esl',
+ 'ccBGSSSE025-AdvDSGS.esm','ccBGSSSE037-Curios.esl','ccQDRSSE001-SurvivalMode.esl','_ResourcePack.esl',
 ];
 const graphicCanonical=[...graphicMasters,'FrostveilCourierNavigation.esp','FrostveilWorld.esp','SkyUI_SE.esp','FrostveilQuest.esp'];
 const graphicsProfileFiles=[...new Set([...graphicActivations,...graphicMasters,'FrostveilQuest.esp','FrostveilWorld.esp','SkyUI_SE.esp'])]
@@ -397,6 +397,17 @@ test('legacy graphics activation with the same active order and different signed
  const differing=Buffer.from(graphicPlugins.toString().replace('*SkyUI_SE.esp\r\n','*SkyUI_SE.esp\r\n# bytes differ\r\n'));
  const f=await legacyGraphicsFixture(t,{plugins:differing,loadorder:graphicLoadorder});
  await assert.rejects(()=>f.graphics.planWholePlay(f.projection),/differs from the exact signed runtime profile bytes/i);
+});
+
+test('legacy graphics refuses reversed Creation slots before observing projected files',async t=>{
+ const order=graphicLoadorder.toString().replace('ccBGSSSE025-AdvDSGS.esm','__CREATION_SLOT__')
+  .replace('ccQDRSSE001-SurvivalMode.esl','ccBGSSSE025-AdvDSGS.esm')
+  .replace('__CREATION_SLOT__','ccQDRSSE001-SurvivalMode.esl');
+ const f=await legacyGraphicsFixture(t,{plugins:graphicPlugins,loadorder:Buffer.from(order)});
+ let observed=false;
+ f.projection.projectedFile=async()=>{observed=true;return null;};
+ await assert.rejects(()=>f.graphics.planWholePlay(f.projection),/exact signed runtime profile bytes/i);
+ assert.equal(observed,false);
 });
 
 test('a legacy graphics output outside the authenticated runtime inventory is refused during planning',async t=>{

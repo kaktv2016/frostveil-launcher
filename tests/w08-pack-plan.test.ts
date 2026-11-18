@@ -227,7 +227,7 @@ test('cold legacy graphics stages signed archive members beyond the marker list 
     if (name !== archiveFiles[1]) managedFiles.push({path: name, size: bytes.length, sha256: digest(bytes)});
   }
   const standardOrder = ['Skyrim.esm', 'Update.esm', 'Dawnguard.esm', 'HearthFires.esm', 'Dragonborn.esm',
-    'ccBGSSSE001-Fish.esm', 'ccQDRSSE001-SurvivalMode.esl', 'ccBGSSSE037-Curios.esl', 'ccBGSSSE025-AdvDSGS.esm',
+    'ccBGSSSE001-Fish.esm', 'ccBGSSSE025-AdvDSGS.esm', 'ccBGSSSE037-Curios.esl', 'ccQDRSSE001-SurvivalMode.esl',
     '_ResourcePack.esl'];
   const active = ['FrostveilCourierNavigation.esp', 'SkyUI_SE.esp'];
   for (const name of [...standardOrder, ...active]) {

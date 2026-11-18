@@ -90,9 +90,9 @@ function graphicsActivationImages(manifest: GraphicsManifest, existingText: stri
       'HearthFires.esm',
       'Dragonborn.esm',
       'ccBGSSSE001-Fish.esm',
-      'ccQDRSSE001-SurvivalMode.esl',
-      'ccBGSSSE037-Curios.esl',
       'ccBGSSSE025-AdvDSGS.esm',
+      'ccBGSSSE037-Curios.esl',
+      'ccQDRSSE001-SurvivalMode.esl',
       '_ResourcePack.esl',
       ...canonicalOrder,
     ];
